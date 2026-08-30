@@ -1,0 +1,32 @@
+{
+  "name": "whatsapp-wordpress-newsroom",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Production-grade newsroom publishing system foundation",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.15.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @newsroom/api dev",
+    "build": "pnpm --filter @newsroom/api build",
+    "start": "pnpm --filter @newsroom/api start",
+    "lint": "pnpm --filter @newsroom/api lint",
+    "typecheck": "pnpm --filter @newsroom/api typecheck",
+    "test": "pnpm --filter @newsroom/api test",
+    "test:e2e": "pnpm --filter @newsroom/api test:e2e",
+    "test:db": "pnpm --filter @newsroom/api test:db",
+    "prisma:generate": "prisma generate",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@prisma/client": "^6.15.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "prisma": "^6.15.0"
+  }
+}

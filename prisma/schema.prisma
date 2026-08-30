@@ -1,0 +1,299 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ReporterStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ConversationState {
+  IDLE
+  AWAITING_HEADLINE
+  AWAITING_BODY
+  COLLECTING_MEDIA
+  AWAITING_APPROVAL
+  PUBLISHING
+}
+
+enum Provider {
+  WHATSAPP
+}
+
+enum InboundEventType {
+  TEXT
+  IMAGE
+  INTERACTIVE
+  UNKNOWN
+}
+
+enum InboundProcessingStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum OutboundMessageType {
+  TEXT
+  INTERACTIVE
+}
+
+enum OutboundMessageStatus {
+  PENDING
+  SENDING
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum StoryStatus {
+  COLLECTING
+  READY
+  DRAFT_CREATING
+  DRAFT_CREATED
+  AWAITING_APPROVAL
+  APPROVED
+  PUBLISHING
+  PUBLISHED
+  CANCELLED
+  FAILED
+}
+
+enum StoryMediaType {
+  IMAGE
+}
+
+enum MediaProcessingStatus {
+  RECEIVED
+  FETCHING
+  FETCHED
+  UPLOADING
+  UPLOADED
+  FAILED
+}
+
+enum ApprovalDecision {
+  APPROVED
+}
+
+enum PublishOperation {
+  CREATE_DRAFT
+  PUBLISH
+}
+
+enum PublishAttemptStatus {
+  PENDING
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+  RECONCILIATION_REQUIRED
+}
+
+enum AuditActorType {
+  REPORTER
+  SYSTEM
+}
+
+model Reporter {
+  id               String            @id @default(uuid()) @db.Uuid
+  phoneNumber      String            @unique @db.VarChar(16)
+  displayName      String            @db.VarChar(200)
+  status           ReporterStatus    @default(ACTIVE)
+  createdAt        DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime          @updatedAt @db.Timestamptz(3)
+  conversation     Conversation?
+  inboundEvents    InboundEvent[]
+  outboundMessages OutboundMessage[]
+  stories          Story[]
+  approvals        Approval[]
+  auditLogs        AuditLog[]
+}
+
+model Conversation {
+  id             String            @id @default(uuid()) @db.Uuid
+  reporterId     String            @unique @db.Uuid
+  state          ConversationState @default(IDLE)
+  currentStoryId String?           @unique @db.Uuid
+  version        Int               @default(0)
+  createdAt      DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime          @updatedAt @db.Timestamptz(3)
+  reporter       Reporter          @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  currentStory   Story?            @relation("CurrentConversationStory", fields: [currentStoryId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+}
+
+model InboundEvent {
+  id                  String                  @id @default(uuid()) @db.Uuid
+  provider            Provider
+  providerMessageId   String                  @db.VarChar(191)
+  reporterId          String?                 @db.Uuid
+  senderPhone         String                  @db.VarChar(16)
+  eventType           InboundEventType
+  processingStatus    InboundProcessingStatus @default(RECEIVED)
+  rawPayload          Json
+  providerOccurredAt  DateTime?               @db.Timestamptz(3)
+  receivedAt          DateTime                @default(now()) @db.Timestamptz(3)
+  processingStartedAt DateTime?               @db.Timestamptz(3)
+  processedAt         DateTime?               @db.Timestamptz(3)
+  processingAttempts  Int                     @default(0)
+  lastErrorCode       String?                 @db.VarChar(100)
+  lastErrorMessage    String?                 @db.Text
+  createdAt           DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime                @updatedAt @db.Timestamptz(3)
+  reporter            Reporter?               @relation(fields: [reporterId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  approval            Approval?
+  auditLogs           AuditLog[]
+
+  @@unique([provider, providerMessageId])
+  @@index([processingStatus, receivedAt])
+  @@index([processingStatus, processingStartedAt])
+  @@index([senderPhone])
+  @@index([reporterId])
+  @@index([receivedAt])
+}
+
+model OutboundMessage {
+  id                String                @id @default(uuid()) @db.Uuid
+  reporterId        String                @db.Uuid
+  storyId           String?               @db.Uuid
+  type              OutboundMessageType
+  status            OutboundMessageStatus @default(PENDING)
+  providerMessageId String?               @unique @db.VarChar(191)
+  correlationKey    String                @unique @db.VarChar(191)
+  payload           Json
+  sendAttempts      Int                   @default(0)
+  lastErrorCode     String?               @db.VarChar(100)
+  lastErrorMessage  String?               @db.Text
+  requestedAt       DateTime              @default(now()) @db.Timestamptz(3)
+  sentAt            DateTime?             @db.Timestamptz(3)
+  deliveredAt       DateTime?             @db.Timestamptz(3)
+  failedAt          DateTime?             @db.Timestamptz(3)
+  createdAt         DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime              @updatedAt @db.Timestamptz(3)
+  reporter          Reporter              @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  story             Story?                @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([status, requestedAt])
+  @@index([reporterId])
+  @@index([storyId])
+  @@index([requestedAt])
+}
+
+model Story {
+  id                   String            @id @default(uuid()) @db.Uuid
+  reporterId           String            @db.Uuid
+  status               StoryStatus       @default(COLLECTING)
+  headline             String?           @db.VarChar(500)
+  body                 String?           @db.Text
+  version              Int               @default(0)
+  wordpressPostId      BigInt?           @unique @db.BigInt
+  wordpressDraftKey    String            @unique @default(uuid()) @db.Uuid
+  wordpressPostUrl     String?           @db.Text
+  draftCreatedAt       DateTime?         @db.Timestamptz(3)
+  approvedAt           DateTime?         @db.Timestamptz(3)
+  publishedAt          DateTime?         @db.Timestamptz(3)
+  cancelledAt          DateTime?         @db.Timestamptz(3)
+  failedAt             DateTime?         @db.Timestamptz(3)
+  createdAt            DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime          @updatedAt @db.Timestamptz(3)
+  reporter             Reporter          @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  activeInConversation Conversation?     @relation("CurrentConversationStory")
+  outboundMessages     OutboundMessage[]
+  media                StoryMedia[]
+  approval             Approval?
+  publishAttempts      PublishAttempt[]
+  auditLogs            AuditLog[]
+
+  @@index([reporterId])
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@index([publishedAt])
+}
+
+model StoryMedia {
+  id               String                @id @default(uuid()) @db.Uuid
+  storyId          String                @db.Uuid
+  providerMediaId  String                @unique @db.VarChar(191)
+  mediaType        StoryMediaType
+  status           MediaProcessingStatus @default(RECEIVED)
+  mimeType         String?               @db.VarChar(150)
+  fileSizeBytes    BigInt?               @db.BigInt
+  sha256           String?               @db.Char(64)
+  wordpressMediaId BigInt?               @unique @db.BigInt
+  position         Int
+  caption          String?               @db.Text
+  altText          String?               @db.Text
+  createdAt        DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime              @updatedAt @db.Timestamptz(3)
+  story            Story                 @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([storyId, position])
+  @@index([status])
+}
+
+model Approval {
+  id             String           @id @default(uuid()) @db.Uuid
+  storyId        String           @unique @db.Uuid
+  reporterId     String           @db.Uuid
+  inboundEventId String           @unique @db.Uuid
+  decision       ApprovalDecision @default(APPROVED)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(3)
+  story          Story            @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  reporter       Reporter         @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  inboundEvent   InboundEvent     @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([reporterId])
+}
+
+model PublishAttempt {
+  id              String               @id @default(uuid()) @db.Uuid
+  storyId         String               @db.Uuid
+  operation       PublishOperation
+  status          PublishAttemptStatus @default(PENDING)
+  attemptNumber   Int
+  idempotencyKey  String               @unique @db.VarChar(191)
+  wordpressPostId BigInt?              @db.BigInt
+  httpStatus      Int?
+  errorCode       String?              @db.VarChar(100)
+  errorMessage    String?              @db.Text
+  startedAt       DateTime?            @db.Timestamptz(3)
+  completedAt     DateTime?            @db.Timestamptz(3)
+  createdAt       DateTime             @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime             @updatedAt @db.Timestamptz(3)
+  story           Story                @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([storyId, operation, attemptNumber])
+  @@index([storyId, createdAt])
+  @@index([status, createdAt])
+  @@index([operation, status])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id             String         @id @default(uuid()) @db.Uuid
+  eventType      String         @db.VarChar(100)
+  actorType      AuditActorType
+  reporterId     String?        @db.Uuid
+  storyId        String?        @db.Uuid
+  inboundEventId String?        @db.Uuid
+  entityType     String?        @db.VarChar(100)
+  entityId       String?        @db.Uuid
+  metadata       Json?
+  occurredAt     DateTime       @default(now()) @db.Timestamptz(3)
+  createdAt      DateTime       @default(now()) @db.Timestamptz(3)
+  reporter       Reporter?      @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  story          Story?         @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  inboundEvent   InboundEvent?  @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([storyId, occurredAt])
+  @@index([reporterId, occurredAt])
+  @@index([inboundEventId])
+  @@index([eventType])
+  @@index([occurredAt])
+}

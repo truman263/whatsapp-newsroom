@@ -1,0 +1,633 @@
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import {
+  ConversationState,
+  InboundEventType,
+  OutboundMessageType,
+  Prisma,
+  Provider,
+  PublishOperation,
+  StoryMediaType,
+  StoryStatus,
+} from '@prisma/client';
+import { PrismaService } from '../src/database/prisma.service';
+
+function loadDatabaseUrl(): void {
+  if (process.env.DATABASE_URL) {
+    return;
+  }
+
+  const envFile = readFileSync(resolve(process.cwd(), '../../.env'), 'utf8');
+  const line = envFile.split(/\r?\n/u).find((candidate) => /^\s*DATABASE_URL\s*=/u.test(candidate));
+
+  if (!line) {
+    throw new Error('DATABASE_URL must be configured for database integration tests');
+  }
+
+  let value = line.replace(/^\s*DATABASE_URL\s*=\s*/u, '').trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+  process.env.DATABASE_URL = value;
+}
+
+async function expectPrismaError(operation: Promise<unknown>, code: string): Promise<void> {
+  try {
+    await operation;
+  } catch (error: unknown) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      expect(error.code).toBe(code);
+      return;
+    }
+    if (
+      code === '23514' &&
+      error instanceof Prisma.PrismaClientUnknownRequestError &&
+      error.message.includes('23514')
+    ) {
+      return;
+    }
+    throw error;
+  }
+  throw new Error(`Expected Prisma error ${code}`);
+}
+
+loadDatabaseUrl();
+jest.setTimeout(120_000);
+
+describe('PostgreSQL persistence contract', () => {
+  const prisma = new PrismaService();
+  const runId = randomUUID();
+  const marker = `DBTEST ${runId}`;
+  const idPart = Date.now().toString().slice(-10);
+  const phone = (suffix: number): string => `+1999${idPart}${suffix}`;
+  const providerId = (name: string): string => `dbtest:${runId}:${name}`;
+  const correlation = (name: string): string => `dbtest:${runId}:${name}`;
+
+  async function createReporter(suffix: number): Promise<{ id: string; phoneNumber: string }> {
+    return prisma.reporter.create({
+      data: { phoneNumber: phone(suffix), displayName: `${marker} reporter ${suffix}` },
+      select: { id: true, phoneNumber: true },
+    });
+  }
+
+  async function createInbound(name: string, reporterId?: string): Promise<{ id: string }> {
+    return prisma.inboundEvent.create({
+      data: {
+        provider: Provider.WHATSAPP,
+        providerMessageId: providerId(name),
+        reporterId,
+        senderPhone: phone(9),
+        eventType: InboundEventType.TEXT,
+        rawPayload: { testRun: runId, name },
+      },
+      select: { id: true },
+    });
+  }
+
+  async function createStory(reporterId: string, name: string): Promise<{ id: string }> {
+    return prisma.story.create({
+      data: { reporterId, headline: `${marker} ${name}` },
+      select: { id: true },
+    });
+  }
+
+  async function cleanupFixtures(displayPrefix: string, keyPrefix: string): Promise<void> {
+    const reporters = await prisma.reporter.findMany({
+      where: { displayName: { startsWith: displayPrefix } },
+      select: { id: true },
+    });
+    const reporterIds = reporters.map(({ id }) => id);
+    const stories = await prisma.story.findMany({
+      where: { OR: [{ reporterId: { in: reporterIds } }, { headline: { startsWith: displayPrefix } }] },
+      select: { id: true },
+    });
+    const storyIds = stories.map(({ id }) => id);
+    const inbounds = await prisma.inboundEvent.findMany({
+      where: { providerMessageId: { startsWith: keyPrefix } },
+      select: { id: true },
+    });
+    const inboundIds = inbounds.map(({ id }) => id);
+
+    await prisma.approval.deleteMany({
+      where: {
+        OR: [
+          { reporterId: { in: reporterIds } },
+          { storyId: { in: storyIds } },
+          { inboundEventId: { in: inboundIds } },
+        ],
+      },
+    });
+    await prisma.auditLog.deleteMany({
+      where: {
+        OR: [
+          { reporterId: { in: reporterIds } },
+          { storyId: { in: storyIds } },
+          { inboundEventId: { in: inboundIds } },
+        ],
+      },
+    });
+    await prisma.publishAttempt.deleteMany({ where: { storyId: { in: storyIds } } });
+    await prisma.storyMedia.deleteMany({
+      where: {
+        OR: [{ storyId: { in: storyIds } }, { providerMediaId: { startsWith: keyPrefix } }],
+      },
+    });
+    await prisma.outboundMessage.deleteMany({
+      where: {
+        OR: [
+          { reporterId: { in: reporterIds } },
+          { storyId: { in: storyIds } },
+          { correlationKey: { startsWith: keyPrefix } },
+        ],
+      },
+    });
+    await prisma.conversation.deleteMany({ where: { reporterId: { in: reporterIds } } });
+    await prisma.inboundEvent.deleteMany({
+      where: {
+        OR: [
+          { reporterId: { in: reporterIds } },
+          { providerMessageId: { startsWith: keyPrefix } },
+        ],
+      },
+    });
+    await prisma.story.deleteMany({ where: { id: { in: storyIds } } });
+    await prisma.reporter.deleteMany({ where: { id: { in: reporterIds } } });
+  }
+
+  beforeAll(async () => {
+    await prisma.$connect();
+    await cleanupFixtures('DBTEST ', 'dbtest:');
+  }, 120_000);
+
+  afterAll(async () => {
+    await cleanupFixtures(marker, `dbtest:${runId}:`);
+    await prisma.$disconnect();
+  }, 120_000);
+
+  it('physically contains the approved PostgreSQL structures and column types', async () => {
+    const tables = await prisma.$queryRaw<Array<{ name: string }>>`
+      SELECT tablename AS name
+      FROM pg_catalog.pg_tables
+      WHERE schemaname = current_schema()
+        AND tablename <> '_prisma_migrations'
+      ORDER BY tablename
+    `;
+    const enums = await prisma.$queryRaw<Array<{ name: string }>>`
+      SELECT t.typname AS name
+      FROM pg_catalog.pg_type t
+      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = current_schema() AND t.typtype = 'e'
+    `;
+    const constraints = await prisma.$queryRaw<Array<{ type: string; count: bigint }>>`
+      SELECT contype::text AS type, COUNT(*)::bigint AS count
+      FROM pg_catalog.pg_constraint c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+      WHERE n.nspname = current_schema() AND contype IN ('f', 'c')
+      GROUP BY contype
+    `;
+    const indexes = await prisma.$queryRaw<Array<{ unique_index: boolean; count: bigint }>>`
+      SELECT (indexdef LIKE 'CREATE UNIQUE INDEX%') AS unique_index, COUNT(*)::bigint AS count
+      FROM pg_catalog.pg_indexes
+      WHERE schemaname = current_schema() AND indexname NOT LIKE '%_pkey'
+      GROUP BY unique_index
+    `;
+    const columnTypes = await prisma.$queryRaw<Array<{ data_type: string; count: bigint }>>`
+      SELECT data_type, COUNT(*)::bigint AS count
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND data_type IN ('timestamp with time zone', 'bigint')
+      GROUP BY data_type
+    `;
+
+    expect(tables.map(({ name }) => name).sort()).toEqual(
+      [
+        'Approval',
+        'AuditLog',
+        'Conversation',
+        'InboundEvent',
+        'OutboundMessage',
+        'PublishAttempt',
+        'Reporter',
+        'Story',
+        'StoryMedia',
+      ].sort(),
+    );
+    expect(enums).toHaveLength(14);
+    expect(Number(constraints.find(({ type }) => type === 'f')?.count)).toBe(14);
+    expect(Number(constraints.find(({ type }) => type === 'c')?.count)).toBe(7);
+    expect(Number(indexes.find(({ unique_index }) => unique_index)?.count)).toBe(15);
+    expect(Number(indexes.find(({ unique_index }) => !unique_index)?.count)).toBe(24);
+    expect(Number(columnTypes.find(({ data_type }) => data_type === 'timestamp with time zone')?.count)).toBeGreaterThan(0);
+    expect(Number(columnTypes.find(({ data_type }) => data_type === 'bigint')?.count)).toBe(4);
+  });
+
+  it('enforces Reporter and Conversation uniqueness', async () => {
+    const reporter = await createReporter(0);
+    await expectPrismaError(
+      prisma.reporter.create({ data: { phoneNumber: reporter.phoneNumber, displayName: marker } }),
+      'P2002',
+    );
+    await prisma.conversation.create({ data: { reporterId: reporter.id } });
+    await expectPrismaError(
+      prisma.conversation.create({ data: { reporterId: reporter.id } }),
+      'P2002',
+    );
+  });
+
+  it('enforces inbound idempotency and accepts an unknown sender', async () => {
+    const inbound = await createInbound('inbound-unique');
+    expect(inbound.id).toBeDefined();
+    await expectPrismaError(
+      prisma.inboundEvent.create({
+        data: {
+          provider: Provider.WHATSAPP,
+          providerMessageId: providerId('inbound-unique'),
+          senderPhone: phone(9),
+          eventType: InboundEventType.TEXT,
+          rawPayload: { testRun: runId },
+        },
+      }),
+      'P2002',
+    );
+  });
+
+  it('enforces outbound nullable and non-null uniqueness semantics', async () => {
+    const reporter = await createReporter(1);
+    await prisma.outboundMessage.createMany({
+      data: [
+        {
+          reporterId: reporter.id,
+          type: OutboundMessageType.TEXT,
+          correlationKey: correlation('out-null-1'),
+          payload: { text: 'one' },
+        },
+        {
+          reporterId: reporter.id,
+          type: OutboundMessageType.TEXT,
+          correlationKey: correlation('out-null-2'),
+          payload: { text: 'two' },
+        },
+      ],
+    });
+    await prisma.outboundMessage.create({
+      data: {
+        reporterId: reporter.id,
+        type: OutboundMessageType.TEXT,
+        correlationKey: correlation('out-provider-1'),
+        providerMessageId: providerId('out-provider'),
+        payload: { text: 'three' },
+      },
+    });
+    await expectPrismaError(
+      prisma.outboundMessage.create({
+        data: {
+          reporterId: reporter.id,
+          type: OutboundMessageType.TEXT,
+          correlationKey: correlation('out-provider-2'),
+          providerMessageId: providerId('out-provider'),
+          payload: { text: 'four' },
+        },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.outboundMessage.create({
+        data: {
+          reporterId: reporter.id,
+          type: OutboundMessageType.TEXT,
+          correlationKey: correlation('out-null-1'),
+          payload: { text: 'duplicate correlation' },
+        },
+      }),
+      'P2002',
+    );
+  });
+
+  it('enforces Story nullable and non-null WordPress uniqueness', async () => {
+    const reporter = await createReporter(2);
+    await createStory(reporter.id, 'null-wordpress-1');
+    await createStory(reporter.id, 'null-wordpress-2');
+    const draftKey = randomUUID();
+    await prisma.story.create({
+      data: { reporterId: reporter.id, headline: marker, wordpressPostId: 9000001n, wordpressDraftKey: draftKey },
+    });
+    await expectPrismaError(
+      prisma.story.create({
+        data: { reporterId: reporter.id, headline: marker, wordpressPostId: 9000001n },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.story.create({ data: { reporterId: reporter.id, headline: marker, wordpressDraftKey: draftKey } }),
+      'P2002',
+    );
+  });
+
+  it('enforces StoryMedia identifiers, positions, and nullable uniqueness', async () => {
+    const reporter = await createReporter(3);
+    const story = await createStory(reporter.id, 'media-story');
+    await prisma.storyMedia.createMany({
+      data: [
+        { storyId: story.id, providerMediaId: providerId('media-1'), mediaType: StoryMediaType.IMAGE, position: 0 },
+        { storyId: story.id, providerMediaId: providerId('media-2'), mediaType: StoryMediaType.IMAGE, position: 1 },
+        {
+          storyId: story.id,
+          providerMediaId: providerId('media-wp'),
+          mediaType: StoryMediaType.IMAGE,
+          wordpressMediaId: 8000001n,
+          position: 2,
+        },
+      ],
+    });
+    await expectPrismaError(
+      prisma.storyMedia.create({
+        data: { storyId: story.id, providerMediaId: providerId('media-1'), mediaType: StoryMediaType.IMAGE, position: 3 },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.storyMedia.create({
+        data: { storyId: story.id, providerMediaId: providerId('media-position'), mediaType: StoryMediaType.IMAGE, position: 1 },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.storyMedia.create({
+        data: {
+          storyId: story.id,
+          providerMediaId: providerId('media-wp-duplicate'),
+          mediaType: StoryMediaType.IMAGE,
+          wordpressMediaId: 8000001n,
+          position: 4,
+        },
+      }),
+      'P2002',
+    );
+  });
+
+  it('enforces Approval provenance uniqueness', async () => {
+    const reporter = await createReporter(4);
+    const storyOne = await createStory(reporter.id, 'approval-one');
+    const storyTwo = await createStory(reporter.id, 'approval-two');
+    const inboundOne = await createInbound('approval-one', reporter.id);
+    const inboundTwo = await createInbound('approval-two', reporter.id);
+    await prisma.approval.create({
+      data: { storyId: storyOne.id, reporterId: reporter.id, inboundEventId: inboundOne.id },
+    });
+    await expectPrismaError(
+      prisma.approval.create({
+        data: { storyId: storyOne.id, reporterId: reporter.id, inboundEventId: inboundTwo.id },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.approval.create({
+        data: { storyId: storyTwo.id, reporterId: reporter.id, inboundEventId: inboundOne.id },
+      }),
+      'P2002',
+    );
+  });
+
+  it('enforces PublishAttempt uniqueness and positive attempt numbers', async () => {
+    const reporter = await createReporter(5);
+    const story = await createStory(reporter.id, 'publish-attempt');
+    await prisma.publishAttempt.create({
+      data: {
+        storyId: story.id,
+        operation: PublishOperation.CREATE_DRAFT,
+        attemptNumber: 1,
+        idempotencyKey: correlation('publish-one'),
+      },
+    });
+    await expectPrismaError(
+      prisma.publishAttempt.create({
+        data: {
+          storyId: story.id,
+          operation: PublishOperation.PUBLISH,
+          attemptNumber: 1,
+          idempotencyKey: correlation('publish-one'),
+        },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.publishAttempt.create({
+        data: {
+          storyId: story.id,
+          operation: PublishOperation.CREATE_DRAFT,
+          attemptNumber: 1,
+          idempotencyKey: correlation('publish-composite'),
+        },
+      }),
+      'P2002',
+    );
+    await expectPrismaError(
+      prisma.publishAttempt.create({
+        data: {
+          storyId: story.id,
+          operation: PublishOperation.PUBLISH,
+          attemptNumber: 0,
+          idempotencyKey: correlation('publish-invalid'),
+        },
+      }),
+      '23514',
+    );
+  });
+
+  it('enforces representative non-negative CHECK constraints', async () => {
+    const reporter = await createReporter(6);
+    const story = await createStory(reporter.id, 'checks');
+    await expectPrismaError(
+      prisma.conversation.create({ data: { reporterId: reporter.id, version: -1 } }),
+      '23514',
+    );
+    await expectPrismaError(
+      prisma.story.create({ data: { reporterId: reporter.id, headline: marker, version: -1 } }),
+      '23514',
+    );
+    await expectPrismaError(
+      prisma.inboundEvent.create({
+        data: {
+          provider: Provider.WHATSAPP,
+          providerMessageId: providerId('negative-inbound'),
+          senderPhone: phone(9),
+          eventType: InboundEventType.TEXT,
+          rawPayload: { testRun: runId },
+          processingAttempts: -1,
+        },
+      }),
+      '23514',
+    );
+    await expectPrismaError(
+      prisma.outboundMessage.create({
+        data: {
+          reporterId: reporter.id,
+          type: OutboundMessageType.TEXT,
+          correlationKey: correlation('negative-outbound'),
+          payload: { text: 'invalid' },
+          sendAttempts: -1,
+        },
+      }),
+      '23514',
+    );
+    await expectPrismaError(
+      prisma.storyMedia.create({
+        data: {
+          storyId: story.id,
+          providerMediaId: providerId('negative-size'),
+          mediaType: StoryMediaType.IMAGE,
+          fileSizeBytes: -1n,
+          position: 0,
+        },
+      }),
+      '23514',
+    );
+    await expectPrismaError(
+      prisma.storyMedia.create({
+        data: {
+          storyId: story.id,
+          providerMediaId: providerId('negative-position'),
+          mediaType: StoryMediaType.IMAGE,
+          position: -1,
+        },
+      }),
+      '23514',
+    );
+  });
+
+  it('restricts deletion of approval, publish, media, and audit provenance', async () => {
+    const reporter = await createReporter(7);
+    const approvalStory = await createStory(reporter.id, 'restrict-approval');
+    const approvalInbound = await createInbound('restrict-approval', reporter.id);
+    await prisma.approval.create({
+      data: { storyId: approvalStory.id, reporterId: reporter.id, inboundEventId: approvalInbound.id },
+    });
+    await expectPrismaError(prisma.reporter.delete({ where: { id: reporter.id } }), 'P2003');
+    await expectPrismaError(prisma.story.delete({ where: { id: approvalStory.id } }), 'P2003');
+
+    const publishStory = await createStory(reporter.id, 'restrict-publish');
+    await prisma.publishAttempt.create({
+      data: {
+        storyId: publishStory.id,
+        operation: PublishOperation.PUBLISH,
+        attemptNumber: 1,
+        idempotencyKey: correlation('restrict-publish'),
+      },
+    });
+    await expectPrismaError(prisma.story.delete({ where: { id: publishStory.id } }), 'P2003');
+
+    const mediaStory = await createStory(reporter.id, 'restrict-media');
+    await prisma.storyMedia.create({
+      data: { storyId: mediaStory.id, providerMediaId: providerId('restrict-media'), mediaType: StoryMediaType.IMAGE, position: 0 },
+    });
+    await expectPrismaError(prisma.story.delete({ where: { id: mediaStory.id } }), 'P2003');
+
+    const auditStory = await createStory(reporter.id, 'restrict-audit');
+    await prisma.auditLog.create({
+      data: { eventType: 'DB_TEST', actorType: 'SYSTEM', storyId: auditStory.id, metadata: { testRun: runId } },
+    });
+    await expectPrismaError(prisma.story.delete({ where: { id: auditStory.id } }), 'P2003');
+  });
+
+  it('applies SET NULL for current Story and optional inbound Reporter', async () => {
+    const currentReporter = await createReporter(8);
+    const currentStory = await createStory(currentReporter.id, 'set-null-current');
+    const conversation = await prisma.conversation.create({
+      data: { reporterId: currentReporter.id, currentStoryId: currentStory.id },
+    });
+    await prisma.story.delete({ where: { id: currentStory.id } });
+    expect(
+      await prisma.conversation.findUnique({ where: { id: conversation.id }, select: { currentStoryId: true } }),
+    ).toEqual({ currentStoryId: null });
+
+    const inboundReporter = await prisma.reporter.create({
+      data: { phoneNumber: '+188800000000001', displayName: `${marker} inbound set-null` },
+    });
+    const inbound = await createInbound('set-null-reporter', inboundReporter.id);
+    await prisma.reporter.delete({ where: { id: inboundReporter.id } });
+    expect(
+      await prisma.inboundEvent.findUnique({ where: { id: inbound.id }, select: { reporterId: true } }),
+    ).toEqual({ reporterId: null });
+  });
+
+  it('atomically creates Reporter and Conversation and rolls back on failure', async () => {
+    const successPhone = '+188800000000002';
+    const success = await prisma.$transaction(async (transaction) => {
+      const reporter = await transaction.reporter.create({
+        data: { phoneNumber: successPhone, displayName: `${marker} tx success` },
+      });
+      const conversation = await transaction.conversation.create({ data: { reporterId: reporter.id } });
+      return { reporter, conversation };
+    });
+    expect(success.conversation.reporterId).toBe(success.reporter.id);
+
+    const rollbackPhone = '+188800000000003';
+    await expectPrismaError(
+      prisma.$transaction(async (transaction) => {
+        const reporter = await transaction.reporter.create({
+          data: { phoneNumber: rollbackPhone, displayName: `${marker} tx rollback` },
+        });
+        await transaction.conversation.create({ data: { reporterId: reporter.id, version: -1 } });
+      }),
+      '23514',
+    );
+    expect(await prisma.reporter.count({ where: { phoneNumber: rollbackPhone } })).toBe(0);
+  });
+
+  it('supports optimistic compare-and-set for Story and Conversation', async () => {
+    const reporter = await prisma.reporter.create({
+      data: { phoneNumber: '+188800000000004', displayName: `${marker} compare-and-set` },
+    });
+    const story = await createStory(reporter.id, 'compare-and-set');
+    const conversation = await prisma.conversation.create({ data: { reporterId: reporter.id } });
+
+    const firstStory = await prisma.story.updateMany({
+      where: { id: story.id, status: StoryStatus.COLLECTING, version: 0 },
+      data: { status: StoryStatus.READY, version: { increment: 1 } },
+    });
+    const staleStory = await prisma.story.updateMany({
+      where: { id: story.id, status: StoryStatus.COLLECTING, version: 0 },
+      data: { status: StoryStatus.READY, version: { increment: 1 } },
+    });
+    const firstConversation = await prisma.conversation.updateMany({
+      where: { id: conversation.id, state: ConversationState.IDLE, version: 0 },
+      data: { state: ConversationState.AWAITING_HEADLINE, version: { increment: 1 } },
+    });
+    const staleConversation = await prisma.conversation.updateMany({
+      where: { id: conversation.id, state: ConversationState.IDLE, version: 0 },
+      data: { state: ConversationState.AWAITING_HEADLINE, version: { increment: 1 } },
+    });
+
+    expect(firstStory.count).toBe(1);
+    expect(staleStory.count).toBe(0);
+    expect(firstConversation.count).toBe(1);
+    expect(staleConversation.count).toBe(0);
+  });
+
+  it('allows exactly one concurrent inbound insert for one provider message', async () => {
+    const duplicateId = providerId('concurrent-race');
+    const insert = (variant: string): Promise<unknown> =>
+      prisma.inboundEvent.create({
+        data: {
+          provider: Provider.WHATSAPP,
+          providerMessageId: duplicateId,
+          senderPhone: phone(9),
+          eventType: InboundEventType.TEXT,
+          rawPayload: { testRun: runId, variant },
+        },
+      });
+
+    const results = await Promise.allSettled([insert('one'), insert('two')]);
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter(({ status }) => status === 'rejected')).toHaveLength(1);
+    expect(
+      await prisma.inboundEvent.count({
+        where: { provider: Provider.WHATSAPP, providerMessageId: duplicateId },
+      }),
+    ).toBe(1);
+  });
+});
