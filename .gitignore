@@ -9,3 +9,5 @@ coverage/
 .idea/
 .vscode/
 test-results/
+wordpress/runtime/newsroom-bridge/.env.runtime
+wordpress/runtime/newsroom-bridge/runtime-results.json

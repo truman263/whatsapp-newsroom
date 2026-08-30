@@ -47,7 +47,7 @@ Local Newsroom Bridge source, private reconciliation storage, idempotent draft-c
 - Hook/plugin side-effect review
 - No public publication
 
-**Status: PENDING**
+**Status: CURRENT**
 
 ## Round 2B — WordPress adapter and controlled integration
 
