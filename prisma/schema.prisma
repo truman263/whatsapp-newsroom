@@ -66,6 +66,11 @@ enum StoryStatus {
   FAILED
 }
 
+enum EditorialCategoryStatus {
+  ACTIVE
+  INACTIVE
+}
+
 enum StoryMediaType {
   IMAGE
 }
@@ -105,6 +110,7 @@ model Reporter {
   id               String            @id @default(uuid()) @db.Uuid
   phoneNumber      String            @unique @db.VarChar(16)
   displayName      String            @db.VarChar(200)
+  editorialByline  String?           @db.VarChar(200)
   status           ReporterStatus    @default(ACTIVE)
   createdAt        DateTime          @default(now()) @db.Timestamptz(3)
   updatedAt        DateTime          @updatedAt @db.Timestamptz(3)
@@ -191,6 +197,7 @@ model Story {
   status               StoryStatus       @default(COLLECTING)
   headline             String?           @db.VarChar(500)
   body                 String?           @db.Text
+  byline               String?           @db.VarChar(200)
   version              Int               @default(0)
   wordpressPostId      BigInt?           @unique @db.BigInt
   wordpressDraftKey    String            @unique @default(uuid()) @db.Uuid
@@ -209,11 +216,37 @@ model Story {
   approval             Approval?
   publishAttempts      PublishAttempt[]
   auditLogs            AuditLog[]
+  categories           StoryCategory[]
 
   @@index([reporterId])
   @@index([status, createdAt])
   @@index([createdAt])
   @@index([publishedAt])
+}
+
+model EditorialCategory {
+  id                  String                  @id @default(uuid()) @db.Uuid
+  wordpressCategoryId BigInt                  @unique @db.BigInt
+  name                String                  @db.VarChar(200)
+  slug                String                  @db.VarChar(200)
+  status              EditorialCategoryStatus @default(ACTIVE)
+  createdAt           DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime                @updatedAt @db.Timestamptz(3)
+  stories             StoryCategory[]
+
+  @@index([status])
+  @@index([slug])
+}
+
+model StoryCategory {
+  storyId    String            @db.Uuid
+  categoryId String            @db.Uuid
+  createdAt  DateTime          @default(now()) @db.Timestamptz(3)
+  story      Story             @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  category   EditorialCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@id([storyId, categoryId])
+  @@index([categoryId])
 }
 
 model StoryMedia {

@@ -4,7 +4,7 @@ Round 1 establishes the PostgreSQL persistence model. It does not implement work
 
 ## Reporter
 
-An authorised WhatsApp user. `phoneNumber` is unique and stored in canonical E.164 form. The database reserves 16 characters for `+` and up to 15 digits; full parsing, validation, and canonicalisation happen at the application boundary before persistence. Reporter deactivation uses `INACTIVE`; deletion is not a routine domain operation. Credentials and login fields do not belong on Reporter.
+An authorised WhatsApp user. `phoneNumber` is unique and stored in canonical E.164 form. The database reserves 16 characters for `+` and up to 15 digits; full parsing, validation, and canonicalisation happen at the application boundary before persistence. `displayName` is operational identity, while nullable `editorialByline` is the Reporter’s current preferred publication byline. Reporter deactivation uses `INACTIVE`; deletion is not a routine domain operation. Credentials, WordPress-user links, and login fields do not belong on Reporter: the technical WordPress publishing account is separate from journalist editorial identity.
 
 A Reporter has at most one Conversation by the unique `Conversation.reporterId` foreign key. Relational databases cannot require every parent row to have a child row, so later reporter provisioning must create Reporter and Conversation together in one short transaction to uphold the domain's exactly-one rule.
 
@@ -26,9 +26,15 @@ Provider-neutral persisted delivery intent. `correlationKey` uniquely identifies
 
 ## Story
 
-The canonical newsroom content aggregate. Headline and body remain nullable while collection is incomplete. State-dependent completeness will be enforced later by application transitions.
+The canonical newsroom content aggregate. Headline and body remain nullable while collection is incomplete. State-dependent completeness will be enforced later by application transitions. Nullable `byline` is historical editorial provenance. Later creation logic will snapshot `Reporter.editorialByline ?? Reporter.displayName`; changing the Reporter later does not update an existing Story. In normal use the snapshot is immutable after creation, and `body` remains canonical article content rather than containing rendered byline text.
 
 `wordpressDraftKey` is a database-generated UUID, unique and independent of mutable content. It is a reconciliation key, not a public slug. Non-null `wordpressPostId` is unique. WordPress IDs use PostgreSQL `BIGINT` to preserve the external identifier range.
+
+## EditorialCategory and StoryCategory
+
+`EditorialCategory.wordpressCategoryId` is the unique, authoritative external taxonomy identity and uses PostgreSQL `BIGINT`. `name` and `slug` are mutable metadata synchronised from WordPress; neither is identity and neither is derived from the other. The public site’s currently visible categories are not seeded or hardcoded truth, and homepage presentation sections do not automatically define taxonomy. Round 2A will discover the actual taxonomy and capabilities through the WordPress REST API.
+
+`StoryCategory` is the explicit many-to-many association. Its `(storyId, categoryId)` primary key prevents duplicate assignment, while `createdAt` records when the historical newsroom metadata was attached. A Story can have multiple categories and no primary-category semantic is assumed. Both foreign keys restrict deletion. Setting an EditorialCategory to `INACTIVE` retains its historical Story associations; routine retirement is a status change, not deletion.
 
 ## StoryMedia
 

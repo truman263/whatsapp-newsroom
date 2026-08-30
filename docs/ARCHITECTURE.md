@@ -18,6 +18,8 @@ There is one newsroom, one configured WordPress site, and one WhatsApp Business 
 
 External systems are Meta WhatsApp Cloud API, PostgreSQL, and WordPress REST API. No external API implementation exists in Round 1.
 
+WordPress is authoritative for category IDs. Category names and slugs are synchronised metadata discovered from the REST API, not hardcoded from the public site, and homepage sections are not automatically taxonomy. Stories support multiple categories without a primary category. Round 2A performs read-only contract discovery before any adapter writes. The configured technical WordPress publishing identity remains separate from Reporter editorial identity; Reporter stores current byline preference and Story stores historical byline provenance.
+
 ## Transaction boundaries
 
 1. State changes involving multiple local records use short PostgreSQL transactions.
@@ -34,7 +36,7 @@ The initial Round 1 migration has been applied and validated against a fresh dev
 
 ## Evidence-preserving deletion
 
-Historical and audit relations use `ON DELETE RESTRICT`, including nullable audit links when they are populated. `SET NULL` is limited to the transient Conversation current-story pointer and the optional InboundEvent reporter association; both preserve the dependent row. No relation uses cascading delete. Reporter deactivation and Story cancellation are state changes, not deletion APIs.
+Historical and audit relations use `ON DELETE RESTRICT`, including both StoryCategory links and nullable audit links when they are populated. `SET NULL` is limited to the transient Conversation current-story pointer and the optional InboundEvent reporter association; both preserve the dependent row. No relation uses cascading delete. Reporter/category deactivation and Story cancellation are state changes, not deletion APIs.
 
 ## Concurrency
 
