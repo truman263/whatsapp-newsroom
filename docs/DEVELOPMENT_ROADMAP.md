@@ -26,9 +26,34 @@ Read-only first: REST API availability, authentication capability, actual post t
 
 **Status: APPROVED**
 
+## Round 2B.0 — WordPress reconciliation bridge
+
+Local Newsroom Bridge source, private reconciliation storage, idempotent draft-create contract, deterministic recovery lookup, and static/local validation only.
+
+**Status: APPROVED**
+
+## Round 2B.1 — WordPress runtime and fault-injection validation
+
+- Disposable/staging WordPress environment
+- Plugin installation/activation validation
+- Schema and `dbDelta()` validation
+- Permissions
+- Transaction rollback
+- Concurrent same-key requests
+- Concurrent conflicting requests
+- Uncertain-response recovery
+- Cache behavior
+- Category assignment
+- Hook/plugin side-effect review
+- No public publication
+
+**Status: PENDING**
+
 ## Round 2B — WordPress adapter and controlled integration
 
 Isolated WordPress client using capabilities already confirmed during approved Round 2A discovery, category synchronisation, controlled DRAFT creation only, media upload, featured image, category assignment, draft retrieval/update, reconciliation of uncertain draft creation, and no public publication test.
+
+**Status: PENDING**
 
 ## Round 3 — WhatsApp Cloud API webhook ingestion
 

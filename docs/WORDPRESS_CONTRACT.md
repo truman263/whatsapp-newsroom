@@ -163,7 +163,11 @@ The resulting least-privilege contract is: category creation/edit/delete and bro
 
 The post collection GET contract still advertises no arbitrary-meta query parameter. Astra, Elementor, SureRank, and unrelated plugin fields are not suitable idempotency storage.
 
-**RECONCILIATION CONTRACT: UNRESOLVED.** The preferred architecture remains a minimal newsroom-specific WordPress extension registering a private UUID reconciliation key that is REST retrievable and deterministically searchable, with uniqueness or equivalent duplicate prevention. It must be validated before draft creation relies on it.
+**LIVE PRODUCTION STATE — RECONCILIATION CONTRACT: UNRESOLVED.** Round 2A discovered no suitable newsroom reconciliation mechanism on the live Simbidzebasa WordPress site. That historical finding remains accurate because Newsroom Bridge has not been deployed, installed, or activated.
+
+**LOCAL APPROVED ARCHITECTURE:** Round 2B.0 provides supervisor-approved local Newsroom Bridge source using a private plugin-owned reconciliation table with `PRIMARY KEY (draft_key)`, `UNIQUE (post_id)`, and reservation-token transaction ownership. Its REST contract provides `POST /newsroom/v1/drafts` and `GET /newsroom/v1/drafts/{draft_key}`; after an uncertain outcome, reconciliation by GET is mandatory before any create retry. Ordinary or private post meta is not the primary idempotency mechanism.
+
+The local bridge is **NOT DEPLOYED**, **NOT INSTALLED**, **NOT ACTIVATED**, **NOT WORDPRESS-INTEGRATION-TESTED**, and **NOT PRODUCTION-VALIDATED**.
 
 ### Timezone and date contract
 
@@ -186,7 +190,7 @@ No bypass, scan, brute force, load test, or unrelated administration request was
 
 1. Actual draft creation/editing, publication, category assignment, featured-media assignment, and registered-meta writes.
 2. Accepted draft fields and sanitization/rendering behavior.
-3. Registration, privacy, uniqueness, deterministic lookup, and write behavior of a dedicated reconciliation key.
+3. Installation, schema, transaction ownership, uniqueness, deterministic lookup, and runtime behavior of the approved local Newsroom Bridge.
 4. Idempotent recovery after an uncertain draft-create response.
 5. Media size/MIME limits, upload response, metadata updates, and attachment behavior.
 6. Category synchronization and retirement behavior.
@@ -197,12 +201,12 @@ No bypass, scan, brute force, load test, or unrelated administration request was
 
 **CONDITIONAL GO.**
 
-Public and authenticated read-only discovery support core `post`, standard categories/tags, normal media/featured-media structures, Application Password authentication, and a dedicated Author integration identity. WordPress core capability mapping supports assignment of existing categories through the account's confirmed `edit_posts` capability while taxonomy management remains denied. Reconciliation remains unresolved. Round 2B may begin only after the reconciliation mechanism receives supervisor design approval and Round 2A is approved.
+Public and authenticated read-only discovery support core `post`, standard categories/tags, normal media/featured-media structures, Application Password authentication, and a dedicated Author integration identity. WordPress core capability mapping supports assignment of existing categories through the account's confirmed `edit_posts` capability while taxonomy management remains denied. Round 2A remains the historical record that the live site has no discovered reconciliation primitive. Round 2B.0 has now satisfied the local source/design gate with the supervisor-approved Newsroom Bridge architecture, but controlled runtime and production integration are not approved.
 
 Before any controlled draft creation, Round 2B should:
 
-1. Resolve the reconciliation contract. Preferred option: a minimal dedicated WordPress extension that registers a private UUID meta field for posts, exposes it in authenticated REST edit context, enforces uniqueness or deterministic lookup, and prevents editorial/theme display. Confirm search/retrieval before relying on it.
-2. Implement an isolated WordPress adapter with strict redaction, bounded timeouts, and reconciliation-first retry behavior.
+1. Complete and obtain approval for Round 2B.1 runtime and fault-injection validation of the Newsroom Bridge in a disposable or staging WordPress environment.
+2. Only after that approval, implement an isolated WordPress adapter with strict redaction, bounded timeouts, and reconciliation-first retry behavior.
 3. Synchronize categories by authoritative WordPress ID without seeding or deriving names/slugs.
 4. Perform only the explicitly approved controlled DRAFT, category-assignment, and media tests; do not publicly publish during Round 2B.
 
