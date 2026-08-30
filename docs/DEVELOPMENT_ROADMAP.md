@@ -24,7 +24,7 @@
 
 Read-only first: REST API availability, authentication capability, actual post type, category IDs/names/slugs, media endpoint, featured-media behaviour, writable post fields, custom metadata capability, reconciliation/idempotency mechanism, and relevant theme/plugin behaviour.
 
-**Status: CURRENT**
+**Status: APPROVED**
 
 ## Round 2B — WordPress adapter and controlled integration
 
