@@ -41,3 +41,5 @@ WHERE "id" = $id
 Exactly one affected row means the caller won the transition. Zero means it lost a race or used stale state and must reload and re-evaluate. This contract is not implemented as a generic optimistic-locking framework.
 
 External WordPress or Meta calls must never be placed inside the PostgreSQL transaction that performs a compare-and-set transition.
+
+Round 1.2 adds no state or transition. Later Story creation snapshots `Reporter.editorialByline ?? Reporter.displayName` into `Story.byline`; category collection supports multiple assignments and assumes no primary category. A later publication guard must require at least one `ACTIVE` category, but that guard is intentionally deferred.
