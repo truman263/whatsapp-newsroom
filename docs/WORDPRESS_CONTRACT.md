@@ -2,7 +2,7 @@
 
 ## 1. Discovery scope
 
-Round 2A performed read-only contract discovery against the production public site. Only `HEAD`, `GET`, and `OPTIONS` were used. No authenticated request, write request, form submission, administrative login, database synchronization, or security probing was performed.
+Round 2A performed read-only contract discovery against the production site. Only `HEAD`, `GET`, and `OPTIONS` were used. Public discovery succeeded; an initial Application Password probe failed because of a misconfigured username, then authenticated read-only discovery succeeded after the username was corrected manually. No write request, form submission, administrative login, database synchronization, or security probing was performed.
 
 - **DISCOVERED FACT:** Discovery ran at `2026-08-30T11:43:35Z` (UTC).
 - **DISCOVERED FACT:** Target site: `https://simbidzebasa.co.zw/`.
@@ -120,17 +120,54 @@ Headline, body, excerpt, slug, comments, categories, public permalink, and exist
 
 ## 10. Authentication and capabilities
 
-- `WORDPRESS_USERNAME`: absent.
-- `WORDPRESS_APPLICATION_PASSWORD`: absent.
-- **AUTHENTICATED DISCOVERY: BLOCKED — CREDENTIALS NOT CONFIGURED.**
+- `WORDPRESS_USERNAME`: configured and non-placeholder at pre-flight.
+- `WORDPRESS_APPLICATION_PASSWORD`: configured and non-placeholder at pre-flight.
+- **DISCOVERED FACT:** The earlier HTTP 401 was resolved after the configured WordPress username was corrected manually.
+- **DISCOVERED FACT:** An Application Password `GET` to `/wp-json/wp/v2/users/me?context=edit` returned HTTP 200.
+- **DISCOVERED FACT:** Authenticated identity is dedicated integration user ID 2, display name “SDB News”, role `author`.
+- **AUTHENTICATION: SUCCEEDED.**
+- **DISCOVERED FACT:** The response passed through `hcdn` without a redirect, bot challenge, or `Retry-After`.
 
-No alternative authentication was attempted. Before authenticated discovery can be completed, an administrator must manually provide a least-privilege WordPress integration username and its Application Password through ignored environment configuration. Round 2A did not create credentials or access `wp-admin`.
+The dedicated Author credential was used only for read-only contract discovery. No user, role, password, Application Password, or WordPress state was changed.
+
+**CONFIRMED FROM AUTHENTICATED CAPABILITY DATA:** `edit_posts`, `publish_posts`, `upload_files`, `edit_published_posts`, and `delete_posts` are true.
+
+**CONFIRMED FROM AUTHENTICATED CAPABILITY DATA:** `edit_others_posts`, `delete_others_posts`, `manage_categories`, `manage_options`, user administration, plugin administration, and theme administration are false. The newsroom does not require these broader capabilities.
+
+**CONFIRMED FROM AUTHENTICATED CAPABILITY DATA AND WORDPRESS CORE CAPABILITY MAPPING:** `edit_posts` is true. For the built-in category taxonomy, `assign_terms` uses `assign_categories`, and WordPress core `map_meta_cap()` resolves `assign_categories` to `edit_posts`. The dedicated Author account therefore supports assigning existing categories while remaining unable to manage the taxonomy. A serialized `assign_categories` value is not, by itself, the effective-capability result because this meta capability is resolved through `edit_posts`.
 
 - **ADVERTISED BY SCHEMA:** Posts, categories, and media collection routes advertise `POST`; individual posts advertise update and delete methods.
-- **UNCONFIRMED UNTIL ROUND 2B WRITE TEST:** Integration-user identity; ability to edit posts, create drafts, publish, upload files, assign categories, set featured media, or use post meta.
-- **UNCONFIRMED UNTIL ROUND 2B WRITE TEST:** Application Password authentication and any WAF/security-middleware interaction with authenticated requests.
+- **UNVERIFIED UNTIL ROUND 2B WRITE TEST:** Actual draft creation/editing, publication, media upload, assignment of existing categories, featured-media assignment, and registered-meta writes.
 
-Publishing timezone/date settings were not requested because authenticated configuration was unavailable.
+### Authenticated post edit context
+
+**DISCOVERED FACT:** An authenticated `context=edit` collection query restricted to author ID 2 returned HTTP 200 and zero posts. The dedicated integration user currently owns no post that can be sampled in edit context without accessing another author’s content.
+
+The authenticated `OPTIONS` post schema exposed the same core top-level fields as public discovery and no plugin-added top-level field. It advertises title, content, excerpt, slug, status, author, categories, tags, `featured_media`, meta, template, `generated_slug`, and `permalink_template`. Availability in schema and Author capability data does not prove future write behavior.
+
+### Authenticated category contract
+
+**DISCOVERED FACT:** The taxonomy schema remained readable and confirms that assignment uses `assign_categories`, while create/edit/delete taxonomy operations use separate management capabilities. A category collection request with `context=edit` returned HTTP 403 `rest_forbidden_context` for the Author account; the terms REST controller requires the taxonomy `edit_terms` capability for edit context. This tested taxonomy-term editing, not assignment of existing terms to a post. Public category reads remain available from the approved public discovery.
+
+The resulting least-privilege contract is: category creation/edit/delete and broader taxonomy management are denied; assignment of existing categories is supported by WordPress core capability mapping because the account has `edit_posts`. No role or capability change is required. Actual REST assignment remains **UNVERIFIED UNTIL ROUND 2B WRITE TEST**.
+
+### Authenticated media and featured media
+
+**DISCOVERED FACT:** An authenticated media collection query restricted to author ID 2 returned HTTP 200 and zero attachments. The media OPTIONS schema remained accessible and advertises title, caption, description, alt text, parent post, author, date, slug, status, template, and meta. `upload_files` is true in authenticated capability data. The post schema continues to expose standard attachment-ID `featured_media`.
+
+**UNVERIFIED UNTIL ROUND 2B WRITE TEST:** Upload acceptance, file limits, attachment behavior, media metadata changes, and featured-media assignment. No material authenticated plugin/security difference was observed in the media schema.
+
+### Authenticated meta and plugin/theme fields
+
+**DISCOVERED FACT:** Authenticated post schema exposes registered Astra layout/display meta, Elementor edit mode/template/data/page settings/conditions, and core `footnotes`. No newsroom-specific top-level field or registered reconciliation meta was exposed. No publishing-relevant SureRank, LiteSpeed, or Hostinger post field appeared in the authenticated core post schema.
+
+The post collection GET contract still advertises no arbitrary-meta query parameter. Astra, Elementor, SureRank, and unrelated plugin fields are not suitable idempotency storage.
+
+**RECONCILIATION CONTRACT: UNRESOLVED.** The preferred architecture remains a minimal newsroom-specific WordPress extension registering a private UUID reconciliation key that is REST retrievable and deterministically searchable, with uniqueness or equivalent duplicate prevention. It must be validated before draft creation relies on it.
+
+### Timezone and date contract
+
+**DISCOVERED FACT:** The dedicated Author account received HTTP 403 `rest_forbidden` from the filtered settings endpoint. A prior read-only administrator discovery established WordPress timezone `Africa/Harare`, date format `F j, Y`, and time format `g:i a`; these settings are not exposed to the production-oriented Author credential. A separate GMT offset was not returned. Post schema exposes both `date` and `date_gmt`; later integration must validate their write behavior against the named timezone.
 
 ## 11. HTTP, proxy, and security behavior
 
@@ -139,34 +176,34 @@ Publishing timezone/date settings were not requested because authenticated confi
 - **DISCOVERED FACT:** The server header reported `hcdn`, indicating an intermediary at the HTTP delivery layer.
 - **DISCOVERED FACT:** No bot challenge, REST block, `Retry-After`, or rate-limit header was observed in the small sequential request set.
 - **DISCOVERED FACT:** One initial PowerShell HTTP client attempt timed out before receiving a response; subsequent controlled curl requests succeeded.
+- **DISCOVERED FACT:** After correcting the configured username, authenticated Application Password requests returned HTTP 200 through `hcdn` without a redirect, bot challenge, or explicit WAF error.
+- **INFERENCE:** Authorization currently reaches WordPress through the observed Hostinger/hCDN path.
 - **INFERENCE:** Future client timeouts and retries should tolerate intermittent transport behavior without assuming a failed request means no WordPress side effect.
 
 No bypass, scan, brute force, load test, or unrelated administration request was attempted.
 
 ## 12. Unknowns requiring controlled Round 2B validation
 
-1. Application Password authentication and integration-user identity.
-2. Exact least-privilege capabilities for draft creation, editing, publication, media upload, category assignment, featured media, and meta.
-3. Accepted draft fields and sanitization/rendering behavior.
-4. Whether a private, durable, REST-retrievable and deterministically searchable reconciliation field can be registered.
-5. Idempotent recovery after an uncertain draft-create response.
-6. Media size/MIME limits, upload response, metadata updates, and attachment behavior.
-7. Category synchronization permissions and retirement behavior.
-8. Theme/plugin behavior when creating a controlled draft, including byline presentation and any Astra, Elementor, SureRank, LiteSpeed, or Hostinger effects.
-9. Timezone/date behavior in authenticated edit context.
+1. Actual draft creation/editing, publication, category assignment, featured-media assignment, and registered-meta writes.
+2. Accepted draft fields and sanitization/rendering behavior.
+3. Registration, privacy, uniqueness, deterministic lookup, and write behavior of a dedicated reconciliation key.
+4. Idempotent recovery after an uncertain draft-create response.
+5. Media size/MIME limits, upload response, metadata updates, and attachment behavior.
+6. Category synchronization and retirement behavior.
+7. Theme/plugin behavior for a controlled draft, including byline presentation and Astra, Elementor, SureRank, LiteSpeed, or Hostinger effects.
+8. Exact `date`/`date_gmt` write behavior under `Africa/Harare`.
 
 ## 13. Round 2B recommendation
 
 **CONDITIONAL GO.**
 
-Public discovery supports core `post`, standard categories/tags, multiple category IDs, normal media attachments, and standard featured-media references. Round 2B may begin only after supervisor approval and manual least-privilege Application Password configuration.
+Public and authenticated read-only discovery support core `post`, standard categories/tags, normal media/featured-media structures, Application Password authentication, and a dedicated Author integration identity. WordPress core capability mapping supports assignment of existing categories through the account's confirmed `edit_posts` capability while taxonomy management remains denied. Reconciliation remains unresolved. Round 2B may begin only after the reconciliation mechanism receives supervisor design approval and Round 2A is approved.
 
 Before any controlled draft creation, Round 2B should:
 
-1. Authenticate with a least-privilege integration account and confirm capabilities through read-only requests first.
-2. Resolve the reconciliation contract. Preferred option: a minimal dedicated WordPress extension that registers a private UUID meta field for posts, exposes it in authenticated REST edit context, enforces uniqueness or deterministic lookup, and prevents editorial/theme display. Confirm search/retrieval before relying on it.
-3. Implement an isolated WordPress adapter with strict redaction, bounded timeouts, and reconciliation-first retry behavior.
-4. Synchronize categories by authoritative WordPress ID without seeding or deriving names/slugs.
-5. Perform only the explicitly approved controlled DRAFT and media tests; do not publicly publish during Round 2B.
+1. Resolve the reconciliation contract. Preferred option: a minimal dedicated WordPress extension that registers a private UUID meta field for posts, exposes it in authenticated REST edit context, enforces uniqueness or deterministic lookup, and prevents editorial/theme display. Confirm search/retrieval before relying on it.
+2. Implement an isolated WordPress adapter with strict redaction, bounded timeouts, and reconciliation-first retry behavior.
+3. Synchronize categories by authoritative WordPress ID without seeding or deriving names/slugs.
+4. Perform only the explicitly approved controlled DRAFT, category-assignment, and media tests; do not publicly publish during Round 2B.
 
 The recommendation is not a claim that any write capability has been proven.
