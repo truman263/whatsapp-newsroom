@@ -18,7 +18,7 @@
 - WordPress categories
 - Multi-category Story relationships
 
-**Status: CURRENT**
+**Status: APPROVED**
 
 ## Round 2A — Simbidzebasa WordPress contract discovery
 
