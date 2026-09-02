@@ -47,7 +47,19 @@ Local Newsroom Bridge source, private reconciliation storage, idempotent draft-c
 - Hook/plugin side-effect review
 - No public publication
 
-**Status: CURRENT**
+**Status: APPROVED**
+
+## Round 2B.2A — WordPress trust-boundary architecture and disposable security proof
+
+Design and locally prove a route-scoped authentication architecture that removes generic WordPress credentials from the newsroom backend, locks down the draft service identity, preserves deterministic draft reconciliation, separates future publication authority, and leaves ordinary WordPress users unaffected.
+
+**Status: CURRENT — design under supervisor review**
+
+## Round 2B.2B — WordPress trust-boundary implementation and validation
+
+Implement the supervisor-approved authentication boundary in production-quality WordPress source, validate it locally/staging, and prepare an audited migration plan. No publication, production deployment, or backend adapter work is implied.
+
+**Status: PENDING**
 
 ## Round 2B — WordPress adapter and controlled integration
 
