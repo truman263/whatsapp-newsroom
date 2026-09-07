@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "src/modules/wordpress-draft",
+    "outDir": "../../wordpress/runtime/backend-draft-adapter/.build",
+    "declaration": false,
+    "sourceMap": false,
+    "incremental": false,
+    "composite": false,
+    "noEmitOnError": true
+  },
+  "include": ["src/modules/wordpress-draft/wordpress-draft.client.ts"],
+  "exclude": ["node_modules", "dist", "test", "**/*.spec.ts"]
+}

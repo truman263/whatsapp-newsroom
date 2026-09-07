@@ -59,7 +59,19 @@ Design and locally prove a route-scoped authentication architecture that removes
 
 Implement the supervisor-approved authentication boundary in production-quality WordPress source, validate it locally/staging, and prepare an audited migration plan. No publication, production deployment, or backend adapter work is implied.
 
+**Status: APPROVED**
+
+## Round 2B.3A — WordPress backend draft adapter (HMAC)
+
+Implement the Node.js backend draft adapter in `@newsroom/api` that signs newsroom HMAC requests to the production Newsroom Bridge and performs deterministic draft creation with recoverable uncertain outcomes. No publication, media authority, or production deployment work is implied; it is validated locally/staging against the frozen bridge.
+
 **Status: CURRENT — implementation under supervisor review**
+
+## Round 2B.3B — WordPress media authority and idempotency
+
+Design and implement front-end-agnostic backend authority to prepare and attach media (featured image upload, media idempotency) to drafts through the WordPress trust boundary, extending the Round 2B.3A draft client. No publication work is implied; validation is local/staging only.
+
+**Status: PENDING**
 
 ## Round 2B — WordPress adapter and controlled integration
 

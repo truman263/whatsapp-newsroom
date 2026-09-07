@@ -14,8 +14,11 @@ export interface ApplicationConfiguration {
   };
   wordpress: {
     baseUrl: string;
-    username: string;
-    applicationPassword: string;
+    draftHmacKeyId: string;
+    draftHmacSecret: string;
+    requestTimeoutMs: number;
+    reconciliationAttempts: number;
+    reconciliationDelayMs: number;
   };
 }
 
@@ -36,8 +39,11 @@ export default function configuration(): ApplicationConfiguration {
     },
     wordpress: {
       baseUrl: environment.WORDPRESS_BASE_URL,
-      username: environment.WORDPRESS_USERNAME,
-      applicationPassword: environment.WORDPRESS_APPLICATION_PASSWORD,
+      draftHmacKeyId: environment.WORDPRESS_DRAFT_HMAC_KEY_ID,
+      draftHmacSecret: environment.WORDPRESS_DRAFT_HMAC_SECRET,
+      requestTimeoutMs: environment.WORDPRESS_REQUEST_TIMEOUT_MS,
+      reconciliationAttempts: environment.WORDPRESS_RECONCILIATION_ATTEMPTS,
+      reconciliationDelayMs: environment.WORDPRESS_RECONCILIATION_DELAY_MS,
     },
   };
 }
