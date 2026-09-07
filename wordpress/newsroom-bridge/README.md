@@ -1,16 +1,20 @@
 # Newsroom Bridge
 
-Local source for the WordPress-side idempotent draft-creation and reconciliation primitive. The local source has passed supervisor source audit; it is not deployed, installed, activated, WordPress-integration-tested, or production-validated.
+Local source for the WordPress-side idempotent draft-creation, reconciliation, and route-scoped authentication boundary. The reconciliation core has passed supervisor source and disposable-runtime audits. Version 1.1.0 adds the Round 2B.2B production-quality trust-boundary implementation, which remains under supervisor review. Nothing here is deployed, installed, activated, or tested on Simbidzebasa.
 
 ## Configuration
 
-Define the dedicated integration user ID outside this plugin, for example in the target site's protected configuration:
+Define security configuration outside WordPress database storage, for example in protected deployment configuration:
 
 ```php
 define( 'NEWSROOM_BRIDGE_USER_ID', 2 );
+define( 'NEWSROOM_BRIDGE_SERVICE_LOCKDOWN_ENABLED', true );
+define( 'NEWSROOM_BRIDGE_HMAC_ENABLED', true );
+define( 'NEWSROOM_BRIDGE_DRAFT_HMAC_KEYS_JSON', '[{"id":"draft-key-id","secret":"<canonical-43-character-base64url-secret>"}]' );
+define( 'NEWSROOM_BRIDGE_SECURITY_LOGGING_ENABLED', false );
 ```
 
-The value is deployment configuration, not plugin business logic. Both custom routes fail closed unless the authenticated REST user matches it and has `edit_posts`.
+The example shows shape only and contains no usable secret. The service identity requires exactly the approved reduced capability policy. HMAC enablement requires explicit lockdown enablement; malformed configuration fails closed. HMAC enablement also makes lockdown effective so a configuration mismatch cannot create simultaneous generic and route-scoped authority. The plugin validates policy and does not alter users, roles, capabilities, passwords, or Application Password records.
 
 ## Routes
 
@@ -19,4 +23,6 @@ The value is deployment configuration, not plugin business logic. Both custom ro
 
 There is no publish, delete, update, media, category-management, user, settings, admin UI, or debug route.
 
-Activation installs the private reconciliation table. Deactivation and uninstall intentionally retain it. Production installation, activation, table-engine verification, and controlled request validation are pending supervisor approval.
+HMAC version 1 accepts only direct top-level requests for these two method/route pairs. Authentication creates a request-bound proof without establishing a service user. Only the frozen permission and route callbacks receive temporary service authority, and each invocation restores the previous user in `finally`. Every nested REST dispatch is denied while that authority is active. Its password and Application Password authentication are denied while lockdown is effective; malformed security flags retain identity-scoped lockdown, and unrelated users remain governed by ordinary WordPress behavior.
+
+Activation installs only the private reconciliation table. Authentication secrets are never written to WordPress storage. Deactivation and uninstall intentionally retain reconciliation history. Production installation, activation, ingress duplicate-header proof, migration, and controlled request validation remain pending supervisor approval.

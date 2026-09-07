@@ -211,3 +211,17 @@ Before any controlled draft creation, Round 2B should:
 4. Perform only the explicitly approved controlled DRAFT, category-assignment, and media tests; do not publicly publish during Round 2B.
 
 The recommendation is not a claim that any write capability has been proven.
+
+## 14. Local Round 2B trust-boundary contract
+
+Round 2B.2A approved replacing the generic backend WordPress credential with a newsroom-scoped HMAC boundary. Round 2B.2B now provides local production-quality Newsroom Bridge 1.1.0 source for that contract, under supervisor review. This does not change the historical Round 2A live-site findings and has not been installed, activated, or validated on Simbidzebasa.
+
+Deployment configuration supplies `NEWSROOM_BRIDGE_USER_ID`, literal boolean lockdown/HMAC flags, and a JSON draft-key ring outside WordPress database storage. A configured key is a canonical 256-bit base64url secret and strict non-secret key ID. No repository or WordPress database value contains a production key.
+
+When enabled, HMAC authority is recognized only for direct top-level `POST /newsroom/v1/drafts` and `GET /newsroom/v1/drafts/{canonical-lowercase-UUID-v4}`. Version 1 binds key ID, uppercase method, concrete canonical REST route, Unix timestamp, and the SHA-256 hash of the exact raw body. POST requires the frozen JSON Content-Type policy; GET requires zero bytes and no Content-Type. Queries, method overrides, ambiguous route/header representations, prior WordPress authentication, and every non-approved route receive the same HTTP 401 authentication failure.
+
+After complete validation, WordPress retains a request-bound proof without service authority. Narrow wrappers temporarily establish the configured reduced service user only while invoking the unchanged bridge permission and route callbacks; required capabilities are `read` and `edit_posts`, and the approved dangerous-capability set must remain absent. Each authority period restores the previous user in `finally`. Any nested REST server dispatch while authority is active returns the generic 401, including recursive or mutated reuse of the top-level request object. No cookie, login session, nonce, or Application Password is created.
+
+Effective service lockdown denies ordinary-password and Application Password authentication only for that identity. It remains enabled if either security flag is malformed. Unrelated WordPress users remain unaffected. The plugin does not mutate roles, capabilities, passwords, or stored Application Passwords. HMAC enabled without valid explicit lockdown configuration fails closed while lockdown remains effective, preventing simultaneous generic and HMAC service authority.
+
+Publication, media authority, backend adapter work, production ingress validation, credential migration, and deployment remain outside this local implementation round. Production remains **NO-GO** pending supervisor source/runtime review and the separately authorized migration and production gates.

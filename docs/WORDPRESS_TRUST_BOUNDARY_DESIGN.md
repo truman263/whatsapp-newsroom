@@ -4,7 +4,7 @@
 
 Round 2B.1 proved that a WordPress Author Application Password is a generic WordPress credential. Its holder could bypass Newsroom Bridge and mutate core resources directly. A promise that the backend will call only the bridge is not a security boundary.
 
-Round 2B.2A therefore requires a credential whose meaning WordPress restricts to approved newsroom routes. This document records a disposable local proof and a proposed architecture. It is **not production implementation, deployment, or validation**.
+Round 2B.2A therefore requires a credential whose meaning WordPress restricts to approved newsroom routes. This document records the approved architecture and its disposable local proof. Round 2B.2B implements that design in local production-quality source under supervisor review; neither round is deployment or production validation.
 
 ## 2. Round 2B.1 evidence
 
@@ -85,7 +85,7 @@ Option B can add defence in depth, but it depends on identifying posts, autosave
 
 Choose **Option C: newsroom-scoped HMAC authentication with an internally established, locked-down WordPress service-user context**.
 
-The backend holds a dedicated 256-bit draft HMAC secret and non-secret key identifier. It holds no generic WordPress credential. During top-level REST authentication, WordPress accepts HMAC only for the two approved newsroom method/route pairs. After validation, WordPress establishes the configured draft service user. The unchanged bridge then performs its exact-user and `edit_posts` checks and invokes the core posts controller internally.
+The backend holds a dedicated 256-bit draft HMAC secret and non-secret key identifier. It holds no generic WordPress credential. During top-level REST authentication, WordPress accepts HMAC only for the two approved newsroom method/route pairs and creates a request-bound proof without establishing a WordPress user. Exact wrappers later revalidate that proof and establish the configured draft service user only around each frozen permission or callback invocation. The unchanged bridge then performs its exact-user and `edit_posts` checks and invokes the core posts controller internally.
 
 For every other HTTP route, the same HMAC headers cause generic authentication failure and never establish a WordPress user. This positive allow-list avoids enumerating every generic mutation endpoint.
 
@@ -180,7 +180,7 @@ The proof requires exact HTTP 401 for draft create, publish, update, delete, aut
 
 The existing bridge's internal `WP_REST_Posts_Controller` call remains compatible because it runs after approved HMAC authentication under the reduced current user; it is not a second external HTTP route.
 
-The production authenticator must preserve the pre-existing WordPress current-user context before manual switching and restore it through a finally-equivalent path after the approved top-level newsroom dispatch. The service context remains active while Newsroom Bridge invokes `WP_REST_Posts_Controller`, creates the draft, verifies postconditions, and commits reconciliation. It must not issue a cookie/session/Application Password or leak into unrelated nested work after dispatch.
+The production implementation must preserve the pre-existing WordPress current-user context before manual switching and restore it through a finally-equivalent boundary around each authority-bearing bridge invocation. Authentication itself establishes no service user. The service context remains active while the wrapped Newsroom Bridge callback invokes `WP_REST_Posts_Controller`, creates the draft, verifies postconditions, and commits reconciliation. It must not issue a cookie/session/Application Password or leak into nested REST work.
 
 ## 12. XML-RPC controls
 
