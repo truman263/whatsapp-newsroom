@@ -65,11 +65,17 @@ Implement the supervisor-approved authentication boundary in production-quality 
 
 Implement the Node.js backend draft adapter in `@newsroom/api` that signs newsroom HMAC requests to the production Newsroom Bridge and performs deterministic draft creation with recoverable uncertain outcomes. No publication, media authority, or production deployment work is implied; it is validated locally/staging against the frozen bridge.
 
-**Status: CURRENT — implementation under supervisor review**
+**Status: APPROVED**
 
 ## Round 2B.3B — WordPress media authority and idempotency
 
-Design and implement front-end-agnostic backend authority to prepare and attach media (featured image upload, media idempotency) to drafts through the WordPress trust boundary, extending the Round 2B.3A draft client. No publication work is implied; validation is local/staging only.
+Design and prove (disposable runtime only) a media authority that is deliberately separate from the draft authority: media-specific canonical HMAC headers and key ring, dedicated media service identity, media reconciliation table, reservation-first idempotency, replay/conflict semantics, crash-window recovery, and orphan garbage collection. No publication work is implied; validation is local/staging only against the frozen bridge.
+
+**Status: CURRENT — media authority/idempotency architecture and disposable proof**
+
+## Round 2B.3C — Production media bridge + backend media adapter implementation
+
+Implement the supervisor-approved media authority in production-quality WordPress source (production media bridge extension) and the Node.js backend media adapter, extending the Round 2B.3B proof design and the Round 2B.3A draft client.
 
 **Status: PENDING**
 
@@ -78,6 +84,10 @@ Design and implement front-end-agnostic backend authority to prepare and attach 
 Isolated WordPress client using capabilities already confirmed during approved Round 2A discovery, category synchronisation, controlled DRAFT creation only, media upload, featured image, category assignment, draft retrieval/update, reconciliation of uncertain draft creation, and no public publication test.
 
 **Status: PENDING**
+
+## Production deployment (all of Round 2B)
+
+**Status: NO-GO** — deployment of any WordPress media/draft authority work is not permitted until the supervisor approves the full Round 2B sequence.
 
 ## Round 3 — WhatsApp Cloud API webhook ingestion
 
