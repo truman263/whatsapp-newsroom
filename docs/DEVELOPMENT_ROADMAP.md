@@ -79,6 +79,12 @@ Implement the supervisor-approved media authority in production-quality WordPres
 
 **Status: CURRENT — production media bridge + backend media adapter implemented and validated in the disposable runtime; production deployment NO-GO**
 
+## Round 2B.4A — WordPress draft sync + featured media design and disposable proof
+
+Architecture and disposable-proof for full-state draft synchronisation (title, body, excerpt, exact category set, featured media by media key) with fingerprint-version CAS, replay idempotency, uncertain-outcome fail-closed semantics, and no status/author mutation or publication. 2B.4B will implement the design in production-quality backend (Node adapter + page) and production bridge extensions; production work remains NO-GO until the supervisor approves this round's report.
+
+**Status: CURRENT — design + disposable proof validated in the disposable runtime (39 evidence groups); production implementation NO-GO**
+
 ## Round 2B — WordPress adapter and controlled integration
 
 Isolated WordPress client using capabilities already confirmed during approved Round 2A discovery, category synchronisation, controlled DRAFT creation only, media upload, featured image, category assignment, draft retrieval/update, reconciliation of uncertain draft creation, and no public publication test.
