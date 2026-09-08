@@ -71,13 +71,13 @@ Implement the Node.js backend draft adapter in `@newsroom/api` that signs newsro
 
 Design and prove (disposable runtime only) a media authority that is deliberately separate from the draft authority: media-specific canonical HMAC headers and key ring, dedicated media service identity, media reconciliation table, reservation-first idempotency, replay/conflict semantics, crash-window recovery, and orphan garbage collection. No publication work is implied; validation is local/staging only against the frozen bridge.
 
-**Status: CURRENT — media authority/idempotency architecture and disposable proof**
+**Status: APPROVED**
 
 ## Round 2B.3C — Production media bridge + backend media adapter implementation
 
 Implement the supervisor-approved media authority in production-quality WordPress source (production media bridge extension) and the Node.js backend media adapter, extending the Round 2B.3B proof design and the Round 2B.3A draft client.
 
-**Status: PENDING**
+**Status: CURRENT — production media bridge + backend media adapter implemented and validated in the disposable runtime; production deployment NO-GO**
 
 ## Round 2B — WordPress adapter and controlled integration
 

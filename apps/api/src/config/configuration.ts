@@ -19,6 +19,12 @@ export interface ApplicationConfiguration {
     requestTimeoutMs: number;
     reconciliationAttempts: number;
     reconciliationDelayMs: number;
+    mediaHmacKeyId: string;
+    mediaHmacSecret: string;
+    mediaRequestTimeoutMs: number;
+    mediaReconciliationAttempts: number;
+    mediaReconciliationDelayMs: number;
+    mediaMaxBytes: number;
   };
 }
 
@@ -44,6 +50,12 @@ export default function configuration(): ApplicationConfiguration {
       requestTimeoutMs: environment.WORDPRESS_REQUEST_TIMEOUT_MS,
       reconciliationAttempts: environment.WORDPRESS_RECONCILIATION_ATTEMPTS,
       reconciliationDelayMs: environment.WORDPRESS_RECONCILIATION_DELAY_MS,
+      mediaHmacKeyId: environment.WORDPRESS_MEDIA_HMAC_KEY_ID,
+      mediaHmacSecret: environment.WORDPRESS_MEDIA_HMAC_SECRET,
+      mediaRequestTimeoutMs: environment.WORDPRESS_MEDIA_REQUEST_TIMEOUT_MS,
+      mediaReconciliationAttempts: environment.WORDPRESS_MEDIA_RECONCILIATION_ATTEMPTS,
+      mediaReconciliationDelayMs: environment.WORDPRESS_MEDIA_RECONCILIATION_DELAY_MS,
+      mediaMaxBytes: environment.WORDPRESS_MEDIA_MAX_BYTES,
     },
   };
 }
