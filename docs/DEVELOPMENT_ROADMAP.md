@@ -105,6 +105,8 @@ Isolated WordPress client using capabilities already confirmed during approved R
 
 Webhook verification, signature authenticity, normalisation, durable InboundEvent persistence, and database-backed deduplication.
 
+**Status: CURRENT — webhook ingestion implementation under supervisor review**
+
 ## Round 4 — Reporter authorisation and deterministic conversation state machine
 
 Phone allowlist, Reporter provisioning, Conversation provisioning, and compare-and-set transitions.

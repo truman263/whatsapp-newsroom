@@ -17,7 +17,7 @@ function logLevelsFor(environment: string | undefined): LogLevel[] {
 }
 
 async function bootstrap(logger: ConsoleLogger): Promise<void> {
-  const app = await NestFactory.create(AppModule, { logger });
+  const app = await NestFactory.create(AppModule, { logger, rawBody: true });
 
   app.useGlobalPipes(
     new ValidationPipe({
