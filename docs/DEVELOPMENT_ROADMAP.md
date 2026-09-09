@@ -77,7 +77,7 @@ Design and prove (disposable runtime only) a media authority that is deliberatel
 
 Implement the supervisor-approved media authority in production-quality WordPress source (production media bridge extension) and the Node.js backend media adapter, extending the Round 2B.3B proof design and the Round 2B.3A draft client.
 
-**Status: CURRENT — production media bridge + backend media adapter implemented and validated in the disposable runtime; production deployment NO-GO**
+**Status: APPROVED — production media bridge + backend media adapter implemented and validated in the disposable runtime; production deployment NO-GO**
 
 ## Round 2B.4A — WordPress draft sync + featured media design and disposable proof
 
@@ -89,13 +89,13 @@ Architecture and disposable-proof for full-state draft synchronisation (title, b
 
 Implement the approved 2B.4A design in production-quality backend (Node adapter) and production bridge extensions (sync PUT + state GET, featured media by media key, fingerprint-version CAS, production auth regression on the current runtime). No publication, deployment, or production validation work is implied.
 
-**Status: CURRENT — production sync/state implementation validated in the disposable runtime (57 evidence groups); production deployment NO-GO**
+**Status: APPROVED — production sync/state implementation validated in the disposable runtime (57 evidence groups); production deployment NO-GO**
 
 ## Round 2B — WordPress adapter and controlled integration
 
 Isolated WordPress client using capabilities already confirmed during approved Round 2A discovery, category synchronisation, controlled DRAFT creation only, media upload, featured image, category assignment, draft retrieval/update, reconciliation of uncertain draft creation, and no public publication test.
 
-**Status: PENDING**
+**Status: APPROVED — Round 2B implementation is approved; production deployment remains NO-GO**
 
 ## Production deployment (all of Round 2B)
 
