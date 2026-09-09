@@ -6,7 +6,7 @@ const schema = readFileSync(resolve(repositoryRoot, 'prisma/schema.prisma'), 'ut
 const migration = readFileSync(
   resolve(
     repositoryRoot,
-    'prisma/migrations/20260830120000_round_1_domain_foundation/migration.sql',
+    'prisma/migrations/00000000000000_round_1_2_baseline/migration.sql',
   ),
   'utf8',
 );
