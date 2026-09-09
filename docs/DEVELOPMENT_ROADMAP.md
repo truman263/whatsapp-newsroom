@@ -83,7 +83,13 @@ Implement the supervisor-approved media authority in production-quality WordPres
 
 Architecture and disposable-proof for full-state draft synchronisation (title, body, excerpt, exact category set, featured media by media key) with fingerprint-version CAS, replay idempotency, uncertain-outcome fail-closed semantics, and no status/author mutation or publication. 2B.4B will implement the design in production-quality backend (Node adapter + page) and production bridge extensions; production work remains NO-GO until the supervisor approves this round's report.
 
-**Status: CURRENT — design + disposable proof validated in the disposable runtime (39 evidence groups); production implementation NO-GO**
+**Status: APPROVED** — disposable proof validated in the disposable runtime; production implementation recorded in Round 2B.4B.
+
+## Round 2B.4B — Production draft sync + featured media implementation
+
+Implement the approved 2B.4A design in production-quality backend (Node adapter) and production bridge extensions (sync PUT + state GET, featured media by media key, fingerprint-version CAS, production auth regression on the current runtime). No publication, deployment, or production validation work is implied.
+
+**Status: CURRENT — production sync/state implementation validated in the disposable runtime (57 evidence groups); production deployment NO-GO**
 
 ## Round 2B — WordPress adapter and controlled integration
 

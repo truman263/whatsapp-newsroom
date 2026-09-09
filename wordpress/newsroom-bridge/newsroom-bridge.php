@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Newsroom Bridge
  * Description: Private idempotent WordPress draft creation and reconciliation boundary.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  */
@@ -11,7 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'NEWSROOM_BRIDGE_VERSION', '1.2.0' );
+define( 'NEWSROOM_BRIDGE_VERSION', '1.3.0' );
 define( 'NEWSROOM_BRIDGE_SCHEMA_VERSION', '2' );
 
 require_once __DIR__ . '/includes/class-newsroom-bridge-key-ring-json.php';
@@ -21,6 +21,7 @@ require_once __DIR__ . '/includes/class-newsroom-bridge-auth.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-db.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-reconciliation.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-rest.php';
+require_once __DIR__ . '/includes/class-newsroom-bridge-draft-sync-rest.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-media-config.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-media-service-user.php';
 require_once __DIR__ . '/includes/class-newsroom-bridge-media-auth.php';
@@ -54,6 +55,8 @@ add_action(
 		$reconciliation = new Newsroom_Bridge_Reconciliation( $database );
 		$rest           = new Newsroom_Bridge_REST( $reconciliation );
 		$rest->register_routes();
+		$sync = new Newsroom_Bridge_Draft_Sync_REST( $database, new Newsroom_Bridge_Media_DB(), $reconciliation );
+		$sync->register_routes();
 
 		$media_config   = Newsroom_Bridge_Media_Config::from_constants();
 		$media_database = new Newsroom_Bridge_Media_DB();

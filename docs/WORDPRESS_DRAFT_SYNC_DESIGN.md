@@ -253,6 +253,28 @@ SELECT post_id FROM wp_newsroom_reconciliation WHERE draft_key = %s FOR UPDATE
 Replays also traverse the locked transaction path, so a replay can never race a
 write into a stale fingerprint.
 
+### 9.1 CAS ordering (authoritative, Round 2B.4B)
+
+CAS protects Actual state transitions. Inside the writer-locked transaction the
+checks run in this exact order:
+
+1. **validate** the payload (schema, categories, media key);
+2. **compute `current_version = state_fingerprint(current_state)`** from the
+   latest committed state (post cache invalidated after the lock);
+3. **compare `current_version` against the desired version** (not `expected`):
+   - `current_version == desired_version` → **200 `replayed: true`**,
+     `applied_version = current_version`, **zero mutation** — even if
+     `expected_version` looks stale, because the target is already the actual
+     committed state;
+   - `current_version != desired_version` **and `expected_version` is stale** →
+     **409 `newsroom_draft_sync_stale_version`**, zero mutation;
+   - CAS match (`expected_version == current_version`) → transition.
+4. **mutate**, then 5. **postcondition**.
+
+The implementation in `Newsroom_Bridge_Draft_Sync_REST` follows this ordering;
+`cas_stale_noop_replay_200` in the Round 2B.4B runtime proves the stale-echo
+replay precedence over the stale rejection.
+
 ## 10. Uncertain outcome and partial failure
 
 The sync is one transaction. On any unexpected throwable:
@@ -405,6 +427,13 @@ The suite covers:
 Full per-group results: `wordpress/runtime/draft-sync-proof/runtime-results.json`
 (git-ignored, from the executed run; summary in Appendix F).
 
+**Round 2B.4B supersedes this proof runtime.** The production implementation
+and its 57-group validation live in the
+`wordpress/runtime/draft-sync-implementation/` runtime (production plugin
+active, read-only mount), documented in
+`docs/WORDPRESS_DRAFT_SYNC_IMPLEMENTATION.md`. The proof runtime remains as
+frozen historical evidence of the 2B.4A approval.
+
 ## 16. GO / NO-GO
 
 This document is the approval candidate. The executed final round report owns
@@ -496,3 +525,5 @@ reported in full in the Round 2B.4A report (Appendix F summary).
   `docs/WORDPRESS_MEDIA_IMPLEMENTATION.md`
 - `wordpress/newsroom-bridge/` (frozen production sources)
 - `wordpress/runtime/draft-sync-proof/` (this proof)
+- `wordpress/runtime/draft-sync-implementation/` (production implementation runtime)
+- `docs/WORDPRESS_DRAFT_SYNC_IMPLEMENTATION.md` (Round 2B.4B validation)

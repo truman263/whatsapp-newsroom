@@ -53,6 +53,22 @@ describe('wordpress-hmac', () => {
       expect(() => assertApprovedRoute('GET', '/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000')).not.toThrow();
     });
 
+    it('accepts PUT with canonical UUID v4 (draft sync)', () => {
+      expect(() => assertApprovedRoute('PUT', '/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000')).not.toThrow();
+    });
+
+    it('accepts GET on the state route with canonical UUID v4', () => {
+      expect(() => assertApprovedRoute('GET', '/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000/state')).not.toThrow();
+    });
+
+    it('rejects PUT on the state route', () => {
+      expect(() => assertApprovedRoute('PUT', '/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000/state')).toThrow('Unsupported WordPress newsroom operation.');
+    });
+
+    it('rejects PUT without UUID', () => {
+      expect(() => assertApprovedRoute('PUT', '/newsroom/v1/drafts')).toThrow('Unsupported WordPress newsroom operation.');
+    });
+
     it('rejects GET without UUID', () => {
       expect(() => assertApprovedRoute('GET', '/newsroom/v1/drafts')).toThrow('Unsupported WordPress newsroom operation.');
     });
@@ -101,6 +117,22 @@ describe('wordpress-hmac', () => {
       expect(headers['X-Newsroom-Key-Id']).toBe(TEST_KEY_ID);
       expect(headers['X-Newsroom-Timestamp']).toBe(String(FIXED_TIMESTAMP));
       expect(headers['X-Newsroom-Signature']).toBe(GET_SIGNATURE);
+    });
+
+    it('produces deterministic state GET signature matching cross-language KAT', () => {
+      const headers = signNewsroomRequest({
+        method: 'GET', route: `${GET_ROUTE}/state`, rawBody: '',
+        keyId: TEST_KEY_ID, secret: VALID_SECRET, timestamp: FIXED_TIMESTAMP,
+      });
+      expect(headers['X-Newsroom-Signature']).toBe('e2432e11a6ab28cc4b7b5f76197784d2199a278089d97a14d59f78f5f7e0b078');
+    });
+
+    it('produces deterministic PUT signature matching cross-language KAT', () => {
+      const body = JSON.stringify({ draft_key: '550e8400-e29b-41d4-a716-446655440000', title: 'Sync KAT Title', content: 'KAT body', excerpt: '', categories: [1, 2], featured_media_key: null, expected_version: null });
+      expect(body).toBe('{"draft_key":"550e8400-e29b-41d4-a716-446655440000","title":"Sync KAT Title","content":"KAT body","excerpt":"","categories":[1,2],"featured_media_key":null,"expected_version":null}');
+      const headers = signNewsroomRequest({ method: 'PUT', route: GET_ROUTE, rawBody: body, keyId: TEST_KEY_ID, secret: VALID_SECRET, timestamp: FIXED_TIMESTAMP });
+      expect(headers['X-Newsroom-Signature']).toBe('14dd7d83826bda8e8cc789e745e3be8b3c8b3971d1d4a625cea552f877fc4190');
+      expect(createHash('sha256').update(body).digest('hex')).toBe('c9d9fa144f03bb41144b57c807ba9453499deee133c17f7f2a80b297dcfad9ed');
     });
 
     it('produces exact canonical string with no trailing LF', () => {

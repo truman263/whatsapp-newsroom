@@ -67,7 +67,7 @@ final class Newsroom_Bridge_Auth {
 			return $this->failure( 'query', '', $category );
 		}
 
-		if ( 'POST' === $method && ! $this->json_content_type_is_valid() ) {
+		if ( ( 'POST' === $method || 'PUT' === $method ) && ! $this->json_content_type_is_valid() ) {
 			return $this->failure( 'content_type', '', $category );
 		}
 		if ( 'GET' === $method && $this->header_exists( 'CONTENT_TYPE' ) ) {
@@ -206,7 +206,10 @@ final class Newsroom_Bridge_Auth {
 			return false;
 		}
 		$p = $this->proof;
-		$expected_url = 'GET' === $p['method'] ? array( 'draft_key' => substr( $p['route'], strlen( '/newsroom/v1/drafts/' ) ) ) : array();
+		$expected_url = array();
+		if ( preg_match( '#\A/newsroom/v1/drafts/([0-9a-f-]{36})(?:/state)?\z#D', $p['route'], $parts ) ) {
+			$expected_url = array( 'draft_key' => $parts[1] );
+		}
 		return true === $p['verified'] && $request === $p['request']
 			&& $request->get_method() === $p['method'] && $request->get_route() === $p['route']
 			&& hash_equals( $p['body_hash'], hash( 'sha256', $request->get_body() ) )
@@ -234,21 +237,32 @@ final class Newsroom_Bridge_Auth {
 		return $response;
 	}
 
-	/** Wrap only the unchanged bridge's two original handlers, never a namespace. */
+	/** Wrap only the four approved draft handlers, never a namespace. */
 	public function wrap_endpoints( $endpoints ) {
-		$routes = array( '/newsroom/v1/drafts' => 'create_draft', '/newsroom/v1/drafts/(?P<draft_key>[a-f0-9-]{36})' => 'get_draft' );
-		foreach ( $routes as $route => $method ) {
+		$routes = array(
+			'/newsroom/v1/drafts'                       => 'create_draft',
+			'/newsroom/v1/drafts/(?P<draft_key>[a-f0-9-]{36})'     => array( 'get_draft', 'sync_draft' ),
+			'/newsroom/v1/drafts/(?P<draft_key>[a-f0-9-]{36})/state' => 'get_state',
+		);
+		foreach ( $routes as $route => $methods ) {
 			if ( ! isset( $endpoints[ $route ] ) ) {
 				continue;
 			}
+			$allowed = (array) $methods;
 			foreach ( $endpoints[ $route ] as &$handler ) {
 				if ( ! is_array( $handler ) || ! isset( $handler['callback'], $handler['permission_callback'] ) ) {
 					continue;
 				}
-				$callback = $handler['callback'];
-				$permission = $handler['permission_callback'];
-				if ( ! is_array( $callback ) || ! $callback[0] instanceof Newsroom_Bridge_REST || $method !== $callback[1]
-					|| ! is_array( $permission ) || $permission[0] !== $callback[0] || 'permission_check' !== $permission[1] ) {
+				$callback    = $handler['callback'];
+				$permission  = $handler['permission_callback'];
+				$callback_ok = false;
+				if ( is_array( $callback ) && count( $callback ) === 2 && is_object( $callback[0] ) && is_string( $callback[1] ) ) {
+					$callback_ok = in_array( $callback[1], $allowed, true ) && (
+						( $callback[0] instanceof Newsroom_Bridge_REST && in_array( $callback[1], array( 'create_draft', 'get_draft' ), true ) )
+						|| ( $callback[0] instanceof Newsroom_Bridge_Draft_Sync_REST && in_array( $callback[1], array( 'sync_draft', 'get_state' ), true ) )
+					);
+				}
+				if ( ! $callback_ok || ! is_array( $permission ) || count( $permission ) !== 2 || $permission[0] !== $callback[0] || 'permission_check' !== $permission[1] ) {
 					continue;
 				}
 				$handler['permission_callback'] = function ( $request ) use ( $permission ) {
@@ -353,6 +367,20 @@ final class Newsroom_Bridge_Auth {
 			&& 1 === preg_match( '#\A/newsroom/v1/drafts/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z#D', $route )
 		) {
 			return 'draft_lookup';
+		}
+
+		if (
+			'GET' === $method
+			&& 1 === preg_match( '#\A/newsroom/v1/drafts/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/state\z#D', $route )
+		) {
+			return 'draft_state';
+		}
+
+		if (
+			'PUT' === $method
+			&& 1 === preg_match( '#\A/newsroom/v1/drafts/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z#D', $route )
+		) {
+			return 'draft_sync';
 		}
 
 		return '';

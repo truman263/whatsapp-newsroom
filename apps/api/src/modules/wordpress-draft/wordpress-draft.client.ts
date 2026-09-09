@@ -1,14 +1,15 @@
+import { syncPayload, validateStateResponse, draftStateFingerprint, type SyncWordPressDraftInput, type SyncWordPressDraftResult, type WordPressDraftState } from './wordpress-draft-state';
 import { WordPressDraftError } from './wordpress-draft.errors';
 import { assertApprovedRoute, decodeDraftHmacSecret, signNewsroomRequest } from './wordpress-hmac';
 import type { CreateWordPressDraftInput, CreateWordPressDraftResult, WordPressDraftClientOptions, WordPressDraftReference } from './wordpress-draft.types';
 
 export interface TransportResponse { status: number; body: unknown; }
 export interface WordPressTransport {
-  send(request: { method: 'GET' | 'POST'; url: string; headers: Readonly<Record<string, string>>; body?: string; timeoutMs: number }): Promise<TransportResponse>;
+  send(request: { method: 'GET' | 'POST' | 'PUT'; url: string; headers: Readonly<Record<string, string>>; body?: string; timeoutMs: number }): Promise<TransportResponse>;
 }
 
 class FetchWordPressTransport implements WordPressTransport {
-  async send(request: { method: 'GET' | 'POST'; url: string; headers: Readonly<Record<string, string>>; body?: string; timeoutMs: number }): Promise<TransportResponse> {
+  async send(request: { method: 'GET' | 'POST' | 'PUT'; url: string; headers: Readonly<Record<string, string>>; body?: string; timeoutMs: number }): Promise<TransportResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), request.timeoutMs);
     try {
@@ -46,6 +47,42 @@ export class WordPressDraftClient {
   async getDraftByKey(wordpressDraftKey: string): Promise<WordPressDraftReference> {
     validateDraftKey(wordpressDraftKey);
     return this.getDraft(wordpressDraftKey);
+  }
+
+  async getDraftState(draftKey: string): Promise<WordPressDraftState> {
+    validateDraftKey(draftKey);
+    const response = await this.send('GET', `/newsroom/v1/drafts/${draftKey}/state`);
+    if (response.status !== 200) throw classifyStatus(response.status);
+    return validateStateResponse(response.body, draftKey, true);
+  }
+
+  async syncDraft(input: SyncWordPressDraftInput): Promise<SyncWordPressDraftResult> {
+    const payload = syncPayload(input);
+    const rawBody = JSON.stringify(payload);
+    const desired = draftStateFingerprint(payload);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await this.send('PUT', `/newsroom/v1/drafts/${payload.draft_key}`, rawBody);
+        if (response.status === 200) {
+          const result = validateStateResponse(response.body, payload.draft_key, false);
+          if (result.applied_version !== desired || result.featured_media_key !== payload.featured_media_key) throw new WordPressDraftError('UNEXPECTED_RESPONSE', 'WordPress returned inconsistent sync state.');
+          return { ...result, outcome: result.replayed ? 'REPLAYED' : 'APPLIED' };
+        }
+        if (response.status === 409 && response.body && typeof response.body === 'object' && (response.body as Record<string, unknown>).code === 'newsroom_draft_sync_stale_version') throw new WordPressDraftError('STALE_VERSION', 'WordPress draft state changed.', 409);
+        if (response.status >= 200 && response.status < 300) throw new WordPressDraftError('UNCERTAIN_OUTCOME', 'WordPress sync outcome is uncertain.');
+        throw classifyStatus(response.status);
+      } catch (error) {
+        const failure = classifyTransport(error);
+        if (!['UNCERTAIN_OUTCOME', 'UNEXPECTED_RESPONSE'].includes(failure.code)) throw failure;
+        let current: WordPressDraftState;
+        try { current = await this.getDraftState(payload.draft_key); }
+        catch { throw new WordPressDraftError('UNCERTAIN_OUTCOME', 'WordPress sync could not be reconciled.'); }
+        if (current.applied_version === desired) return { draft_key: current.draft_key, post_id: current.post_id, status: 'draft', featured_media_key: current.featured_media_key, applied_version: current.applied_version, replayed: true, outcome: 'RECOVERED' };
+        if (payload.expected_version !== null && payload.expected_version !== current.applied_version) throw new WordPressDraftError('STALE_VERSION', 'WordPress draft state changed.', 409);
+        if (attempt === 1) throw new WordPressDraftError('UNCERTAIN_OUTCOME', 'WordPress sync outcome remains uncertain.');
+      }
+    }
+    throw new WordPressDraftError('UNCERTAIN_OUTCOME', 'WordPress sync outcome remains uncertain.');
   }
 
   private async postOrReconcile(draftKey: string, rawBody: string, mayRetryPost: boolean): Promise<CreateWordPressDraftResult> {
@@ -89,12 +126,12 @@ export class WordPressDraftClient {
     throw classifyStatus(response.status);
   }
 
-  private async send(method: 'GET' | 'POST', route: string, rawBody = ''): Promise<TransportResponse> {
+  private async send(method: 'GET' | 'POST' | 'PUT', route: string, rawBody = ''): Promise<TransportResponse> {
     assertApprovedRoute(method, route);
     const headers: Record<string, string> = { ...signNewsroomRequest({ method, route, rawBody, keyId: this.options.keyId, secret: this.secret, timestamp: Math.floor(this.now() / 1000) }) };
-    if (method === 'POST') headers['Content-Type'] = 'application/json';
+    if (method !== 'GET') headers['Content-Type'] = 'application/json';
     const url = this.urlFor(route);
-    try { return await this.transport.send({ method, url, headers, ...(method === 'POST' ? { body: rawBody } : {}), timeoutMs: this.options.requestTimeoutMs }); }
+    try { return await this.transport.send({ method, url, headers, ...(method !== 'GET' ? { body: rawBody } : {}), timeoutMs: this.options.requestTimeoutMs }); }
     catch { throw new WordPressDraftError('UNCERTAIN_OUTCOME', 'WordPress request outcome is uncertain.'); }
   }
 

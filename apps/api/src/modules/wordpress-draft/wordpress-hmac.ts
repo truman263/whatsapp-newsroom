@@ -19,13 +19,13 @@ export function decodeDraftHmacSecret(encoded: string): Buffer {
 }
 
 export function assertApprovedRoute(method: string, route: string): void {
-  if (!((method === 'POST' && route === CREATE_ROUTE) || (method === 'GET' && GET_ROUTE.test(route)))) {
+  if (!((method === 'POST' && route === CREATE_ROUTE) || ((method === 'GET' || method === 'PUT') && GET_ROUTE.test(route)) || (method === 'GET' && route.endsWith('/state') && GET_ROUTE.test(route.slice(0, -6))))) {
     throw new Error('Unsupported WordPress newsroom operation.');
   }
 }
 
 export function signNewsroomRequest(input: {
-  method: 'GET' | 'POST'; route: string; rawBody: string; keyId: string; secret: Buffer; timestamp: number;
+  method: 'GET' | 'POST' | 'PUT'; route: string; rawBody: string; keyId: string; secret: Buffer; timestamp: number;
 }): NewsroomHmacHeaders {
   assertApprovedRoute(input.method, input.route);
   if (!KEY_ID.test(input.keyId) || !Number.isSafeInteger(input.timestamp) || input.timestamp < 0) throw new Error('Invalid WordPress draft HMAC configuration.');

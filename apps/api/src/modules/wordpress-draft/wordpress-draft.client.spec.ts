@@ -2,6 +2,7 @@ import { createHash, createHmac } from 'node:crypto';
 import type { WordPressDraftClientOptions } from './wordpress-draft.types';
 import { WordPressDraftClient, type TransportResponse, type WordPressTransport } from './wordpress-draft.client';
 import { WordPressDraftError, type WordPressDraftErrorCode } from './wordpress-draft.errors';
+import { draftStateFingerprint, syncPayload, type SyncWordPressDraftInput } from './wordpress-draft-state';
 
 const TEST_KEY_ID = 'test-draft-key';
 const TEST_SECRET = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -11,7 +12,7 @@ const FIXED_NOW = 1700000000000;
 const UUID = '550e8400-e29b-41d4-a716-446655440000';
 
 interface MockRequest {
-  method: 'GET' | 'POST';
+  method: 'GET' | 'POST' | 'PUT';
   url: string;
   headers: Record<string, string>;
   body?: string;
@@ -85,6 +86,15 @@ async function expectClientError(promise: Promise<unknown>, code: WordPressDraft
 }
 
 const validDraftInput = { wordpressDraftKey: UUID, headline: 'Title', body: 'Content', wordpressCategoryIds: [1] };
+const validSyncInput: SyncWordPressDraftInput = { wordpressDraftKey: UUID, headline: 'Sync Title', body: 'Sync Content', excerpt: '', wordpressCategoryIds: [1], featuredMediaKey: null, expectedVersion: null };
+function syncStateBody(input: SyncWordPressDraftInput = validSyncInput): Record<string, unknown> {
+  const payload = syncPayload(input);
+  return { draft_key: payload.draft_key, post_id: 42, status: 'draft', title: payload.title, content: payload.content, excerpt: payload.excerpt, categories: payload.categories, featured_media_key: payload.featured_media_key, author_id: 2, applied_version: draftStateFingerprint(payload) };
+}
+function anyStateBody(fields: { title?: string; content?: string; categories?: number[]; featured_media_key?: string | null } = {}): Record<string, unknown> {
+  const state = { title: fields.title ?? 'Current', content: fields.content ?? 'Current body', excerpt: '', categories: fields.categories ?? [1], featured_media_key: fields.featured_media_key ?? null };
+  return { draft_key: UUID, post_id: 99, status: 'draft', ...state, author_id: 2, applied_version: draftStateFingerprint(state) };
+}
 
 describe('WordPressDraftClient', () => {
   describe('constructor validation', () => {
@@ -428,6 +438,333 @@ describe('WordPressDraftClient', () => {
       mock.setHandler(() => ({ status: 401, body: {} }));
       const { client } = makeClient({}, mock);
       await expectClientError(client.createDraft(validDraftInput), 'AUTHENTICATION_FAILURE', 401);
+    });
+  });
+
+  describe('successful getDraftState', () => {
+    it('returns WordPressDraftState on 200', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: syncStateBody() }));
+      const { client, transport } = makeClient({}, mock);
+      const result = await client.getDraftState(UUID);
+      expect(result.draft_key).toBe(UUID);
+      expect(result.status).toBe('draft');
+      expect(result.title).toBe('Sync Title');
+      expect(result.applied_version).toBe(draftStateFingerprint(syncPayload(validSyncInput)));
+      expect(firstRequest(transport).url).toBe('http://localhost:8080/wp-json/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000/state');
+      expect(firstRequest(transport).method).toBe('GET');
+    });
+
+    it('signs the state route with a cross-language GET KAT', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: syncStateBody() }));
+      const { client, transport } = makeClient({ keyId: 'test-v1' }, mock);
+      await client.getDraftState(UUID);
+      const req = firstRequest(transport);
+      expect(req.headers['X-Newsroom-Signature']).toBe('e2432e11a6ab28cc4b7b5f76197784d2199a278089d97a14d59f78f5f7e0b078');
+      expect(req.headers['X-Newsroom-Timestamp']).toBe('1700000000');
+      expect(req.headers['X-Newsroom-Key-Id']).toBe('test-v1');
+    });
+
+    it('never sends Authorization, Cookie, or X-WP-Nonce', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: syncStateBody() }));
+      const { client, transport } = makeClient({}, mock);
+      await client.getDraftState(UUID);
+      const h = firstRequest(transport).headers;
+      expect(h['Authorization']).toBeUndefined();
+      expect(h['Cookie']).toBeUndefined();
+      expect(h['X-WP-Nonce']).toBeUndefined();
+    });
+  });
+
+  describe('strict state response validation', () => {
+    it('rejects non-draft status', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: { ...syncStateBody(), status: 'publish' } }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+
+    it('rejects non-canonical featured_media_key', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: { ...syncStateBody(), featured_media_key: 'not-a-uuid' } }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+
+    it('rejects fingerprint mismatch', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: { ...syncStateBody(), applied_version: 'a'.repeat(64) } }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+
+    it('rejects unsorted categories', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: { ...syncStateBody(), categories: [2, 1] } }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+
+    it('rejects extra fields', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: { ...syncStateBody(), extra: true } }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+
+    it('rejects null body', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 200, body: null }));
+      const { client } = makeClient({}, mock);
+      await expectClientError(client.getDraftState(UUID), 'UNEXPECTED_RESPONSE');
+    });
+  });
+
+  describe('exact-byte PUT transport (cross-language KAT)', () => {
+    it('signs the exact PUT body with the pinned signature', async () => {
+      const mock = new MockTransport();
+      const input: SyncWordPressDraftInput = { wordpressDraftKey: '550e8400-e29b-41d4-a716-446655440000', headline: 'Sync KAT Title', body: 'KAT body', excerpt: '', wordpressCategoryIds: [2, 1], featuredMediaKey: null, expectedVersion: null };
+      const payload = syncPayload(input);
+      mock.setHandler(() => ({ status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } }));
+      const { client, transport } = makeClient({ keyId: 'test-v1' }, mock);
+      const result = await client.syncDraft(input);
+      expect(result.outcome).toBe('APPLIED');
+      const req = firstRequest(transport);
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('http://localhost:8080/wp-json/newsroom/v1/drafts/550e8400-e29b-41d4-a716-446655440000');
+      expect(req.body).toBe('{"draft_key":"550e8400-e29b-41d4-a716-446655440000","title":"Sync KAT Title","content":"KAT body","excerpt":"","categories":[1,2],"featured_media_key":null,"expected_version":null}');
+      expect(req.headers['Content-Type']).toBe('application/json');
+      expect(req.headers['X-Newsroom-Auth-Version']).toBe('1');
+      expect(req.headers['X-Newsroom-Key-Id']).toBe('test-v1');
+      expect(req.headers['X-Newsroom-Timestamp']).toBe('1700000000');
+      expect(req.headers['X-Newsroom-Signature']).toBe('14dd7d83826bda8e8cc789e745e3be8b3c8b3971d1d4a625cea552f877fc4190');
+    });
+  });
+
+  describe('syncDraft semantics', () => {
+    it('returns REPLAYED on replayed:true', async () => {
+      const mock = new MockTransport();
+      const payload = syncPayload(validSyncInput);
+      mock.setHandler(() => ({ status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: true, featured_media_key: null, applied_version: draftStateFingerprint(payload) } }));
+      const { client } = makeClient({}, mock);
+      const result = await client.syncDraft(validSyncInput);
+      expect(result.outcome).toBe('REPLAYED');
+      expect(result.replayed).toBe(true);
+    });
+
+    it('recovers by GET when the applied PUT response is lost', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') { putCount += 1; throw new Error('socket hang up'); }
+        return { status: 200, body: syncStateBody() };
+      });
+      const { client, transport } = makeClient({}, mock);
+      const result = await client.syncDraft(validSyncInput);
+      expect(result.outcome).toBe('RECOVERED');
+      expect(result.applied_version).toBe(draftStateFingerprint(syncPayload(validSyncInput)));
+      expect(putCount).toBe(1);
+      expect(transport.requests).toHaveLength(2);
+      expect(transport.requests[1]?.method).toBe('GET');
+    });
+
+    it('throws STALE_VERSION when GET shows a different applied version', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') { putCount += 1; throw new Error('socket hang up'); }
+        return { status: 200, body: anyStateBody({ title: 'Someone changed it' }) };
+      });
+      const { client, transport } = makeClient({}, mock);
+      const input = { ...validSyncInput, expectedVersion: draftStateFingerprint({ title: 'Old', content: 'Old body', excerpt: '', categories: [1], featured_media_key: null }) };
+      await expectClientError(client.syncDraft(input), 'STALE_VERSION', 409);
+      expect(putCount).toBe(1);
+      expect(transport.requests).toHaveLength(2);
+    });
+
+    it('retries once when the reconcile shows an unapplied state and CAS intent is still valid', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      const previous = { title: 'Old', content: 'Old body', excerpt: '', categories: [1], featured_media_key: null };
+      const previousVersion = draftStateFingerprint(previous);
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') {
+          putCount += 1;
+          if (putCount === 1) throw new Error('ECONNREFUSED');
+          const payload = syncPayload(validSyncInput);
+          return { status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } };
+        }
+        return { status: 200, body: anyStateBody({ title: previous.title, content: previous.content }) };
+      });
+      const { client, transport } = makeClient({}, mock);
+      const result = await client.syncDraft({ ...validSyncInput, expectedVersion: previousVersion });
+      expect(result.outcome).toBe('APPLIED');
+      expect(putCount).toBe(2);
+      expect(transport.requests).toHaveLength(3);
+      const putBodies = transport.requests.filter((r) => r.method === 'PUT');
+      expect(putBodies[1]?.body).toBe(putBodies[0]?.body);
+    });
+
+    it('never blind-retries when the reconciling GET is uncertain', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') { putCount += 1; throw new Error('socket hang up'); }
+        throw new Error('ETIMEDOUT');
+      });
+      const { client, transport } = makeClient({}, mock);
+      await expectClientError(client.syncDraft(validSyncInput), 'UNCERTAIN_OUTCOME');
+      expect(putCount).toBe(1);
+      expect(transport.requests.map((r) => r.method)).toEqual(['PUT', 'GET']);
+    });
+
+    it('recovers malformed 2xx through GET when desired state was applied without a second PUT', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') { putCount += 1; return { status: 200, body: { foo: 1 } }; }
+        return { status: 200, body: syncStateBody() };
+      });
+      const { client, transport } = makeClient({}, mock);
+      const result = await client.syncDraft(validSyncInput);
+      expect(result.outcome).toBe('RECOVERED');
+      expect(putCount).toBe(1);
+      expect(transport.requests.map((r) => r.method)).toEqual(['PUT', 'GET']);
+    });
+
+    it('terminates malformed 2xx as UNCERTAIN_OUTCOME when the reconciling GET is uncertain', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      let getCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') { putCount += 1; return { status: 200, body: { foo: 1 } }; }
+        getCount += 1;
+        throw new Error('ETIMEDOUT');
+      });
+      const { client, transport } = makeClient({}, mock);
+      await expectClientError(client.syncDraft(validSyncInput), 'UNCERTAIN_OUTCOME');
+      expect(putCount).toBe(1);
+      expect(getCount).toBe(1);
+      expect(transport.requests.map((r) => r.method)).toEqual(['PUT', 'GET']);
+    });
+
+    it('retries malformed 2xx once only after GET proves old state and original CAS remains valid', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      let getCount = 0;
+      const previous = { title: 'Old', content: 'Old body', excerpt: '', categories: [1], featured_media_key: null };
+      const previousVersion = draftStateFingerprint(previous);
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') {
+          putCount += 1;
+          if (putCount === 1) return { status: 200, body: { foo: 1 } };
+          const payload = syncPayload(validSyncInput);
+          return { status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } };
+        }
+        getCount += 1;
+        return { status: 200, body: anyStateBody({ title: previous.title, content: previous.content }) };
+      });
+      const { client, transport } = makeClient({}, mock);
+      const result = await client.syncDraft({ ...validSyncInput, expectedVersion: previousVersion });
+      expect(result.outcome).toBe('APPLIED');
+      expect(putCount).toBe(2);
+      expect(getCount).toBe(1);
+      expect(transport.requests.map((r) => r.method)).toEqual(['PUT', 'GET', 'PUT']);
+      const puts = transport.requests.filter((r) => r.method === 'PUT');
+      expect(puts[1]?.body).toBe(puts[0]?.body);
+    });
+
+    it('maps stale-version 409 to STALE_VERSION without reconciling', async () => {
+      const mock = new MockTransport();
+      let getCount = 0;
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') return { status: 409, body: { code: 'newsroom_draft_sync_stale_version' } };
+        getCount += 1;
+        return { status: 200, body: syncStateBody() };
+      });
+      const { client, transport } = makeClient({}, mock);
+      await expectClientError(client.syncDraft(validSyncInput), 'STALE_VERSION', 409);
+      expect(getCount).toBe(0);
+      expect(transport.requests).toHaveLength(1);
+    });
+
+    it('maps redirect on PUT to CONTRACT_FAILURE', async () => {
+      const mock = new MockTransport();
+      mock.setHandler(() => ({ status: 302, body: null }));
+      const { client, transport } = makeClient({}, mock);
+      await expectClientError(client.syncDraft(validSyncInput), 'CONTRACT_FAILURE');
+      expect(transport.requests).toHaveLength(1);
+    });
+
+    it('never sends Authorization, Cookie, or X-WP-Nonce on PUT', async () => {
+      const mock = new MockTransport();
+      const payload = syncPayload(validSyncInput);
+      mock.setHandler(() => ({ status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } }));
+      const { client, transport } = makeClient({}, mock);
+      await client.syncDraft(validSyncInput);
+      const h = firstRequest(transport).headers;
+      expect(h['Authorization']).toBeUndefined();
+      expect(h['Cookie']).toBeUndefined();
+      expect(h['X-WP-Nonce']).toBeUndefined();
+    });
+  });
+
+  describe('syncDraft input validation', () => {
+    it('rejects unknown fields', async () => {
+      const { client } = makeClient();
+      await expectClientError(client.syncDraft({ ...validSyncInput, post_id: 1 } as never), 'CONTRACT_FAILURE');
+    });
+
+    it('rejects non-canonical featured media key', async () => {
+      const { client } = makeClient();
+      await expectClientError(client.syncDraft({ ...validSyncInput, featuredMediaKey: 'not-a-uuid' }), 'CONTRACT_FAILURE');
+    });
+
+    it('rejects invalid expected_version', async () => {
+      const { client } = makeClient();
+      await expectClientError(client.syncDraft({ ...validSyncInput, expectedVersion: 'zz' }), 'CONTRACT_FAILURE');
+    });
+
+    it('rejects empty categories', async () => {
+      const { client } = makeClient();
+      await expectClientError(client.syncDraft({ ...validSyncInput, wordpressCategoryIds: [] }), 'CONTRACT_FAILURE');
+    });
+
+    it('dedupes and sorts category ids in the transmitted body', async () => {
+      const mock = new MockTransport();
+      const input = { ...validSyncInput, wordpressCategoryIds: [3, 1, 2, 3] };
+      const payload = syncPayload(input);
+      mock.setHandler(() => ({ status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } }));
+      const { client, transport } = makeClient({}, mock);
+      await client.syncDraft(input);
+      const parsed = JSON.parse(firstRequest(transport).body as string) as { categories: number[] };
+      expect(parsed.categories).toEqual([1, 2, 3]);
+    });
+
+    it('uses a fresh timestamp/signature when it retries the PUT', async () => {
+      const mock = new MockTransport();
+      let putCount = 0;
+      let clock = 1700000000000;
+      const previous = { title: 'Old', content: 'Old body', excerpt: '', categories: [1], featured_media_key: null };
+      const previousVersion = draftStateFingerprint(previous);
+      mock.setHandler((req) => {
+        if (req.method === 'PUT') {
+          putCount += 1;
+          if (putCount === 1) throw new Error('ECONNREFUSED');
+          const payload = syncPayload(validSyncInput);
+          return { status: 200, body: { draft_key: payload.draft_key, post_id: 42, status: 'draft', replayed: false, featured_media_key: null, applied_version: draftStateFingerprint(payload) } };
+        }
+        return { status: 200, body: anyStateBody({ title: previous.title, content: previous.content }) };
+      });
+      const client = new WordPressDraftClient(makeOptions({}), mock, () => { const current = clock; clock += 500; return current; });
+      const result = await client.syncDraft({ ...validSyncInput, expectedVersion: previousVersion });
+      expect(result.outcome).toBe('APPLIED');
+      const puts = mock.requests.filter((r) => r.method === 'PUT');
+      expect(puts).toHaveLength(2);
+      expect(puts[1]?.headers['X-Newsroom-Timestamp']).not.toBe(puts[0]?.headers['X-Newsroom-Timestamp']);
+      expect(puts[1]?.body).toBe(puts[0]?.body);
     });
   });
 });
