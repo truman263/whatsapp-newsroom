@@ -105,7 +105,7 @@ Isolated WordPress client using capabilities already confirmed during approved R
 
 Webhook verification, signature authenticity, normalisation, durable InboundEvent persistence, and database-backed deduplication.
 
-**Status: CURRENT — webhook ingestion implementation under supervisor review**
+**Status: APPROVED — secure WhatsApp webhook ingestion and real PostgreSQL deduplication/runtime validation completed; production deployment remains NO-GO**
 
 ## Round 4 — Reporter authorisation and deterministic conversation state machine
 
