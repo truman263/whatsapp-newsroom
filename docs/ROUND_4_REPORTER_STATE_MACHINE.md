@@ -1,6 +1,6 @@
 # Round 4 — Reporter authorisation and deterministic conversation state machine
 
-**Status: ARCHITECTURE FREEZE — awaiting supervisor review**
+**Status: APPROVED — architecture frozen and Round 4B implementation validated against disposable PostgreSQL; production deployment remains NO-GO**
 
 ## 1. Scope and non-goals
 

@@ -111,7 +111,7 @@ Webhook verification, signature authenticity, normalisation, durable InboundEven
 
 Phone allowlist, Reporter provisioning, Conversation provisioning, and compare-and-set transitions.
 
-**Status: CURRENT — reporter authorisation and state-machine architecture under supervisor review**
+**Status: APPROVED — Reporter authorisation, controlled provisioning, deterministic Conversation state transitions and PostgreSQL concurrency validation completed; production deployment remains NO-GO**
 
 ## Round 5 — Simbidzebasa-aligned Story/media collection
 
