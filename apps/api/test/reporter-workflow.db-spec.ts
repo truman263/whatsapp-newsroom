@@ -17,6 +17,11 @@ import { REPORTER_WORKFLOW_AUDIT } from "../src/modules/reporter-workflow/report
 import { ReporterAuthorizationService } from "../src/modules/reporter-workflow/reporter-authorization.service";
 import { ReporterProvisioningService } from "../src/modules/reporter-workflow/reporter-provisioning.service";
 import { ReporterWorkflowError } from "../src/modules/reporter-workflow/reporter-workflow.errors";
+import { WhatsappWebhookIngestionService } from "../src/modules/whatsapp-webhook/whatsapp-webhook-ingestion.service";
+import type {
+  NormalizedInboundEvent,
+  NormalizedWebhookBatch,
+} from "../src/modules/whatsapp-webhook/whatsapp-webhook.types";
 
 if (!process.env.DATABASE_URL)
   throw new Error("DATABASE_URL is required; this suite never reads .env");
@@ -25,13 +30,14 @@ jest.setTimeout(120_000);
 const prisma = new PrismaService();
 const run = Date.now().toString().slice(-8);
 let sequence = 0;
+let ingestSequence = 0n;
 const phone = (): string => `+2637${run}${String(sequence++).padStart(2, "0")}`;
 const providerId = (name: string): string =>
   `round4b:${run}:${name}:${sequence++}`;
 
 async function reset(): Promise<void> {
   await prisma.$executeRaw`
-    TRUNCATE TABLE "Approval", "AuditLog", "StoryCategory", "StoryMedia", "OutboundMessage", "PublishAttempt", "Conversation", "InboundEvent", "Story", "EditorialCategory", "Reporter" CASCADE
+    TRUNCATE TABLE "Approval", "AuditLog", "StoryCategory", "StoryMedia", "OutboundMessage", "PublishAttempt", "Conversation", "InboundEvent", "InboundSenderSequence", "Story", "EditorialCategory", "Reporter" CASCADE
   `;
 }
 
@@ -53,11 +59,26 @@ async function inbound(
       provider: Provider.WHATSAPP,
       providerMessageId: providerId(name),
       senderPhone,
+      senderIngestSequence: ingestSequence++,
       reporterId,
       eventType: InboundEventType.TEXT,
       rawPayload: { proof: "round4b" },
     },
   });
+}
+
+function normalized(senderPhone: string, name: string): NormalizedInboundEvent {
+  return {
+    providerMessageId: providerId(name),
+    senderPhone,
+    eventType: InboundEventType.TEXT,
+    rawPayload: { proof: "round5b0" },
+    providerOccurredAt: new Date(),
+  };
+}
+
+function batch(events: NormalizedInboundEvent[]): NormalizedWebhookBatch {
+  return { events, foreignPhoneChanges: 0, unsupportedChanges: 0 };
 }
 
 function processor(client: PrismaService): InboundEventProcessingService {
@@ -703,5 +724,275 @@ describe("Round 4B disposable PostgreSQL proof", () => {
       outcome: "IGNORED",
       reason: "REPORTER_INACTIVE",
     });
+  });
+
+  it("allocates non-overlapping same-sender ranges across 20 concurrent ingestion transactions", async () => {
+    const sender = phone();
+    const pool = await clients(20);
+    try {
+      await Promise.all(
+        pool.map((client, index) =>
+          new WhatsappWebhookIngestionService(client).persist(
+            batch([normalized(sender, `same-sender-${index}`)]),
+          ),
+        ),
+      );
+      const rows = await prisma.inboundEvent.findMany({
+        where: { senderPhone: sender },
+        orderBy: { senderIngestSequence: "asc" },
+        select: { senderIngestSequence: true },
+      });
+      expect(
+        rows.map(({ senderIngestSequence }) => senderIngestSequence),
+      ).toEqual(Array.from({ length: 20 }, (_, index) => BigInt(index)));
+      expect(
+        await prisma.inboundSenderSequence.findUniqueOrThrow({
+          where: { senderPhone: sender },
+          select: { nextValue: true },
+        }),
+      ).toEqual({ nextValue: 20n });
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
+  });
+
+  it("preserves retained traversal order and permits provider-replay reservation gaps", async () => {
+    const sender = phone();
+    const service = new WhatsappWebhookIngestionService(prisma);
+    const first = normalized(sender, "gap-replay-first");
+    const afterDuplicate = normalized(sender, "gap-replay-after-duplicate");
+    await service.persist(batch([first]));
+    await service.persist(batch([first, afterDuplicate]));
+    const rows = await prisma.inboundEvent.findMany({
+      where: { senderPhone: sender },
+      orderBy: { senderIngestSequence: "asc" },
+      select: { providerMessageId: true, senderIngestSequence: true },
+    });
+    expect(rows).toEqual([
+      { providerMessageId: first.providerMessageId, senderIngestSequence: 0n },
+      {
+        providerMessageId: afterDuplicate.providerMessageId,
+        senderIngestSequence: 2n,
+      },
+    ]);
+    expect(
+      await prisma.inboundSenderSequence.findUniqueOrThrow({
+        where: { senderPhone: sender },
+        select: { nextValue: true },
+      }),
+    ).toEqual({ nextValue: 3n });
+
+    const orderedSender = phone();
+    const ordered = [
+      normalized(orderedSender, "traversal-a"),
+      normalized(orderedSender, "traversal-b"),
+      normalized(orderedSender, "traversal-c"),
+    ];
+    await service.persist(batch(ordered));
+    expect(
+      await prisma.inboundEvent.findMany({
+        where: { senderPhone: orderedSender },
+        orderBy: { senderIngestSequence: "asc" },
+        select: { providerMessageId: true, senderIngestSequence: true },
+      }),
+    ).toEqual(
+      ordered.map(({ providerMessageId }, index) => ({
+        providerMessageId,
+        senderIngestSequence: BigInt(index),
+      })),
+    );
+  });
+
+  it("keeps sender cursors independent and avoids reversed multi-sender deadlocks", async () => {
+    const senderA = phone();
+    const senderB = phone();
+    const pool = await clients(2);
+    try {
+      await Promise.all([
+        new WhatsappWebhookIngestionService(pool[0]!).persist(
+          batch([
+            normalized(senderB, "reverse-b-first"),
+            normalized(senderA, "reverse-a-second"),
+          ]),
+        ),
+        new WhatsappWebhookIngestionService(pool[1]!).persist(
+          batch([
+            normalized(senderA, "forward-a-first"),
+            normalized(senderB, "forward-b-second"),
+          ]),
+        ),
+      ]);
+      for (const senderPhone of [senderA, senderB]) {
+        const values = await prisma.inboundEvent.findMany({
+          where: { senderPhone },
+          orderBy: { senderIngestSequence: "asc" },
+          select: { senderIngestSequence: true },
+        });
+        expect(
+          values.map(({ senderIngestSequence }) => senderIngestSequence),
+        ).toEqual([0n, 1n]);
+      }
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
+  });
+
+  it("rolls back every cursor when a later sender makes event insertion fail", async () => {
+    const senderA = phone();
+    const invalidSenderB = `+${"9".repeat(16)}`;
+    const service = new WhatsappWebhookIngestionService(prisma);
+    await expect(
+      service.persist(
+        batch([
+          normalized(senderA, "rollback-a"),
+          normalized(invalidSenderB, "rollback-b"),
+        ]),
+      ),
+    ).rejects.toThrow("Webhook persistence unavailable.");
+    expect(
+      await prisma.inboundEvent.count({ where: { senderPhone: senderA } }),
+    ).toBe(0);
+    expect(
+      await prisma.inboundSenderSequence.count({
+        where: { senderPhone: { in: [senderA, invalidSenderB] } },
+      }),
+    ).toBe(0);
+    await expect(
+      service.persist(batch([normalized(senderA, "rollback-safe-retry")])),
+    ).resolves.toEqual({ inserted: 1 });
+    expect(
+      await prisma.inboundEvent.findFirstOrThrow({
+        where: { senderPhone: senderA },
+        select: { senderIngestSequence: true },
+      }),
+    ).toEqual({ senderIngestSequence: 0n });
+  });
+
+  it("rolls back a reserved range when event insertion fails", async () => {
+    const sender = phone();
+    const service = new WhatsappWebhookIngestionService(prisma);
+    const invalid = normalized(sender, "post-reservation-failure");
+    invalid.providerMessageId = "x".repeat(192);
+    await expect(service.persist(batch([invalid]))).rejects.toThrow(
+      "Webhook persistence unavailable.",
+    );
+    expect(
+      await prisma.inboundEvent.count({ where: { senderPhone: sender } }),
+    ).toBe(0);
+    expect(
+      await prisma.inboundSenderSequence.count({
+        where: { senderPhone: sender },
+      }),
+    ).toBe(0);
+    await service.persist(
+      batch([normalized(sender, "post-reservation-retry")]),
+    );
+    expect(
+      await prisma.inboundEvent.findFirstOrThrow({
+        where: { senderPhone: sender },
+        select: { senderIngestSequence: true },
+      }),
+    ).toEqual({ senderIngestSequence: 0n });
+  });
+
+  it.each([
+    InboundProcessingStatus.RECEIVED,
+    InboundProcessingStatus.PROCESSING,
+  ])("blocks a successor while its predecessor is %s", async (status) => {
+    const sender = phone();
+    const earlier = await inbound(sender, `blocked-earlier-${status}`);
+    await prisma.inboundEvent.update({
+      where: { id: earlier.id },
+      data: { processingStatus: status },
+    });
+    const later = await inbound(sender, `blocked-later-${status}`);
+    await expect(processor(prisma).process(later.id)).resolves.toEqual({
+      outcome: "ORDER_BLOCKED",
+    });
+    expect(
+      await prisma.auditLog.count({ where: { inboundEventId: later.id } }),
+    ).toBe(0);
+  });
+
+  it.each([
+    InboundProcessingStatus.PROCESSED,
+    InboundProcessingStatus.IGNORED,
+    InboundProcessingStatus.FAILED,
+  ])("allows a successor after a %s predecessor", async (status) => {
+    const sender = phone();
+    const earlier = await inbound(sender, `terminal-earlier-${status}`);
+    await prisma.inboundEvent.update({
+      where: { id: earlier.id },
+      data: { processingStatus: status },
+    });
+    const later = await inbound(sender, `terminal-later-${status}`);
+    await expect(processor(prisma).claim(later.id)).resolves.toEqual({
+      outcome: "CLAIMED",
+    });
+  });
+
+  it("claims across a persisted sequence gap", async () => {
+    const sender = phone();
+    await prisma.inboundEvent.create({
+      data: {
+        provider: Provider.WHATSAPP,
+        providerMessageId: providerId("gap-zero"),
+        senderPhone: sender,
+        senderIngestSequence: 0n,
+        eventType: InboundEventType.TEXT,
+        rawPayload: { proof: "gap" },
+        processingStatus: InboundProcessingStatus.PROCESSED,
+      },
+    });
+    const later = await prisma.inboundEvent.create({
+      data: {
+        provider: Provider.WHATSAPP,
+        providerMessageId: providerId("gap-two"),
+        senderPhone: sender,
+        senderIngestSequence: 2n,
+        eventType: InboundEventType.TEXT,
+        rawPayload: { proof: "gap" },
+      },
+    });
+    await expect(processor(prisma).claim(later.id)).resolves.toEqual({
+      outcome: "CLAIMED",
+    });
+  });
+
+  it("serializes adjacent claims and orders unknown-Reporter terminal handling", async () => {
+    const sender = phone();
+    const first = await inbound(sender, "adjacent-first");
+    const second = await inbound(sender, "adjacent-second");
+    const pool = await clients(2);
+    try {
+      const results = await Promise.all([
+        processor(pool[0]!).claim(first.id),
+        processor(pool[1]!).claim(second.id),
+      ]);
+      expect(
+        results.filter(({ outcome }) => outcome === "CLAIMED"),
+      ).toHaveLength(1);
+      expect(await processor(prisma).process(second.id)).toEqual({
+        outcome: "ORDER_BLOCKED",
+      });
+      await prisma.inboundEvent.update({
+        where: { id: first.id },
+        data: {
+          processingStatus: InboundProcessingStatus.RECEIVED,
+          processingStartedAt: null,
+          processingAttempts: 0,
+        },
+      });
+      await expect(processor(prisma).process(first.id)).resolves.toEqual({
+        outcome: "IGNORED",
+        reason: "REPORTER_UNKNOWN",
+      });
+      await expect(processor(prisma).process(second.id)).resolves.toEqual({
+        outcome: "IGNORED",
+        reason: "REPORTER_UNKNOWN",
+      });
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
   });
 });

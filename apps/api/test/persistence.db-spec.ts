@@ -76,6 +76,7 @@ describe("PostgreSQL persistence contract", () => {
   const providerId = (name: string): string => `dbtest:${runId}:${name}`;
   const correlation = (name: string): string => `dbtest:${runId}:${name}`;
   let categorySequence = 0n;
+  let inboundSequence = 0n;
 
   async function createReporter(
     suffix: number,
@@ -99,6 +100,7 @@ describe("PostgreSQL persistence contract", () => {
         providerMessageId: providerId(name),
         reporterId,
         senderPhone: phone(9),
+        senderIngestSequence: inboundSequence++,
         eventType: InboundEventType.TEXT,
         rawPayload: { testRun: runId, name },
       },
@@ -282,6 +284,7 @@ describe("PostgreSQL persistence contract", () => {
         "Conversation",
         "EditorialCategory",
         "InboundEvent",
+        "InboundSenderSequence",
         "OutboundMessage",
         "PublishAttempt",
         "Reporter",
@@ -297,10 +300,10 @@ describe("PostgreSQL persistence contract", () => {
     expect(Number(constraints.find(({ type }) => type === "c")?.count)).toBe(7);
     expect(
       Number(indexes.find(({ unique_index }) => unique_index)?.count),
-    ).toBe(16);
+    ).toBe(17);
     expect(
       Number(indexes.find(({ unique_index }) => !unique_index)?.count),
-    ).toBe(27);
+    ).toBe(28);
     expect(
       Number(
         columnTypes.find(
@@ -312,7 +315,7 @@ describe("PostgreSQL persistence contract", () => {
       Number(
         columnTypes.find(({ data_type }) => data_type === "bigint")?.count,
       ),
-    ).toBe(5);
+    ).toBe(7);
   });
 
   it("persists nullable and non-null Reporter editorial bylines", async () => {
@@ -470,6 +473,7 @@ describe("PostgreSQL persistence contract", () => {
           provider: Provider.WHATSAPP,
           providerMessageId: providerId("inbound-unique"),
           senderPhone: phone(9),
+          senderIngestSequence: inboundSequence++,
           eventType: InboundEventType.TEXT,
           rawPayload: { testRun: runId },
         },
@@ -729,6 +733,7 @@ describe("PostgreSQL persistence contract", () => {
           provider: Provider.WHATSAPP,
           providerMessageId: providerId("negative-inbound"),
           senderPhone: phone(9),
+          senderIngestSequence: inboundSequence++,
           eventType: InboundEventType.TEXT,
           rawPayload: { testRun: runId },
           processingAttempts: -1,
@@ -960,6 +965,7 @@ describe("PostgreSQL persistence contract", () => {
           provider: Provider.WHATSAPP,
           providerMessageId: duplicateId,
           senderPhone: phone(9),
+          senderIngestSequence: variant === "one" ? 900000n : 900001n,
           eventType: InboundEventType.TEXT,
           rawPayload: { testRun: runId, variant },
         },

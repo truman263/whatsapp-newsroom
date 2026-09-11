@@ -45,6 +45,12 @@ function body(id = "wamid.e2e"): Record<string, unknown> {
 describe("WhatsApp webhook (e2e)", () => {
   let app: INestApplication;
   const createMany = jest.fn();
+  const tx = {
+    $executeRaw: jest.fn().mockResolvedValue(1),
+    $queryRaw: jest.fn().mockResolvedValue([{ nextValue: 0n }]),
+    inboundSenderSequence: { update: jest.fn().mockResolvedValue({}) },
+    inboundEvent: { createMany },
+  };
 
   beforeAll(async () => {
     process.env.NODE_ENV = "test";
@@ -53,7 +59,10 @@ describe("WhatsApp webhook (e2e)", () => {
     process.env.WHATSAPP_PHONE_NUMBER_ID = "test-phone-number-id";
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(PrismaService)
-      .useValue({ inboundEvent: { createMany } })
+      .useValue({
+        $transaction: (operation: (client: typeof tx) => unknown) =>
+          operation(tx),
+      })
       .compile();
     app = moduleRef.createNestApplication({ rawBody: true });
     await app.listen(0, "127.0.0.1");
@@ -247,10 +256,7 @@ describe("WhatsApp webhook (e2e)", () => {
     if (!address || typeof address === "string")
       throw new Error("Expected TCP listener");
     const response = await new Promise<string>((resolve, reject) => {
-      const socket = createConnection(
-        address.port,
-        "127.0.0.1",
-      );
+      const socket = createConnection(address.port, "127.0.0.1");
       let output = "";
       socket.on("connect", () =>
         socket.write(

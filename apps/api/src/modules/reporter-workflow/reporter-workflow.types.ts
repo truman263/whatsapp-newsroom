@@ -37,9 +37,12 @@ export type TransitionResult =
   | { outcome: "NOT_FOUND_OR_NOT_OWNED" };
 
 export type EventClaimResult =
-  { outcome: "CLAIMED" } | { outcome: "NOT_CLAIMED" };
+  | { outcome: "CLAIMED" }
+  | { outcome: "ORDER_BLOCKED" }
+  | { outcome: "NOT_CLAIMED" };
 
 export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }
   | { outcome: "IGNORED"; reason: "REPORTER_UNKNOWN" | "REPORTER_INACTIVE" }
+  | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };

@@ -22,28 +22,46 @@ export class InboundEventProcessingService {
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
-    const result = await this.prisma.inboundEvent.updateMany({
-      where: {
-        id: eventId,
-        processingStatus: InboundProcessingStatus.RECEIVED,
-      },
-      data: {
-        processingStatus: InboundProcessingStatus.PROCESSING,
-        processingStartedAt: new Date(),
-        processingAttempts: { increment: 1 },
-        processedAt: null,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
-    });
-    return result.count === 1
-      ? { outcome: "CLAIMED" }
+    const now = new Date();
+    const claimed = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      UPDATE "InboundEvent" AS candidate
+      SET "processingStatus" = 'PROCESSING'::"InboundProcessingStatus",
+          "processingStartedAt" = ${now},
+          "processingAttempts" = candidate."processingAttempts" + 1,
+          "processedAt" = NULL,
+          "lastErrorCode" = NULL,
+          "lastErrorMessage" = NULL,
+          "updatedAt" = ${now}
+      WHERE candidate."id" = ${eventId}::uuid
+        AND candidate."processingStatus" = 'RECEIVED'::"InboundProcessingStatus"
+        AND NOT EXISTS (
+          SELECT 1 FROM "InboundEvent" AS earlier
+          WHERE earlier."senderPhone" = candidate."senderPhone"
+            AND earlier."senderIngestSequence" < candidate."senderIngestSequence"
+            AND earlier."processingStatus" IN ('RECEIVED'::"InboundProcessingStatus", 'PROCESSING'::"InboundProcessingStatus")
+        )
+      RETURNING candidate."id"
+    `;
+    if (claimed.length === 1) return { outcome: "CLAIMED" };
+    const blocked = await this.prisma.$queryRaw<Array<{ blocked: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM "InboundEvent" AS candidate
+        JOIN "InboundEvent" AS earlier
+          ON earlier."senderPhone" = candidate."senderPhone"
+         AND earlier."senderIngestSequence" < candidate."senderIngestSequence"
+         AND earlier."processingStatus" IN ('RECEIVED'::"InboundProcessingStatus", 'PROCESSING'::"InboundProcessingStatus")
+        WHERE candidate."id" = ${eventId}::uuid
+          AND candidate."processingStatus" = 'RECEIVED'::"InboundProcessingStatus"
+      ) AS blocked
+    `;
+    return blocked[0]?.blocked
+      ? { outcome: "ORDER_BLOCKED" }
       : { outcome: "NOT_CLAIMED" };
   }
 
   async process(eventId: string): Promise<EventProcessingResult> {
     const claim = await this.claim(eventId);
-    if (claim.outcome === "NOT_CLAIMED") return claim;
+    if (claim.outcome !== "CLAIMED") return claim;
     return this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT "id" FROM "InboundEvent" WHERE "id" = ${eventId}::uuid FOR UPDATE

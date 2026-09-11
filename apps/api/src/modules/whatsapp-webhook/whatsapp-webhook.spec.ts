@@ -183,7 +183,9 @@ describe("Whatsapp webhook security and normalisation", () => {
     expect(
       normalizer.normalize({
         object: "whatsapp_business_account",
-        entry: [{ changes: [{ field: "messages", value: { statuses: [{}] } }] }],
+        entry: [
+          { changes: [{ field: "messages", value: { statuses: [{}] } }] },
+        ],
       }).events,
     ).toHaveLength(0);
     expect(
@@ -204,7 +206,17 @@ describe("Whatsapp webhook security and normalisation", () => {
 describe("WhatsappWebhookIngestionService", () => {
   it("persists WHATSAPP candidates with database-backed duplicate handling and approved defaults", async () => {
     const createMany = jest.fn().mockResolvedValue({ count: 1 });
-    const prisma = { inboundEvent: { createMany } } as unknown as PrismaService;
+    const tx = {
+      $executeRaw: jest.fn().mockResolvedValue(1),
+      $queryRaw: jest.fn().mockResolvedValue([{ nextValue: 0n }]),
+      inboundSenderSequence: { update: jest.fn().mockResolvedValue({}) },
+      inboundEvent: { createMany },
+    };
+    const prisma = {
+      $transaction: jest.fn((operation: (client: typeof tx) => unknown) =>
+        operation(tx),
+      ),
+    } as unknown as PrismaService;
     const event = new WhatsappWebhookNormalizer(config()).normalize(payload())
       .events[0]!;
     await expect(
@@ -231,6 +243,7 @@ describe("WhatsappWebhookIngestionService", () => {
       unknown
     >;
     expect(stored).not.toHaveProperty("processingStatus");
+    expect(stored.senderIngestSequence).toBe(0n);
     expect(JSON.stringify(stored.rawPayload)).not.toMatch(
       /app-secret|verify-token|signature/i,
     );
@@ -251,11 +264,9 @@ describe("WhatsappWebhookIngestionService", () => {
 
   it("maps database failures to a retriable generic 503 exception", async () => {
     const prisma = {
-      inboundEvent: {
-        createMany: jest
-          .fn()
-          .mockRejectedValue(new Error("secret database detail")),
-      },
+      $transaction: jest
+        .fn()
+        .mockRejectedValue(new Error("secret database detail")),
     } as unknown as PrismaService;
     const event = new WhatsappWebhookNormalizer(config()).normalize(payload())
       .events[0]!;

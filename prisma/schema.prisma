@@ -140,6 +140,7 @@ model InboundEvent {
   providerMessageId   String                  @db.VarChar(191)
   reporterId          String?                 @db.Uuid
   senderPhone         String                  @db.VarChar(16)
+  senderIngestSequence BigInt                 @db.BigInt
   eventType           InboundEventType
   processingStatus    InboundProcessingStatus @default(RECEIVED)
   rawPayload          Json
@@ -157,11 +158,19 @@ model InboundEvent {
   auditLogs           AuditLog[]
 
   @@unique([provider, providerMessageId])
+  @@unique([senderPhone, senderIngestSequence])
+  @@index([senderPhone, processingStatus, senderIngestSequence])
   @@index([processingStatus, receivedAt])
   @@index([processingStatus, processingStartedAt])
   @@index([senderPhone])
   @@index([reporterId])
   @@index([receivedAt])
+}
+
+model InboundSenderSequence {
+  senderPhone String   @id @db.VarChar(16)
+  nextValue   BigInt   @default(0) @db.BigInt
+  updatedAt   DateTime @updatedAt @db.Timestamptz(3)
 }
 
 model OutboundMessage {
