@@ -117,6 +117,8 @@ Phone allowlist, Reporter provisioning, Conversation provisioning, and compare-a
 
 Headline, Story byline snapshot, body, categories, images, deterministic ordering, completeness validation, and durable media staging decision.
 
+**Status: CURRENT — Story/media collection architecture under supervisor review**
+
 ## Round 6 — WordPress draft and WhatsApp preview workflow
 
 Draft creation, media/category synchronisation, preview/review response, and recoverable external attempts.
