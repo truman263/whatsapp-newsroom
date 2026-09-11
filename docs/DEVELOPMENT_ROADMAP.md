@@ -111,6 +111,8 @@ Webhook verification, signature authenticity, normalisation, durable InboundEven
 
 Phone allowlist, Reporter provisioning, Conversation provisioning, and compare-and-set transitions.
 
+**Status: CURRENT — reporter authorisation and state-machine architecture under supervisor review**
+
 ## Round 5 — Simbidzebasa-aligned Story/media collection
 
 Headline, Story byline snapshot, body, categories, images, deterministic ordering, completeness validation, and durable media staging decision.
