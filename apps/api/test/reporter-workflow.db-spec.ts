@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
 import {
   ConversationState,
+  EditorialCategoryStatus,
   InboundEventType,
   InboundProcessingStatus,
+  MediaProcessingStatus,
+  type Prisma,
   Provider,
   type InboundEvent,
   type Reporter,
   ReporterStatus,
+  StoryStatus,
 } from "@prisma/client";
 import { runReporterCli } from "../src/commands/reporter-cli";
 import { PrismaService } from "../src/database/prisma.service";
@@ -17,6 +21,11 @@ import { REPORTER_WORKFLOW_AUDIT } from "../src/modules/reporter-workflow/report
 import { ReporterAuthorizationService } from "../src/modules/reporter-workflow/reporter-authorization.service";
 import { ReporterProvisioningService } from "../src/modules/reporter-workflow/reporter-provisioning.service";
 import { ReporterWorkflowError } from "../src/modules/reporter-workflow/reporter-workflow.errors";
+import { StoredWhatsappEventParser } from "../src/modules/story-collection/stored-whatsapp-event.parser";
+import { StoryEventProcessor } from "../src/modules/story-collection/story-event-processor.service";
+import { StoryCompletenessService } from "../src/modules/story-collection/story-completeness.service";
+import { STORY_COLLECTION_AUDIT } from "../src/modules/story-collection/story-collection.audit";
+import type { ParsedStoredEvent } from "../src/modules/story-collection/story-collection.types";
 import { WhatsappWebhookIngestionService } from "../src/modules/whatsapp-webhook/whatsapp-webhook-ingestion.service";
 import type {
   NormalizedInboundEvent,
@@ -54,15 +63,55 @@ async function inbound(
   name: string,
   reporterId?: string,
 ): Promise<InboundEvent> {
+  const providerMessageId = providerId(name);
+  const timestamp = "1760000000";
   return prisma.inboundEvent.create({
     data: {
       provider: Provider.WHATSAPP,
-      providerMessageId: providerId(name),
+      providerMessageId,
       senderPhone,
       senderIngestSequence: ingestSequence++,
       reporterId,
       eventType: InboundEventType.TEXT,
-      rawPayload: { proof: "round4b" },
+      rawPayload: {
+        message: {
+          id: providerMessageId,
+          from: senderPhone.slice(1),
+          timestamp,
+          type: "text",
+          text: { body: name === "active" ? "/story" : "not a story command" },
+        },
+      },
+      providerOccurredAt: new Date(Number(timestamp) * 1000),
+    },
+  });
+}
+
+async function storedEvent(
+  senderPhone: string,
+  name: string,
+  eventType: InboundEventType,
+  message: Record<string, unknown>,
+): Promise<InboundEvent> {
+  const providerMessageId = providerId(name);
+  const timestamp = "1760000000";
+  return prisma.inboundEvent.create({
+    data: {
+      provider: Provider.WHATSAPP,
+      providerMessageId,
+      senderPhone,
+      senderIngestSequence: ingestSequence++,
+      eventType,
+      rawPayload: {
+        message: {
+          id: providerMessageId,
+          from: senderPhone.slice(1),
+          timestamp,
+          type: eventType.toLowerCase(),
+          ...message,
+        },
+      },
+      providerOccurredAt: new Date(Number(timestamp) * 1000),
     },
   });
 }
@@ -82,11 +131,69 @@ function batch(events: NormalizedInboundEvent[]): NormalizedWebhookBatch {
 }
 
 function processor(client: PrismaService): InboundEventProcessingService {
+  const stateMachine = new ConversationStateMachineService(client);
   return new InboundEventProcessingService(
     client,
     new ReporterAuthorizationService(),
     new ConversationProvisioningService(),
+    new StoredWhatsappEventParser(),
+    new StoryEventProcessor(stateMachine),
   );
+}
+
+function storyProcessor(client: PrismaService): StoryEventProcessor {
+  return new StoryEventProcessor(new ConversationStateMachineService(client));
+}
+
+async function provenance(
+  owner: Reporter,
+  name: string,
+): Promise<InboundEvent> {
+  const event = await storedEvent(
+    owner.phoneNumber,
+    name,
+    InboundEventType.TEXT,
+    {
+      text: { body: name },
+    },
+  );
+  return prisma.inboundEvent.update({
+    where: { id: event.id },
+    data: { reporterId: owner.id },
+  });
+}
+
+async function directRace(
+  owner: Reporter,
+  conversation: { id: string; state: ConversationState; version: number },
+  expectedStoryVersion: number | null,
+  parsed: (index: number) => ParsedStoredEvent,
+): Promise<PromiseSettledResult<unknown>[]> {
+  const events = await Promise.all(
+    Array.from({ length: 20 }, (_, index) =>
+      provenance(owner, `direct-${Date.now()}-${index}`),
+    ),
+  );
+  const pool = await clients(20);
+  try {
+    return await Promise.allSettled(
+      pool.map((client, index) =>
+        client.$transaction((tx) =>
+          storyProcessor(client).process(tx, {
+            eventId: events[index]!.id,
+            reporterId: owner.id,
+            conversationId: conversation.id,
+            conversationState: conversation.state,
+            conversationVersion: conversation.version,
+            expectedStoryVersion,
+            parsed: parsed(index),
+          }),
+        ),
+      ),
+    );
+  } finally {
+    await Promise.all(pool.map((client) => client.$disconnect()));
+  }
 }
 
 async function clients(count: number): Promise<PrismaService[]> {
@@ -371,7 +478,7 @@ describe("Round 4B disposable PostgreSQL proof", () => {
       approval: await prisma.approval.count(),
       publishAttempt: await prisma.publishAttempt.count(),
       outbound: await prisma.outboundMessage.count(),
-    }).toEqual(before);
+    }).toEqual({ ...before, story: before.story + 1 });
   });
 
   it("fails closed on an immutable Reporter association conflict and leaves PROCESSING", async () => {
@@ -994,5 +1101,1739 @@ describe("Round 4B disposable PostgreSQL proof", () => {
     } finally {
       await Promise.all(pool.map((client) => client.$disconnect()));
     }
+  });
+
+  it("collects a Story, headline, body, categories, and preserves the byline snapshot", async () => {
+    const owner = await prisma.reporter.create({
+      data: {
+        phoneNumber: phone(),
+        displayName: "Display Byline",
+        editorialByline: "  Editorial Byline  ",
+      },
+    });
+    const start = await storedEvent(
+      owner.phoneNumber,
+      "story-start",
+      InboundEventType.TEXT,
+      {
+        text: { body: "/story" },
+      },
+    );
+    await expect(processor(prisma).process(start.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const conversation = await prisma.conversation.findUniqueOrThrow({
+      where: { reporterId: owner.id },
+    });
+    const storyId = conversation.currentStoryId!;
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: storyId } }),
+    ).toMatchObject({
+      status: StoryStatus.COLLECTING,
+      version: 0,
+      headline: null,
+      body: null,
+      byline: "Editorial Byline",
+    });
+    await prisma.reporter.update({
+      where: { id: owner.id },
+      data: { displayName: "Changed", editorialByline: "Changed Byline" },
+    });
+    const headline = await storedEvent(
+      owner.phoneNumber,
+      "headline",
+      InboundEventType.TEXT,
+      {
+        text: { body: "  A newsroom headline  " },
+      },
+    );
+    await expect(processor(prisma).process(headline.id)).resolves.toMatchObject(
+      { outcome: "PROCESSED" },
+    );
+    const bodyEvent = await storedEvent(
+      owner.phoneNumber,
+      "body",
+      InboundEventType.TEXT,
+      {
+        text: { body: "  First paragraph\r\n\r\nSecond paragraph  " },
+      },
+    );
+    await expect(
+      processor(prisma).process(bodyEvent.id),
+    ).resolves.toMatchObject({ outcome: "PROCESSED" });
+    const categories = await Promise.all([
+      prisma.editorialCategory.create({
+        data: {
+          wordpressCategoryId: 51001n,
+          name: "Politics",
+          slug: "sample-politics",
+        },
+      }),
+      prisma.editorialCategory.create({
+        data: {
+          wordpressCategoryId: 51002n,
+          name: "Business",
+          slug: "sample-business",
+        },
+      }),
+    ]);
+    const categoryEvent = await storedEvent(
+      owner.phoneNumber,
+      "categories",
+      InboundEventType.TEXT,
+      {
+        text: {
+          body: "/categories Sample-Politics, sample-business,sample-politics",
+        },
+      },
+    );
+    await expect(
+      processor(prisma).process(categoryEvent.id),
+    ).resolves.toMatchObject({ outcome: "PROCESSED" });
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: storyId } }),
+    ).toMatchObject({
+      headline: "A newsroom headline",
+      body: "First paragraph\n\nSecond paragraph",
+      byline: "Editorial Byline",
+      version: 3,
+    });
+    expect(
+      await prisma.storyCategory.findMany({
+        where: { storyId },
+        orderBy: { categoryId: "asc" },
+      }),
+    ).toHaveLength(2);
+    const noOp = await storedEvent(
+      owner.phoneNumber,
+      "categories-noop",
+      InboundEventType.TEXT,
+      {
+        text: { body: "/categories sample-business,sample-politics" },
+      },
+    );
+    await processor(prisma).process(noOp.id);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: storyId } }))
+        .version,
+    ).toBe(3);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId,
+          eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+        },
+      }),
+    ).toBe(1);
+    expect(categories).toHaveLength(2);
+  });
+
+  it("fails malformed retained evidence without creating a Conversation", async () => {
+    const owner = await reporter();
+    const event = await inbound(owner.phoneNumber, "malformed-story");
+    await prisma.inboundEvent.update({
+      where: { id: event.id },
+      data: { rawPayload: { message: { id: "wrong" } } },
+    });
+    await expect(processor(prisma).process(event.id)).resolves.toEqual({
+      outcome: "FAILED",
+      reason: "MALFORMED_STORED_EVENT",
+    });
+    expect(
+      await prisma.conversation.count({ where: { reporterId: owner.id } }),
+    ).toBe(0);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+        select: {
+          processingStatus: true,
+          lastErrorCode: true,
+          lastErrorMessage: true,
+        },
+      }),
+    ).toEqual({
+      processingStatus: InboundProcessingStatus.FAILED,
+      lastErrorCode: "MALFORMED_STORED_EVENT",
+      lastErrorMessage: null,
+    });
+  });
+
+  it("fails the malformed stored-evidence matrix terminally without domain writes", async () => {
+    type MalformedCase = {
+      name: string;
+      eventType: InboundEventType;
+      payload: (event: InboundEvent, owner: Reporter) => Prisma.InputJsonValue;
+    };
+    const message = (
+      event: InboundEvent,
+      owner: Reporter,
+      value: Record<string, Prisma.JsonValue>,
+    ): Prisma.InputJsonValue => ({
+      message: {
+        id: event.providerMessageId,
+        from: owner.phoneNumber.slice(1),
+        timestamp: "1760000000",
+        type: event.eventType.toLowerCase(),
+        ...value,
+      },
+    });
+    const text = { text: { body: "evidence" } };
+    const interactive = {
+      interactive: {
+        type: "button_reply",
+        button_reply: { id: "unsupported:v1", title: "ignored title" },
+      },
+    };
+    const image = {
+      image: { id: "opaque.media:1", mime_type: "image/jpeg" },
+    };
+    const cases: MalformedCase[] = [
+      {
+        name: "payload-array",
+        eventType: InboundEventType.TEXT,
+        payload: () => [],
+      },
+      {
+        name: "message-missing",
+        eventType: InboundEventType.TEXT,
+        payload: () => ({}),
+      },
+      {
+        name: "message-null",
+        eventType: InboundEventType.TEXT,
+        payload: () => ({ message: null }),
+      },
+      {
+        name: "id-missing",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { id: null, ...text }),
+      },
+      {
+        name: "id-mismatch",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { id: "wrong", ...text }),
+      },
+      {
+        name: "from-missing",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { from: null, ...text }),
+      },
+      {
+        name: "sender-mismatch",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { from: "263700000000", ...text }),
+      },
+      {
+        name: "timestamp-missing",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { timestamp: null, ...text }),
+      },
+      {
+        name: "timestamp-invalid",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { timestamp: "invalid", ...text }),
+      },
+      {
+        name: "timestamp-mismatch",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { timestamp: "1760000001", ...text }),
+      },
+      {
+        name: "type-mismatch",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { type: "image", ...text }),
+      },
+      {
+        name: "text-missing",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, {}),
+      },
+      {
+        name: "text-null",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { text: null }),
+      },
+      {
+        name: "body-missing",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { text: {} }),
+      },
+      {
+        name: "body-non-string",
+        eventType: InboundEventType.TEXT,
+        payload: (e, o) => message(e, o, { text: { body: 7 } }),
+      },
+      {
+        name: "interactive-missing",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) => message(e, o, {}),
+      },
+      {
+        name: "interactive-null",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) => message(e, o, { interactive: null }),
+      },
+      {
+        name: "interactive-type",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) => message(e, o, { interactive: { type: "bad" } }),
+      },
+      {
+        name: "button-absent",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, { interactive: { type: "button_reply" } }),
+      },
+      {
+        name: "list-absent",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, { interactive: { type: "list_reply" } }),
+      },
+      {
+        name: "reply-null",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, {
+            interactive: { type: "button_reply", button_reply: null },
+          }),
+      },
+      {
+        name: "reply-id-missing",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, {
+            interactive: { type: "button_reply", button_reply: {} },
+          }),
+      },
+      {
+        name: "reply-id-non-string",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, {
+            interactive: { type: "button_reply", button_reply: { id: 1 } },
+          }),
+      },
+      {
+        name: "reply-contradictory",
+        eventType: InboundEventType.INTERACTIVE,
+        payload: (e, o) =>
+          message(e, o, {
+            interactive: {
+              type: "button_reply",
+              button_reply: { id: "a" },
+              list_reply: { id: "b" },
+            },
+          }),
+      },
+      {
+        name: "image-missing",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) => message(e, o, {}),
+      },
+      {
+        name: "image-null",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) => message(e, o, { image: null }),
+      },
+      {
+        name: "media-id-missing",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { mime_type: "image/jpeg" } }),
+      },
+      {
+        name: "media-id-blank",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { id: "", mime_type: "image/jpeg" } }),
+      },
+      {
+        name: "media-id-long",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, {
+            image: { id: "a".repeat(192), mime_type: "image/jpeg" },
+          }),
+      },
+      {
+        name: "media-id-slash",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { id: "a/b", mime_type: "image/jpeg" } }),
+      },
+      {
+        name: "media-id-control",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { id: "a\u0001b", mime_type: "image/jpeg" } }),
+      },
+      {
+        name: "mime-missing",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) => message(e, o, { image: { id: "opaque" } }),
+      },
+      {
+        name: "mime-unsupported",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, {
+            image: { id: "opaque", mime_type: "image/svg+xml" },
+          }),
+      },
+      {
+        name: "sha-invalid",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { ...image.image, sha256: "not-base64" } }),
+      },
+      {
+        name: "sha-wrong-size",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, {
+            image: {
+              ...image.image,
+              sha256: Buffer.alloc(31).toString("base64"),
+            },
+          }),
+      },
+      {
+        name: "caption-non-string",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, { image: { ...image.image, caption: 4 } }),
+      },
+      {
+        name: "caption-too-long",
+        eventType: InboundEventType.IMAGE,
+        payload: (e, o) =>
+          message(e, o, {
+            image: { ...image.image, caption: "😀".repeat(4097) },
+          }),
+      },
+    ];
+    for (const malformedCase of cases) {
+      const owner = await reporter();
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `malformed-${malformedCase.name}`,
+        malformedCase.eventType,
+        malformedCase.eventType === InboundEventType.TEXT
+          ? text
+          : malformedCase.eventType === InboundEventType.INTERACTIVE
+            ? interactive
+            : image,
+      );
+      await prisma.inboundEvent.update({
+        where: { id: event.id },
+        data: { rawPayload: malformedCase.payload(event, owner) },
+      });
+      const beforeAudits = await prisma.auditLog.count();
+      const beforeMedia = await prisma.storyMedia.count();
+      await expect(processor(prisma).process(event.id)).resolves.toEqual({
+        outcome: "FAILED",
+        reason: "MALFORMED_STORED_EVENT",
+      });
+      const terminal = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+        select: {
+          processingStatus: true,
+          processedAt: true,
+          lastErrorCode: true,
+          lastErrorMessage: true,
+        },
+      });
+      expect(terminal).toMatchObject({
+        processingStatus: InboundProcessingStatus.FAILED,
+        lastErrorCode: "MALFORMED_STORED_EVENT",
+        lastErrorMessage: null,
+      });
+      expect(terminal.processedAt).toBeInstanceOf(Date);
+      expect(
+        await prisma.story.count({ where: { reporterId: owner.id } }),
+      ).toBe(0);
+      expect(await prisma.storyMedia.count()).toBe(beforeMedia);
+      expect(await prisma.auditLog.count()).toBe(beforeAudits);
+    }
+  });
+
+  it("accepts valid retained IMAGE and unsupported INTERACTIVE evidence only into fixed policy outcomes", async () => {
+    for (const [eventType, evidence, reason] of [
+      [
+        InboundEventType.IMAGE,
+        {
+          image: {
+            id: "opaque.media:valid",
+            mime_type: "image/png",
+            sha256: Buffer.alloc(32).toString("base64"),
+            caption: "valid",
+          },
+        },
+        "MEDIA_COLLECTION_NOT_ENABLED",
+      ],
+      [
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "unsupported:v1", title: "/story" },
+          },
+        },
+        "UNSUPPORTED_INTERACTION",
+      ],
+    ] as const) {
+      const owner = await reporter();
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `valid-policy-${eventType}`,
+        eventType,
+        evidence,
+      );
+      await expect(processor(prisma).process(event.id)).resolves.toMatchObject({
+        outcome: "IGNORED",
+        reason,
+      });
+      const terminal = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+      });
+      expect(terminal).toMatchObject({
+        processingStatus: InboundProcessingStatus.IGNORED,
+        lastErrorCode: reason,
+        lastErrorMessage: null,
+      });
+      expect(terminal.processedAt).toBeInstanceOf(Date);
+      expect(
+        await prisma.storyMedia.count({
+          where: { providerMediaId: "opaque.media:valid" },
+        }),
+      ).toBe(0);
+    }
+  });
+
+  it("proves command interpretation across IDLE, headline, and body states", async () => {
+    const owner = await reporter();
+    const start = await storedEvent(
+      owner.phoneNumber,
+      "matrix-interactive-start",
+      InboundEventType.INTERACTIVE,
+      {
+        interactive: {
+          type: "button_reply",
+          button_reply: {
+            id: "newsroom:v1:story:start",
+            title: "title is not authority",
+          },
+        },
+      },
+    );
+    await expect(processor(prisma).process(start.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const conversation = await prisma.conversation.findUniqueOrThrow({
+      where: { reporterId: owner.id },
+    });
+    const storyId = conversation.currentStoryId!;
+    const headline = await storedEvent(
+      owner.phoneNumber,
+      "matrix-story-as-headline",
+      InboundEventType.TEXT,
+      { text: { body: "/story" } },
+    );
+    await expect(processor(prisma).process(headline.id)).resolves.toMatchObject(
+      { outcome: "PROCESSED" },
+    );
+    const body = await storedEvent(
+      owner.phoneNumber,
+      "matrix-categories-as-body",
+      InboundEventType.TEXT,
+      { text: { body: "/categories politics" } },
+    );
+    await expect(processor(prisma).process(body.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: storyId } }),
+    ).toMatchObject({
+      headline: "/story",
+      body: "/categories politics",
+      version: 2,
+    });
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { reporterId: owner.id },
+      }),
+    ).toMatchObject({
+      state: ConversationState.COLLECTING_MEDIA,
+      currentStoryId: storyId,
+    });
+  });
+
+  it("proves fixed ignored terminal policy throughout the Story state matrix", async () => {
+    const cases = [
+      [
+        ConversationState.IDLE,
+        InboundEventType.TEXT,
+        { text: { body: "other" } },
+        "STORY_START_REQUIRED",
+      ],
+      [
+        ConversationState.IDLE,
+        InboundEventType.TEXT,
+        { text: { body: "/cancel" } },
+        "STORY_START_REQUIRED",
+      ],
+      [
+        ConversationState.IDLE,
+        InboundEventType.TEXT,
+        { text: { body: "/done" } },
+        "CONTROL_NOT_ENABLED",
+      ],
+      [
+        ConversationState.IDLE,
+        InboundEventType.IMAGE,
+        { image: { id: "idle-image", mime_type: "image/jpeg" } },
+        "MEDIA_COLLECTION_NOT_ENABLED",
+      ],
+      [
+        ConversationState.IDLE,
+        InboundEventType.UNKNOWN,
+        {},
+        "UNSUPPORTED_EVENT_TYPE",
+      ],
+      [
+        ConversationState.IDLE,
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "unsupported" },
+          },
+        },
+        "UNSUPPORTED_INTERACTION",
+      ],
+      [
+        ConversationState.AWAITING_HEADLINE,
+        InboundEventType.IMAGE,
+        { image: { id: "headline-image", mime_type: "image/jpeg" } },
+        "MEDIA_COLLECTION_NOT_ENABLED",
+      ],
+      [
+        ConversationState.AWAITING_HEADLINE,
+        InboundEventType.UNKNOWN,
+        {},
+        "UNSUPPORTED_EVENT_TYPE",
+      ],
+      [
+        ConversationState.AWAITING_HEADLINE,
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "unsupported" },
+          },
+        },
+        "UNSUPPORTED_INTERACTION",
+      ],
+      [
+        ConversationState.AWAITING_BODY,
+        InboundEventType.IMAGE,
+        { image: { id: "body-image", mime_type: "image/jpeg" } },
+        "MEDIA_COLLECTION_NOT_ENABLED",
+      ],
+      [
+        ConversationState.AWAITING_BODY,
+        InboundEventType.UNKNOWN,
+        {},
+        "UNSUPPORTED_EVENT_TYPE",
+      ],
+      [
+        ConversationState.AWAITING_BODY,
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "unsupported" },
+          },
+        },
+        "UNSUPPORTED_INTERACTION",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.TEXT,
+        { text: { body: "/done" } },
+        "CONTROL_NOT_ENABLED",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "newsroom:v1:story:done" },
+          },
+        },
+        "CONTROL_NOT_ENABLED",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.TEXT,
+        { text: { body: "other" } },
+        "TEXT_NOT_ACCEPTED_IN_STATE",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.IMAGE,
+        { image: { id: "collecting-image", mime_type: "image/jpeg" } },
+        "MEDIA_COLLECTION_NOT_ENABLED",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.UNKNOWN,
+        {},
+        "UNSUPPORTED_EVENT_TYPE",
+      ],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        InboundEventType.INTERACTIVE,
+        {
+          interactive: {
+            type: "button_reply",
+            button_reply: { id: "unsupported" },
+          },
+        },
+        "UNSUPPORTED_INTERACTION",
+      ],
+    ] as const;
+    for (const [state, eventType, evidence, reason] of cases) {
+      const owner = await reporter();
+      const story =
+        state === ConversationState.IDLE
+          ? null
+          : await prisma.story.create({
+              data: { reporterId: owner.id, byline: "Matrix" },
+            });
+      const conversation = await prisma.conversation.create({
+        data: {
+          reporterId: owner.id,
+          state,
+          currentStoryId: story?.id,
+        },
+      });
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `state-${state}-${eventType}-${reason}`,
+        eventType,
+        evidence,
+      );
+      const result = await processor(prisma).process(event.id);
+      expect(result).toMatchObject({ outcome: "IGNORED", reason });
+      const terminal = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+      });
+      expect(terminal).toMatchObject({
+        processingStatus: InboundProcessingStatus.IGNORED,
+        lastErrorCode: reason,
+        lastErrorMessage: null,
+      });
+      expect(terminal.processedAt).toBeInstanceOf(Date);
+      expect(
+        await prisma.conversation.findUniqueOrThrow({
+          where: { id: conversation.id },
+        }),
+      ).toMatchObject({ state, version: conversation.version });
+      if (story) {
+        expect(
+          await prisma.story.findUniqueOrThrow({ where: { id: story.id } }),
+        ).toMatchObject({ version: 0, status: StoryStatus.COLLECTING });
+      }
+      expect(
+        await prisma.storyMedia.count({
+          where: {
+            storyId: story?.id ?? "00000000-0000-0000-0000-000000000000",
+          },
+        }),
+      ).toBe(0);
+    }
+  });
+
+  it.each([
+    ConversationState.AWAITING_HEADLINE,
+    ConversationState.AWAITING_BODY,
+    ConversationState.COLLECTING_MEDIA,
+  ])("cancels atomically from %s", async (state) => {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Byline" },
+    });
+    await prisma.conversation.create({
+      data: { reporterId: owner.id, state, currentStoryId: story.id },
+    });
+    const event = await storedEvent(
+      owner.phoneNumber,
+      `cancel-${state}`,
+      InboundEventType.TEXT,
+      {
+        text: { body: "/cancel" },
+      },
+    );
+    await expect(processor(prisma).process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const cancelled = await prisma.story.findUniqueOrThrow({
+      where: { id: story.id },
+    });
+    expect(cancelled).toMatchObject({
+      status: StoryStatus.CANCELLED,
+      version: 1,
+    });
+    expect(cancelled.cancelledAt).toBeInstanceOf(Date);
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { reporterId: owner.id },
+      }),
+    ).toMatchObject({
+      state: ConversationState.IDLE,
+      currentStoryId: null,
+    });
+  });
+
+  it("validates completeness without mutations for zero or valid fetched media", async () => {
+    const owner = await reporter();
+    const category = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 52001n, name: "Complete", slug: "complete" },
+    });
+    const story = await prisma.story.create({
+      data: {
+        reporterId: owner.id,
+        headline: "Headline",
+        body: "Body",
+        byline: "Byline",
+      },
+    });
+    await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    await prisma.storyCategory.create({
+      data: { storyId: story.id, categoryId: category.id },
+    });
+    const completeness = new StoryCompletenessService(prisma);
+    await expect(completeness.isComplete(owner.id, story.id)).resolves.toBe(
+      true,
+    );
+    const media = await prisma.storyMedia.create({
+      data: {
+        storyId: story.id,
+        providerMediaId: providerId("complete-media"),
+        mediaType: "IMAGE",
+        status: MediaProcessingStatus.RECEIVED,
+        position: 0,
+      },
+    });
+    await expect(completeness.isComplete(owner.id, story.id)).resolves.toBe(
+      false,
+    );
+    await prisma.storyMedia.update({
+      where: { id: media.id },
+      data: {
+        status: MediaProcessingStatus.FETCHED,
+        mimeType: "image/jpeg",
+        fileSizeBytes: 1n,
+        sha256: "a".repeat(64),
+      },
+    });
+    await expect(completeness.isComplete(owner.id, story.id)).resolves.toBe(
+      true,
+    );
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .status,
+    ).toBe(StoryStatus.COLLECTING);
+    await prisma.editorialCategory.update({
+      where: { id: category.id },
+      data: { status: EditorialCategoryStatus.INACTIVE },
+    });
+    await expect(completeness.isComplete(owner.id, story.id)).resolves.toBe(
+      true,
+    );
+  });
+
+  it("allows exactly one of 20 direct Story starts and commits no orphan losers", async () => {
+    const owner = await reporter();
+    const conversation = await prisma.conversation.create({
+      data: { reporterId: owner.id },
+    });
+    const events = await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        storedEvent(
+          owner.phoneNumber,
+          `direct-start-${index}`,
+          InboundEventType.TEXT,
+          {
+            text: { body: "/story" },
+          },
+        ),
+      ),
+    );
+    await prisma.inboundEvent.updateMany({
+      where: { id: { in: events.map(({ id }) => id) } },
+      data: { reporterId: owner.id },
+    });
+    const pool = await clients(20);
+    try {
+      const results = await Promise.allSettled(
+        pool.map((client, index) =>
+          client.$transaction((tx) =>
+            new StoryEventProcessor(
+              new ConversationStateMachineService(client),
+            ).process(tx, {
+              eventId: events[index]!.id,
+              reporterId: owner.id,
+              conversationId: conversation.id,
+              conversationState: ConversationState.IDLE,
+              conversationVersion: 0,
+              expectedStoryVersion: null,
+              parsed: { kind: "TEXT", text: "/story" },
+            }),
+          ),
+        ),
+      );
+      expect(
+        results.filter(({ status }) => status === "fulfilled"),
+      ).toHaveLength(1);
+      expect(
+        await prisma.story.count({ where: { reporterId: owner.id } }),
+      ).toBe(1);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            reporterId: owner.id,
+            eventType: STORY_COLLECTION_AUDIT.STORY_CREATED,
+          },
+        }),
+      ).toBe(1);
+      expect(
+        await prisma.conversation.findUniqueOrThrow({
+          where: { id: conversation.id },
+        }),
+      ).toMatchObject({
+        state: ConversationState.AWAITING_HEADLINE,
+        version: 1,
+      });
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
+  });
+
+  it("awards one direct winner for headline, body, categories, and cancellation", async () => {
+    const headlineOwner = await reporter();
+    const headlineStory = await prisma.story.create({
+      data: { reporterId: headlineOwner.id, byline: "Byline" },
+    });
+    const headlineConversation = await prisma.conversation.create({
+      data: {
+        reporterId: headlineOwner.id,
+        state: ConversationState.AWAITING_HEADLINE,
+        currentStoryId: headlineStory.id,
+      },
+    });
+    const headlineResults = await directRace(
+      headlineOwner,
+      headlineConversation,
+      0,
+      (index) => ({ kind: "TEXT", text: `Headline ${index}` }),
+    );
+    expect(
+      headlineResults.filter(({ status }) => status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: headlineStory.id } }),
+    ).toMatchObject({ version: 1 });
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { id: headlineConversation.id },
+      }),
+    ).toMatchObject({ state: ConversationState.AWAITING_BODY, version: 1 });
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: headlineStory.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_HEADLINE_SET,
+        },
+      }),
+    ).toBe(1);
+
+    const bodyOwner = await reporter();
+    const bodyStory = await prisma.story.create({
+      data: {
+        reporterId: bodyOwner.id,
+        byline: "Byline",
+        headline: "Headline",
+      },
+    });
+    const bodyConversation = await prisma.conversation.create({
+      data: {
+        reporterId: bodyOwner.id,
+        state: ConversationState.AWAITING_BODY,
+        currentStoryId: bodyStory.id,
+      },
+    });
+    const bodyResults = await directRace(
+      bodyOwner,
+      bodyConversation,
+      0,
+      (index) => ({ kind: "TEXT", text: `Body ${index}` }),
+    );
+    expect(
+      bodyResults.filter(({ status }) => status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: bodyStory.id } }),
+    ).toMatchObject({ version: 1 });
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { id: bodyConversation.id },
+      }),
+    ).toMatchObject({ state: ConversationState.COLLECTING_MEDIA, version: 1 });
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: bodyStory.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_BODY_SET,
+        },
+      }),
+    ).toBe(1);
+
+    const categoryOwner = await reporter();
+    const categoryStory = await prisma.story.create({
+      data: { reporterId: categoryOwner.id, byline: "Byline" },
+    });
+    const categoryConversation = await prisma.conversation.create({
+      data: {
+        reporterId: categoryOwner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: categoryStory.id,
+      },
+    });
+    const categoryRows = await Promise.all(
+      [0, 1, 2].map((index) =>
+        prisma.editorialCategory.create({
+          data: {
+            wordpressCategoryId: 53000n + BigInt(index),
+            name: `Race ${index}`,
+            slug: `race-${index}`,
+          },
+        }),
+      ),
+    );
+    const categoryResults = await directRace(
+      categoryOwner,
+      categoryConversation,
+      0,
+      (index) => ({
+        kind: "TEXT",
+        text: `/categories race-${index % categoryRows.length}`,
+      }),
+    );
+    expect(
+      categoryResults.filter(({ status }) => status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await prisma.story.findUniqueOrThrow({
+          where: { id: categoryStory.id },
+        })
+      ).version,
+    ).toBe(1);
+    expect(
+      await prisma.storyCategory.count({
+        where: { storyId: categoryStory.id },
+      }),
+    ).toBe(1);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: categoryStory.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+        },
+      }),
+    ).toBe(1);
+
+    const cancelOwner = await reporter();
+    const cancelStory = await prisma.story.create({
+      data: { reporterId: cancelOwner.id, byline: "Byline" },
+    });
+    const cancelConversation = await prisma.conversation.create({
+      data: {
+        reporterId: cancelOwner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: cancelStory.id,
+      },
+    });
+    const cancelResults = await directRace(
+      cancelOwner,
+      cancelConversation,
+      0,
+      () => ({ kind: "TEXT", text: "/cancel" }),
+    );
+    expect(
+      cancelResults.filter(({ status }) => status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: cancelStory.id } }),
+    ).toMatchObject({ status: StoryStatus.CANCELLED, version: 1 });
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { id: cancelConversation.id },
+      }),
+    ).toMatchObject({
+      state: ConversationState.IDLE,
+      currentStoryId: null,
+      version: 1,
+    });
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: cancelStory.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_CANCELLED,
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("rolls back post-write Story operations when the transaction fails", async () => {
+    const owner = await reporter();
+    const unassociated = await storedEvent(
+      owner.phoneNumber,
+      "rollback-provenance",
+      InboundEventType.TEXT,
+      { text: { body: "value" } },
+    );
+    const idle = await prisma.conversation.create({
+      data: { reporterId: owner.id },
+    });
+    await expect(
+      prisma.$transaction((tx) =>
+        storyProcessor(prisma).process(tx, {
+          eventId: unassociated.id,
+          reporterId: owner.id,
+          conversationId: idle.id,
+          conversationState: ConversationState.IDLE,
+          conversationVersion: 0,
+          expectedStoryVersion: null,
+          parsed: { kind: "TEXT", text: "/story" },
+        }),
+      ),
+    ).rejects.toBeDefined();
+    expect(await prisma.story.count({ where: { reporterId: owner.id } })).toBe(
+      0,
+    );
+    expect(
+      await prisma.conversation.findUniqueOrThrow({ where: { id: idle.id } }),
+    ).toMatchObject({
+      state: ConversationState.IDLE,
+      version: 0,
+      currentStoryId: null,
+    });
+
+    for (const operation of ["headline", "body", "cancel"] as const) {
+      const state =
+        operation === "headline"
+          ? ConversationState.AWAITING_HEADLINE
+          : operation === "body"
+            ? ConversationState.AWAITING_BODY
+            : ConversationState.COLLECTING_MEDIA;
+      const story = await prisma.story.create({
+        data: { reporterId: owner.id, byline: "Byline" },
+      });
+      await prisma.conversation.update({
+        where: { id: idle.id },
+        data: { state, currentStoryId: story.id, version: { increment: 1 } },
+      });
+      const before = await prisma.conversation.findUniqueOrThrow({
+        where: { id: idle.id },
+      });
+      await expect(
+        prisma.$transaction((tx) =>
+          storyProcessor(prisma).process(tx, {
+            eventId: unassociated.id,
+            reporterId: owner.id,
+            conversationId: idle.id,
+            conversationState: before.state,
+            conversationVersion: before.version,
+            expectedStoryVersion: 0,
+            parsed: {
+              kind: "TEXT",
+              text: operation === "cancel" ? "/cancel" : "New value",
+            },
+          }),
+        ),
+      ).rejects.toBeDefined();
+      expect(
+        await prisma.story.findUniqueOrThrow({ where: { id: story.id } }),
+      ).toMatchObject({
+        version: 0,
+        status: StoryStatus.COLLECTING,
+        headline: null,
+        body: null,
+        cancelledAt: null,
+      });
+      expect(
+        await prisma.auditLog.count({ where: { storyId: story.id } }),
+      ).toBe(0);
+      await prisma.conversation.update({
+        where: { id: idle.id },
+        data: {
+          state: ConversationState.IDLE,
+          currentStoryId: null,
+          version: { increment: 1 },
+        },
+      });
+    }
+
+    const category = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 54001n, name: "Rollback", slug: "rollback" },
+    });
+    const categoryStory = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Byline" },
+    });
+    const current = await prisma.conversation.update({
+      where: { id: idle.id },
+      data: {
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: categoryStory.id,
+        version: { increment: 1 },
+      },
+    });
+    const associated = await provenance(owner, "category-rollback");
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await storyProcessor(prisma).process(tx, {
+          eventId: associated.id,
+          reporterId: owner.id,
+          conversationId: idle.id,
+          conversationState: current.state,
+          conversationVersion: current.version,
+          expectedStoryVersion: 0,
+          parsed: { kind: "TEXT", text: "/categories rollback" },
+        });
+        throw new Error("forced rollback");
+      }),
+    ).rejects.toThrow("forced rollback");
+    expect(
+      (
+        await prisma.story.findUniqueOrThrow({
+          where: { id: categoryStory.id },
+        })
+      ).version,
+    ).toBe(0);
+    expect(
+      await prisma.storyCategory.count({
+        where: { storyId: categoryStory.id },
+      }),
+    ).toBe(0);
+    expect(
+      await prisma.auditLog.count({ where: { storyId: categoryStory.id } }),
+    ).toBe(0);
+    expect(category.id).toBeDefined();
+  });
+
+  it("rejects every direct cross-Reporter Story mutation", async () => {
+    const ownerA = await reporter();
+    const ownerB = await reporter();
+    const category = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 55001n, name: "Owned", slug: "owned" },
+    });
+    const operations = [
+      [ConversationState.AWAITING_HEADLINE, { kind: "TEXT", text: "Headline" }],
+      [ConversationState.AWAITING_BODY, { kind: "TEXT", text: "Body" }],
+      [
+        ConversationState.COLLECTING_MEDIA,
+        { kind: "TEXT", text: "/categories owned" },
+      ],
+      [ConversationState.COLLECTING_MEDIA, { kind: "TEXT", text: "/cancel" }],
+    ] as const;
+    for (const [state, parsed] of operations) {
+      const story = await prisma.story.create({
+        data: { reporterId: ownerB.id, byline: "B" },
+      });
+      const conversation = await prisma.conversation.upsert({
+        where: { reporterId: ownerB.id },
+        create: { reporterId: ownerB.id, state, currentStoryId: story.id },
+        update: { state, currentStoryId: story.id, version: { increment: 1 } },
+      });
+      const event = await provenance(ownerA, `cross-${state}-${parsed.text}`);
+      await expect(
+        prisma.$transaction((tx) =>
+          storyProcessor(prisma).process(tx, {
+            eventId: event.id,
+            reporterId: ownerA.id,
+            conversationId: conversation.id,
+            conversationState: conversation.state,
+            conversationVersion: conversation.version,
+            expectedStoryVersion: 0,
+            parsed,
+          }),
+        ),
+      ).rejects.toBeDefined();
+      expect(
+        await prisma.story.findUniqueOrThrow({ where: { id: story.id } }),
+      ).toMatchObject({
+        version: 0,
+        status: StoryStatus.COLLECTING,
+        headline: null,
+        body: null,
+      });
+      await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: {
+          state: ConversationState.IDLE,
+          currentStoryId: null,
+          version: { increment: 1 },
+        },
+      });
+    }
+    expect(
+      await prisma.storyCategory.count({ where: { categoryId: category.id } }),
+    ).toBe(0);
+  });
+
+  it("exhaustively validates category inputs, replacement, no-op, and atomic rejection", async () => {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: {
+        reporterId: owner.id,
+        byline: "Matrix Byline",
+        headline: "Matrix headline",
+        body: "Matrix body",
+      },
+    });
+    await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    const politics = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 58001n, name: "Politics", slug: "politics" },
+    });
+    const business = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 58002n, name: "Business", slug: "business" },
+    });
+    const inactive = await prisma.editorialCategory.create({
+      data: {
+        wordpressCategoryId: 58003n,
+        name: "Inactive",
+        slug: "inactive",
+        status: EditorialCategoryStatus.INACTIVE,
+      },
+    });
+    await Promise.all([
+      prisma.editorialCategory.create({
+        data: { wordpressCategoryId: 58004n, name: "Dup A", slug: "duplicate" },
+      }),
+      prisma.editorialCategory.create({
+        data: { wordpressCategoryId: 58005n, name: "Dup B", slug: "duplicate" },
+      }),
+    ]);
+    const submit = async (
+      body: string,
+    ): Promise<{
+      event: InboundEvent;
+      result: Awaited<ReturnType<InboundEventProcessingService["process"]>>;
+      terminal: {
+        processingStatus: InboundProcessingStatus;
+        processedAt: Date | null;
+        lastErrorCode: string | null;
+        lastErrorMessage: string | null;
+      };
+    }> => {
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `category-${sequence}`,
+        InboundEventType.TEXT,
+        {
+          text: { body },
+        },
+      );
+      const result = await processor(prisma).process(event.id);
+      const terminal = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+        select: {
+          processingStatus: true,
+          processedAt: true,
+          lastErrorCode: true,
+          lastErrorMessage: true,
+        },
+      });
+      return { event, result, terminal };
+    };
+    const categoryIds = async (): Promise<string[]> =>
+      (
+        await prisma.storyCategory.findMany({
+          where: { storyId: story.id },
+          orderBy: { categoryId: "asc" },
+          select: { categoryId: true },
+        })
+      ).map(({ categoryId }) => categoryId);
+
+    for (const body of [
+      "/categories politics",
+      "/categories Politics",
+      "/categories \tpolitics\t",
+      "/categories \u2003politics\u2003",
+      "/categories politics,politics",
+    ]) {
+      const { result } = await submit(body);
+      expect({ body, result }).toMatchObject({
+        body,
+        result: { outcome: "PROCESSED" },
+      });
+      expect(await categoryIds()).toEqual([politics.id]);
+    }
+    await submit("/categories Politics, business,politics");
+    expect(await categoryIds()).toEqual([business.id, politics.id].sort());
+    const resolvedCategories = await prisma.storyCategory.findMany({
+      where: { storyId: story.id },
+      include: { category: true },
+    });
+    expect(
+      resolvedCategories.find(({ categoryId }) => categoryId === politics.id)
+        ?.category.wordpressCategoryId,
+    ).toBe(58001n);
+    expect(
+      resolvedCategories.find(({ categoryId }) => categoryId === business.id)
+        ?.category.wordpressCategoryId,
+    ).toBe(58002n);
+    const noOpVersion = (
+      await prisma.story.findUniqueOrThrow({ where: { id: story.id } })
+    ).version;
+    const noOpAudits = await prisma.auditLog.count({
+      where: {
+        storyId: story.id,
+        eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+      },
+    });
+    for (const body of [
+      "/categories politics,business",
+      "/categories business,politics",
+      "/categories Politics,Politics,Business",
+      "/categories \tbusiness, politics\u2003",
+    ]) {
+      const { result } = await submit(body);
+      expect(result.outcome).toBe("PROCESSED");
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(noOpVersion);
+      expect(await categoryIds()).toEqual([business.id, politics.id].sort());
+    }
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+        },
+      }),
+    ).toBe(noOpAudits);
+
+    const invalid = [
+      ["/categories unknown", "CATEGORY_NOT_FOUND"],
+      ["/categories inactive", "CATEGORY_NOT_FOUND"],
+      ["/categories duplicate", "CATEGORY_AMBIGUOUS"],
+      ["/categories ", "INVALID_CATEGORY_COMMAND"],
+      ["/categories ,culture", "INVALID_CATEGORY_COMMAND"],
+      ["/categories culture,", "INVALID_CATEGORY_COMMAND"],
+      ["/categories culture,,business", "INVALID_CATEGORY_COMMAND"],
+      ["/categories breaking news", "INVALID_CATEGORY_COMMAND"],
+      ["/categories bad!", "INVALID_CATEGORY_COMMAND"],
+      ["/categories bad/slug", "INVALID_CATEGORY_COMMAND"],
+      ["/categories bad\\slug", "INVALID_CATEGORY_COMMAND"],
+      ["/categories bad\u0001slug", "INVALID_CATEGORY_COMMAND"],
+      ["/categories política", "INVALID_CATEGORY_COMMAND"],
+      [`/categories ${"a".repeat(201)}`, "INVALID_CATEGORY_COMMAND"],
+      ["/categories Politics Desk", "INVALID_CATEGORY_COMMAND"],
+      ["/categories politic", "CATEGORY_NOT_FOUND"],
+      ["/categories politics trailing", "INVALID_CATEGORY_COMMAND"],
+      ["/category politics", "TEXT_NOT_ACCEPTED_IN_STATE"],
+      ["/categories", "TEXT_NOT_ACCEPTED_IN_STATE"],
+      ["/categoriespolitics", "TEXT_NOT_ACCEPTED_IN_STATE"],
+      ["/categories politics,unknown", "CATEGORY_NOT_FOUND"],
+      ["/categories politics,inactive", "CATEGORY_NOT_FOUND"],
+      ["/categories politics,duplicate", "CATEGORY_AMBIGUOUS"],
+    ] as const;
+    for (const [body, reason] of invalid) {
+      const beforeVersion = (
+        await prisma.story.findUniqueOrThrow({ where: { id: story.id } })
+      ).version;
+      const beforeIds = await categoryIds();
+      const beforeAudits = await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+        },
+      });
+      const { result, terminal } = await submit(body);
+      expect(result).toMatchObject({ outcome: "IGNORED", reason });
+      expect(terminal).toMatchObject({
+        processingStatus: InboundProcessingStatus.IGNORED,
+        lastErrorCode: reason,
+        lastErrorMessage: null,
+      });
+      expect(terminal.processedAt).toBeInstanceOf(Date);
+      expect(terminal.lastErrorCode).not.toContain(body);
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(beforeVersion);
+      expect(await categoryIds()).toEqual(beforeIds);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            storyId: story.id,
+            eventType: STORY_COLLECTION_AUDIT.STORY_CATEGORIES_SET,
+          },
+        }),
+      ).toBe(beforeAudits);
+    }
+    expect(inactive.status).toBe(EditorialCategoryStatus.INACTIVE);
+  });
+
+  it("exhaustively validates completeness as a pure read", async () => {
+    const owner = await reporter();
+    const other = await reporter();
+    const category = await prisma.editorialCategory.create({
+      data: { wordpressCategoryId: 59001n, name: "Matrix", slug: "matrix" },
+    });
+    const story = await prisma.story.create({
+      data: {
+        reporterId: owner.id,
+        headline: "Headline",
+        body: "Body",
+        byline: "Byline",
+      },
+    });
+    const conversation = await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    await prisma.storyCategory.create({
+      data: { storyId: story.id, categoryId: category.id },
+    });
+    const completeness = new StoryCompletenessService(prisma);
+    const snapshot = async (): Promise<object> => ({
+      story: await prisma.story.findUniqueOrThrow({ where: { id: story.id } }),
+      conversation: await prisma.conversation.findUniqueOrThrow({
+        where: { id: conversation.id },
+      }),
+      categories: await prisma.storyCategory.findMany({
+        where: { storyId: story.id },
+      }),
+      media: await prisma.storyMedia.findMany({ where: { storyId: story.id } }),
+      audits: await prisma.auditLog.count(),
+    });
+    const pure = async (
+      expected: boolean,
+      reporterId = owner.id,
+    ): Promise<void> => {
+      const before = await snapshot();
+      await expect(completeness.isComplete(reporterId, story.id)).resolves.toBe(
+        expected,
+      );
+      expect(await snapshot()).toEqual(before);
+    };
+    await pure(true);
+    await pure(false, other.id);
+
+    for (const data of [
+      { headline: null },
+      { headline: " \t" },
+      { body: null },
+      { body: " \n" },
+      { byline: null },
+      { byline: " \u2003" },
+    ]) {
+      await prisma.story.update({ where: { id: story.id }, data });
+      await pure(false);
+      await prisma.story.update({
+        where: { id: story.id },
+        data: { headline: "Headline", body: "Body", byline: "Byline" },
+      });
+    }
+    for (const status of Object.values(StoryStatus).filter(
+      (value) => value !== StoryStatus.COLLECTING,
+    )) {
+      await prisma.story.update({ where: { id: story.id }, data: { status } });
+      await pure(false);
+    }
+    await prisma.story.update({
+      where: { id: story.id },
+      data: { status: StoryStatus.COLLECTING },
+    });
+
+    for (const data of [
+      { state: ConversationState.IDLE },
+      { state: ConversationState.AWAITING_HEADLINE },
+      { state: ConversationState.AWAITING_BODY },
+    ]) {
+      await prisma.conversation.update({
+        where: { id: conversation.id },
+        data,
+      });
+      await pure(false);
+    }
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { state: ConversationState.COLLECTING_MEDIA, currentStoryId: null },
+    });
+    await pure(false);
+    const otherStory = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Other" },
+    });
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { currentStoryId: otherStory.id },
+    });
+    await pure(false);
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { currentStoryId: story.id },
+    });
+
+    await prisma.storyCategory.deleteMany({ where: { storyId: story.id } });
+    await pure(false);
+    await prisma.storyCategory.create({
+      data: { storyId: story.id, categoryId: category.id },
+    });
+    await prisma.editorialCategory.update({
+      where: { id: category.id },
+      data: { status: EditorialCategoryStatus.INACTIVE },
+    });
+    await pure(true);
+
+    const media = await prisma.storyMedia.create({
+      data: {
+        storyId: story.id,
+        providerMediaId: providerId("matrix-media"),
+        mediaType: "IMAGE",
+        position: 0,
+      },
+    });
+    for (const status of [
+      MediaProcessingStatus.RECEIVED,
+      MediaProcessingStatus.FETCHING,
+      MediaProcessingStatus.FAILED,
+      MediaProcessingStatus.UPLOADING,
+      MediaProcessingStatus.UPLOADED,
+    ]) {
+      await prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { status },
+      });
+      await pure(false);
+    }
+    const validMedia = {
+      status: MediaProcessingStatus.FETCHED,
+      mimeType: "image/jpeg",
+      fileSizeBytes: 1n,
+      sha256: "a".repeat(64),
+    };
+    for (const mimeType of [
+      "image/png",
+      "image/jpeg",
+      "image/webp",
+      "image/gif",
+    ]) {
+      await prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, mimeType },
+      });
+      await pure(true);
+    }
+    for (const mimeType of [
+      null,
+      "text/plain",
+      "application/octet-stream",
+      "image/svg+xml",
+      "image/bmp",
+    ]) {
+      await prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, mimeType },
+      });
+      await pure(false);
+    }
+    for (const fileSizeBytes of [null, 0n]) {
+      await prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, fileSizeBytes },
+      });
+      await pure(false);
+    }
+    await expect(
+      prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, fileSizeBytes: -1n },
+      }),
+    ).rejects.toBeDefined();
+    for (const sha256 of [
+      null,
+      "a".repeat(63),
+      "A".repeat(64),
+      `${"a".repeat(63)}A`,
+      `${"a".repeat(63)}g`,
+      ` ${"a".repeat(63)}`,
+      `${"a".repeat(63)} `,
+      Buffer.alloc(32).toString("base64"),
+    ]) {
+      await prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, sha256 },
+      });
+      await pure(false);
+    }
+    await expect(
+      prisma.storyMedia.update({
+        where: { id: media.id },
+        data: { ...validMedia, sha256: "a".repeat(65) },
+      }),
+    ).rejects.toBeDefined();
+    await prisma.storyMedia.update({
+      where: { id: media.id },
+      data: validMedia,
+    });
+    const second = await prisma.storyMedia.create({
+      data: {
+        storyId: story.id,
+        providerMediaId: providerId("matrix-media-two"),
+        mediaType: "IMAGE",
+        position: 1,
+        ...validMedia,
+      },
+    });
+    await pure(true);
+    await prisma.storyMedia.update({
+      where: { id: second.id },
+      data: { status: MediaProcessingStatus.RECEIVED },
+    });
+    await pure(false);
+    await prisma.storyMedia.update({
+      where: { id: second.id },
+      data: { ...validMedia, status: MediaProcessingStatus.FAILED },
+    });
+    await pure(false);
+    await prisma.storyMedia.update({
+      where: { id: second.id },
+      data: { ...validMedia, sha256: "Z".repeat(64) },
+    });
+    await pure(false);
   });
 });

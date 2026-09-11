@@ -1,6 +1,9 @@
 import { Injectable } from "@nestjs/common";
 import { AuditActorType, InboundProcessingStatus } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
+import { StoredWhatsappEventParser } from "../story-collection/stored-whatsapp-event.parser";
+import { StoryCollectionError } from "../story-collection/story-collection.errors";
+import { StoryEventProcessor } from "../story-collection/story-event-processor.service";
 import { ConversationProvisioningService } from "./conversation-provisioning.service";
 import {
   IGNORED_REASON,
@@ -19,6 +22,8 @@ export class InboundEventProcessingService {
     private readonly prisma: PrismaService,
     private readonly authorization: ReporterAuthorizationService,
     private readonly conversations: ConversationProvisioningService,
+    private readonly storedEvents: StoredWhatsappEventParser,
+    private readonly stories: StoryEventProcessor,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -75,6 +80,10 @@ export class InboundEventProcessingService {
           senderPhone: true,
           reporterId: true,
           processingStatus: true,
+          providerMessageId: true,
+          eventType: true,
+          rawPayload: true,
+          providerOccurredAt: true,
         },
       });
       if (event.processingStatus !== InboundProcessingStatus.PROCESSING)
@@ -117,10 +126,81 @@ export class InboundEventProcessingService {
         event.reporterId !== authorization.reporterId
       )
         throw new ReporterWorkflowError("INBOUND_EVENT_ASSOCIATION_CONFLICT");
+      await tx.inboundEvent.update({
+        where: { id: event.id },
+        data: { reporterId: authorization.reporterId },
+      });
+      let parsed;
+      try {
+        parsed = this.storedEvents.parse({
+          providerMessageId: event.providerMessageId,
+          senderPhone: event.senderPhone,
+          eventType: event.eventType,
+          providerOccurredAt: event.providerOccurredAt,
+          rawPayload: event.rawPayload,
+        });
+      } catch (error: unknown) {
+        if (
+          error instanceof StoryCollectionError &&
+          error.code === "MALFORMED_STORED_EVENT"
+        ) {
+          await tx.inboundEvent.update({
+            where: { id: event.id },
+            data: {
+              processingStatus: InboundProcessingStatus.FAILED,
+              processedAt: new Date(),
+              lastErrorCode: error.code,
+              lastErrorMessage: null,
+            },
+          });
+          return { outcome: "FAILED", reason: error.code };
+        }
+        throw error;
+      }
       const conversation = await this.conversations.getOrCreateInTransaction(
         tx,
         authorization.reporterId,
       );
+      const expectedStoryVersion = conversation.currentStoryId
+        ? (
+            await tx.story.findUniqueOrThrow({
+              where: { id: conversation.currentStoryId },
+              select: { version: true },
+            })
+          ).version
+        : null;
+      const storyResult = await this.stories.process(tx, {
+        eventId: event.id,
+        reporterId: authorization.reporterId,
+        conversationId: conversation.id,
+        conversationState: conversation.state,
+        conversationVersion: conversation.version,
+        expectedStoryVersion,
+        parsed,
+      });
+      if (storyResult.outcome === "IGNORED") {
+        await tx.auditLog.create({
+          data: {
+            eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_IGNORED,
+            actorType: AuditActorType.REPORTER,
+            reporterId: authorization.reporterId,
+            inboundEventId: event.id,
+            entityType: "InboundEvent",
+            entityId: event.id,
+            metadata: { reason: storyResult.reason },
+          },
+        });
+        await tx.inboundEvent.update({
+          where: { id: event.id },
+          data: {
+            processingStatus: InboundProcessingStatus.IGNORED,
+            processedAt: new Date(),
+            lastErrorCode: storyResult.reason,
+            lastErrorMessage: null,
+          },
+        });
+        return { outcome: "IGNORED", reason: storyResult.reason };
+      }
       await tx.auditLog.create({
         data: {
           eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_AUTHORIZED,
@@ -134,7 +214,6 @@ export class InboundEventProcessingService {
       await tx.inboundEvent.update({
         where: { id: event.id },
         data: {
-          reporterId: authorization.reporterId,
           processingStatus: InboundProcessingStatus.PROCESSED,
           processedAt: new Date(),
           lastErrorCode: null,

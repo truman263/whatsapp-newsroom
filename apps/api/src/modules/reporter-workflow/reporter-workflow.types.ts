@@ -1,4 +1,5 @@
 import type { ConversationState } from "@prisma/client";
+import type { StoryIgnoredReason } from "../story-collection/story-collection.types";
 
 export type ProvisionReporterInput = {
   phoneNumber: string;
@@ -43,6 +44,10 @@ export type EventClaimResult =
 
 export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }
-  | { outcome: "IGNORED"; reason: "REPORTER_UNKNOWN" | "REPORTER_INACTIVE" }
+  | {
+      outcome: "IGNORED";
+      reason: "REPORTER_UNKNOWN" | "REPORTER_INACTIVE" | StoryIgnoredReason;
+    }
+  | { outcome: "FAILED"; reason: "MALFORMED_STORED_EVENT" }
   | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };
