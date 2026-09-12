@@ -4,6 +4,7 @@ import {
   ConversationState,
   EditorialCategoryStatus,
   Prisma,
+  StoryMediaType,
   StoryStatus,
   type Story,
 } from "@prisma/client";
@@ -11,6 +12,7 @@ import { ConversationStateMachineService } from "../reporter-workflow/conversati
 import { STORY_COLLECTION_AUDIT } from "./story-collection.audit";
 import { StoryCollectionError } from "./story-collection.errors";
 import type {
+  ParsedStoredEvent,
   StoryIgnoredReason,
   StoryProcessInput,
   StoryProcessResult,
@@ -51,8 +53,11 @@ export class StoryEventProcessor {
 
     if (input.parsed.kind === "UNKNOWN")
       return ignored("UNSUPPORTED_EVENT_TYPE");
-    if (input.parsed.kind === "IMAGE")
-      return ignored("MEDIA_COLLECTION_NOT_ENABLED");
+    if (
+      input.parsed.kind === "IMAGE" &&
+      conversation.state !== ConversationState.COLLECTING_MEDIA
+    )
+      return ignored("IMAGE_NOT_ACCEPTED_IN_STATE");
     if (command === "newsroom:v1:story:done" || command === "/done")
       return ignored("CONTROL_NOT_ENABLED");
     if (
@@ -105,6 +110,8 @@ export class StoryEventProcessor {
       );
     }
     if (conversation.state === ConversationState.COLLECTING_MEDIA) {
+      if (input.parsed.kind === "IMAGE")
+        return this.media(tx, input, conversation.currentStoryId, input.parsed);
       if (input.parsed.kind !== "TEXT")
         return ignored("UNSUPPORTED_INTERACTION");
       if (!input.parsed.text.startsWith(CATEGORY_COMMAND))
@@ -117,6 +124,62 @@ export class StoryEventProcessor {
       );
     }
     return ignored("TEXT_NOT_ACCEPTED_IN_STATE");
+  }
+
+  private async media(
+    tx: Prisma.TransactionClient,
+    input: StoryProcessInput,
+    storyId: string | null,
+    authority: Extract<ParsedStoredEvent, { kind: "IMAGE" }>,
+  ): Promise<StoryProcessResult> {
+    const duplicate = await tx.storyMedia.findUnique({
+      where: { providerMediaId: authority.providerMediaId },
+      select: { id: true },
+    });
+    if (duplicate) throw new StoryCollectionError("STORY_DOMAIN_CONFLICT");
+    const story = await this.currentStory(
+      tx,
+      input.reporterId,
+      storyId,
+      input.expectedStoryVersion,
+    );
+    const last = await tx.storyMedia.findFirst({
+      where: { storyId: story.id },
+      orderBy: [{ position: "desc" }, { id: "asc" }],
+      select: { position: true },
+    });
+    await this.storyCas(tx, story, {});
+    const media = await tx.storyMedia.create({
+      data: {
+        storyId: story.id,
+        providerMediaId: authority.providerMediaId,
+        mediaType: StoryMediaType.IMAGE,
+        mimeType: authority.mimeType,
+        position: (last?.position ?? -1) + 1,
+        caption: authority.caption ?? null,
+        altText: null,
+      },
+    });
+    await this.audit(
+      tx,
+      input,
+      story.id,
+      STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+      {
+        ...versionMetadata(story.version),
+        storyMediaId: media.id,
+        position: media.position,
+        mimeType: authority.mimeType,
+      },
+      "StoryMedia",
+      media.id,
+    );
+    return {
+      outcome: "MEDIA_INTENT",
+      mediaId: media.id,
+      storyId: story.id,
+      authority,
+    };
   }
 
   private async start(
@@ -407,6 +470,8 @@ export class StoryEventProcessor {
     storyId: string,
     eventType: string,
     metadata: Prisma.InputJsonObject,
+    entityType = "Story",
+    entityId = storyId,
   ): Promise<void> {
     await tx.auditLog.create({
       data: {
@@ -415,8 +480,8 @@ export class StoryEventProcessor {
         reporterId: input.reporterId,
         storyId,
         inboundEventId: input.eventId,
-        entityType: "Story",
-        entityId: storyId,
+        entityType,
+        entityId,
         metadata,
       },
     });

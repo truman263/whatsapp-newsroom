@@ -1,8 +1,8 @@
-import { Environment, validateEnvironment } from './env.schema';
+import { Environment, validateEnvironment } from "./env.schema";
 
 export interface ApplicationConfiguration {
   app: {
-    environment: Environment['NODE_ENV'];
+    environment: Environment["NODE_ENV"];
     port: number;
   };
   database: { url: string };
@@ -25,6 +25,10 @@ export interface ApplicationConfiguration {
     mediaReconciliationAttempts: number;
     mediaReconciliationDelayMs: number;
     mediaMaxBytes: number;
+  };
+  mediaStaging: {
+    maxBytes: number;
+    requestTimeoutMs: number;
   };
 }
 
@@ -53,9 +57,15 @@ export default function configuration(): ApplicationConfiguration {
       mediaHmacKeyId: environment.WORDPRESS_MEDIA_HMAC_KEY_ID,
       mediaHmacSecret: environment.WORDPRESS_MEDIA_HMAC_SECRET,
       mediaRequestTimeoutMs: environment.WORDPRESS_MEDIA_REQUEST_TIMEOUT_MS,
-      mediaReconciliationAttempts: environment.WORDPRESS_MEDIA_RECONCILIATION_ATTEMPTS,
-      mediaReconciliationDelayMs: environment.WORDPRESS_MEDIA_RECONCILIATION_DELAY_MS,
+      mediaReconciliationAttempts:
+        environment.WORDPRESS_MEDIA_RECONCILIATION_ATTEMPTS,
+      mediaReconciliationDelayMs:
+        environment.WORDPRESS_MEDIA_RECONCILIATION_DELAY_MS,
       mediaMaxBytes: environment.WORDPRESS_MEDIA_MAX_BYTES,
+    },
+    mediaStaging: {
+      maxBytes: environment.NEWSROOM_MEDIA_STAGING_MAX_BYTES,
+      requestTimeoutMs: environment.WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS,
     },
   };
 }

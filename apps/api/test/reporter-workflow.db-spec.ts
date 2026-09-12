@@ -1,23 +1,39 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   ConversationState,
   EditorialCategoryStatus,
   InboundEventType,
   InboundProcessingStatus,
   MediaProcessingStatus,
-  type Prisma,
   Provider,
-  type InboundEvent,
-  type Reporter,
   ReporterStatus,
   StoryStatus,
+  type Conversation,
+  type InboundEvent,
+  type Prisma,
+  type Reporter,
+  type Story,
 } from "@prisma/client";
 import { runReporterCli } from "../src/commands/reporter-cli";
 import { PrismaService } from "../src/database/prisma.service";
+import { MEDIA_STAGING_AUDIT } from "../src/modules/media-staging/media-staging.audit";
+import { MediaStagingError } from "../src/modules/media-staging/media-staging.errors";
+import { MediaStagingService } from "../src/modules/media-staging/media-staging.service";
+import {
+  mediaObjectKey,
+  type DownloadedMedia,
+  type MediaAuthority,
+  type MediaObjectStore,
+  type MediaProviderClient,
+  type StoredObjectHead,
+} from "../src/modules/media-staging/media-staging.types";
 import { ConversationProvisioningService } from "../src/modules/reporter-workflow/conversation-provisioning.service";
 import { ConversationStateMachineService } from "../src/modules/reporter-workflow/conversation-state-machine.service";
 import { InboundEventProcessingService } from "../src/modules/reporter-workflow/inbound-event-processing.service";
-import { REPORTER_WORKFLOW_AUDIT } from "../src/modules/reporter-workflow/reporter-workflow.audit";
+import {
+  IGNORED_REASON,
+  REPORTER_WORKFLOW_AUDIT,
+} from "../src/modules/reporter-workflow/reporter-workflow.audit";
 import { ReporterAuthorizationService } from "../src/modules/reporter-workflow/reporter-authorization.service";
 import { ReporterProvisioningService } from "../src/modules/reporter-workflow/reporter-provisioning.service";
 import { ReporterWorkflowError } from "../src/modules/reporter-workflow/reporter-workflow.errors";
@@ -40,11 +56,52 @@ const prisma = new PrismaService();
 const run = Date.now().toString().slice(-8);
 let sequence = 0;
 let ingestSequence = 0n;
+const stagedObjects = new Map<string, DownloadedMedia>();
+
+class ProofMediaProvider implements MediaProviderClient {
+  fetch(authority: MediaAuthority): Promise<DownloadedMedia> {
+    const bytes =
+      authority.mimeType === "image/png"
+        ? Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.alloc(16)])
+        : Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    return Promise.resolve({
+      bytes,
+      mimeType: authority.mimeType,
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+  }
+}
+
+class ProofObjectStore implements MediaObjectStore {
+  putIfAbsent(
+    key: string,
+    media: DownloadedMedia,
+  ): Promise<"CREATED" | "EXISTS"> {
+    if (stagedObjects.has(key)) return Promise.resolve("EXISTS");
+    stagedObjects.set(key, media);
+    return Promise.resolve("CREATED");
+  }
+  head(key: string): Promise<StoredObjectHead | null> {
+    const media = stagedObjects.get(key);
+    return Promise.resolve(
+      media
+        ? { size: media.size, sha256: media.sha256, mimeType: media.mimeType }
+        : null,
+    );
+  }
+  read(key: string): Promise<Buffer> {
+    const media = stagedObjects.get(key);
+    if (!media) return Promise.reject(new Error("missing"));
+    return Promise.resolve(media.bytes);
+  }
+}
 const phone = (): string => `+2637${run}${String(sequence++).padStart(2, "0")}`;
 const providerId = (name: string): string =>
   `round4b:${run}:${name}:${sequence++}`;
 
 async function reset(): Promise<void> {
+  stagedObjects.clear();
   await prisma.$executeRaw`
     TRUNCATE TABLE "Approval", "AuditLog", "StoryCategory", "StoryMedia", "OutboundMessage", "PublishAttempt", "Conversation", "InboundEvent", "InboundSenderSequence", "Story", "EditorialCategory", "Reporter" CASCADE
   `;
@@ -138,6 +195,11 @@ function processor(client: PrismaService): InboundEventProcessingService {
     new ConversationProvisioningService(),
     new StoredWhatsappEventParser(),
     new StoryEventProcessor(stateMachine),
+    new MediaStagingService(
+      client,
+      new ProofMediaProvider(),
+      new ProofObjectStore(),
+    ),
   );
 }
 
@@ -1570,7 +1632,7 @@ describe("Round 4B disposable PostgreSQL proof", () => {
             caption: "valid",
           },
         },
-        "MEDIA_COLLECTION_NOT_ENABLED",
+        "IMAGE_NOT_ACCEPTED_IN_STATE",
       ],
       [
         InboundEventType.INTERACTIVE,
@@ -1693,7 +1755,7 @@ describe("Round 4B disposable PostgreSQL proof", () => {
         ConversationState.IDLE,
         InboundEventType.IMAGE,
         { image: { id: "idle-image", mime_type: "image/jpeg" } },
-        "MEDIA_COLLECTION_NOT_ENABLED",
+        "IMAGE_NOT_ACCEPTED_IN_STATE",
       ],
       [
         ConversationState.IDLE,
@@ -1716,7 +1778,7 @@ describe("Round 4B disposable PostgreSQL proof", () => {
         ConversationState.AWAITING_HEADLINE,
         InboundEventType.IMAGE,
         { image: { id: "headline-image", mime_type: "image/jpeg" } },
-        "MEDIA_COLLECTION_NOT_ENABLED",
+        "IMAGE_NOT_ACCEPTED_IN_STATE",
       ],
       [
         ConversationState.AWAITING_HEADLINE,
@@ -1739,7 +1801,7 @@ describe("Round 4B disposable PostgreSQL proof", () => {
         ConversationState.AWAITING_BODY,
         InboundEventType.IMAGE,
         { image: { id: "body-image", mime_type: "image/jpeg" } },
-        "MEDIA_COLLECTION_NOT_ENABLED",
+        "IMAGE_NOT_ACCEPTED_IN_STATE",
       ],
       [
         ConversationState.AWAITING_BODY,
@@ -1780,12 +1842,6 @@ describe("Round 4B disposable PostgreSQL proof", () => {
         InboundEventType.TEXT,
         { text: { body: "other" } },
         "TEXT_NOT_ACCEPTED_IN_STATE",
-      ],
-      [
-        ConversationState.COLLECTING_MEDIA,
-        InboundEventType.IMAGE,
-        { image: { id: "collecting-image", mime_type: "image/jpeg" } },
-        "MEDIA_COLLECTION_NOT_ENABLED",
       ],
       [
         ConversationState.COLLECTING_MEDIA,
@@ -2835,5 +2891,1326 @@ describe("Round 4B disposable PostgreSQL proof", () => {
       data: { ...validMedia, sha256: "Z".repeat(64) },
     });
     await pure(false);
+  });
+
+  it("stages sequential IMAGE events durably with zero-based positions and one Story version each", async () => {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: {
+        reporterId: owner.id,
+        byline: "Media Byline",
+        headline: "Media headline",
+        body: "Media body",
+      },
+    });
+    await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    const category = await prisma.editorialCategory.create({
+      data: {
+        wordpressCategoryId: 61001n,
+        name: "Media",
+        slug: "media-proof",
+      },
+    });
+    await prisma.storyCategory.create({
+      data: { storyId: story.id, categoryId: category.id },
+    });
+    for (let index = 0; index < 3; index += 1) {
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `media-sequential-${index}`,
+        InboundEventType.IMAGE,
+        {
+          image: {
+            id: `opaque.media.sequential:${index}`,
+            mime_type: "image/jpeg",
+            caption: `line one\r\nline ${index}`,
+          },
+        },
+      );
+      await expect(processor(prisma).process(event.id)).resolves.toMatchObject({
+        outcome: "PROCESSED",
+      });
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        }),
+      ).toMatchObject({
+        processingStatus: InboundProcessingStatus.PROCESSED,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      });
+    }
+    const media = await prisma.storyMedia.findMany({
+      where: { storyId: story.id },
+      orderBy: { position: "asc" },
+    });
+    expect(media.map(({ position }) => position)).toEqual([0, 1, 2]);
+    expect(media.map(({ caption }) => caption)).toEqual([
+      "line one\nline 0",
+      "line one\nline 1",
+      "line one\nline 2",
+    ]);
+    for (const row of media) {
+      expect(row).toMatchObject({
+        status: MediaProcessingStatus.FETCHED,
+        mimeType: "image/jpeg",
+        fileSizeBytes: 4n,
+        altText: null,
+        wordpressMediaId: null,
+      });
+      expect(row.sha256).toMatch(/^[0-9a-f]{64}$/u);
+      expect(stagedObjects.has(`story-media/v1/${row.id}/source`)).toBe(true);
+    }
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(3);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+        },
+      }),
+    ).toBe(3);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_STAGED,
+        },
+      }),
+    ).toBe(3);
+    await expect(
+      new StoryCompletenessService(prisma).isComplete(owner.id, story.id),
+    ).resolves.toBe(true);
+  });
+
+  it("commits media intent before any provider/store I/O and completes afterward", async () => {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Boundary" },
+    });
+    await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    const providerMediaId = "opaque.boundary";
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "media-boundary",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    let externalObservedCommittedIntent = false;
+    const provider: MediaProviderClient = {
+      fetch: async (authority) => {
+        const intent = await prisma.storyMedia.findUniqueOrThrow({
+          where: { providerMediaId: authority.providerMediaId },
+        });
+        await prisma.$queryRaw`SELECT "id" FROM "Story" WHERE "id" = ${story.id}::uuid FOR UPDATE NOWAIT`;
+        expect(intent.status).toBe(MediaProcessingStatus.FETCHING);
+        expect(
+          await prisma.inboundEvent.findUniqueOrThrow({
+            where: { id: event.id },
+          }),
+        ).toMatchObject({
+          processingStatus: InboundProcessingStatus.PROCESSING,
+        });
+        externalObservedCommittedIntent = true;
+        return new ProofMediaProvider().fetch(authority);
+      },
+    };
+    const service = new InboundEventProcessingService(
+      prisma,
+      new ReporterAuthorizationService(),
+      new ConversationProvisioningService(),
+      new StoredWhatsappEventParser(),
+      storyProcessor(prisma),
+      new MediaStagingService(prisma, provider, new ProofObjectStore()),
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    expect(externalObservedCommittedIntent).toBe(true);
+  });
+
+  it("allows one of 20 direct media intents for one expected Story version", async () => {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Race" },
+    });
+    const conversation = await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    const results = await directRace(owner, conversation, 0, (index) => ({
+      kind: "IMAGE",
+      providerMediaId: `opaque.race:${index}`,
+      mimeType: "image/jpeg",
+    }));
+    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(
+      await prisma.storyMedia.findMany({ where: { storyId: story.id } }),
+    ).toHaveLength(1);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("rejects duplicate provider media IDs without another association, version, or audit", async () => {
+    const owner = await reporter();
+    const other = await reporter();
+    const story = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Owner" },
+    });
+    const otherStory = await prisma.story.create({
+      data: { reporterId: other.id, byline: "Other" },
+    });
+    await Promise.all([
+      prisma.conversation.create({
+        data: {
+          reporterId: owner.id,
+          state: ConversationState.COLLECTING_MEDIA,
+          currentStoryId: story.id,
+        },
+      }),
+      prisma.conversation.create({
+        data: {
+          reporterId: other.id,
+          state: ConversationState.COLLECTING_MEDIA,
+          currentStoryId: otherStory.id,
+        },
+      }),
+    ]);
+    const providerMediaId = "opaque.duplicate";
+    const first = await storedEvent(
+      owner.phoneNumber,
+      "duplicate-first",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    await processor(prisma).process(first.id);
+    for (const candidate of [owner, other]) {
+      const duplicate = await storedEvent(
+        candidate.phoneNumber,
+        `duplicate-${candidate.id}`,
+        InboundEventType.IMAGE,
+        { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+      );
+      await expect(processor(prisma).process(duplicate.id)).rejects.toThrow(
+        "STORY_DOMAIN_CONFLICT",
+      );
+    }
+    expect(await prisma.storyMedia.count({ where: { providerMediaId } })).toBe(
+      1,
+    );
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: otherStory.id } }))
+        .version,
+    ).toBe(0);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+        },
+      }),
+    ).toBe(1);
+  });
+});
+
+describe("Round 5B.2 PostgreSQL closure proofs", () => {
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const JPEG_SHA = createHash("sha256").update(JPEG).digest("hex");
+
+  async function collectingStory(): Promise<{
+    owner: Reporter;
+    story: Story;
+    conversation: Conversation;
+  }> {
+    const owner = await reporter();
+    const story = await prisma.story.create({
+      data: { reporterId: owner.id, byline: "Closure B" },
+    });
+    const conversation = await prisma.conversation.create({
+      data: {
+        reporterId: owner.id,
+        state: ConversationState.COLLECTING_MEDIA,
+        currentStoryId: story.id,
+      },
+    });
+    return { owner, story, conversation };
+  }
+
+  class RecordingProvider implements MediaProviderClient {
+    readonly calls: MediaAuthority[] = [];
+    constructor(private readonly inner: MediaProviderClient) {}
+
+    async fetch(authority: MediaAuthority): Promise<DownloadedMedia> {
+      this.calls.push(authority);
+      return this.inner.fetch(authority);
+    }
+  }
+
+  class RecordingStore implements MediaObjectStore {
+    readonly puts: string[] = [];
+    constructor(private readonly inner: MediaObjectStore) {}
+
+    async putIfAbsent(
+      key: string,
+      media: DownloadedMedia,
+    ): Promise<"CREATED" | "EXISTS"> {
+      this.puts.push(key);
+      return this.inner.putIfAbsent(key, media);
+    }
+    async head(key: string): Promise<StoredObjectHead | null> {
+      return this.inner.head(key);
+    }
+    async read(key: string): Promise<Buffer> {
+      return this.inner.read(key);
+    }
+  }
+
+  class ThrowingProvider implements MediaProviderClient {
+    readonly calls: MediaAuthority[] = [];
+    constructor(private readonly error: MediaStagingError) {}
+
+    fetch(authority: MediaAuthority): Promise<DownloadedMedia> {
+      this.calls.push(authority);
+      throw new MediaStagingError(this.error.code, this.error.definitive);
+    }
+  }
+
+  class ConflictingHeadStore implements MediaObjectStore {
+    async putIfAbsent(_key: string, _media: DownloadedMedia): Promise<"CREATED" | "EXISTS"> {
+      return Promise.resolve("EXISTS");
+    }
+    async head(_key: string): Promise<StoredObjectHead | null> {
+      return Promise.resolve({
+        size: 999999,
+        sha256: "0".repeat(64),
+        mimeType: "image/jpeg",
+      });
+    }
+    async read(_key: string): Promise<Buffer> {
+      return Promise.resolve(Buffer.from([0]));
+    }
+  }
+
+  function serviceWith(
+    client: PrismaService,
+    provider: MediaProviderClient,
+    store: MediaObjectStore,
+  ): InboundEventProcessingService {
+    return new InboundEventProcessingService(
+      client,
+      new ReporterAuthorizationService(),
+      new ConversationProvisioningService(),
+      new StoredWhatsappEventParser(),
+      storyProcessor(client),
+      new MediaStagingService(client, provider, store),
+    );
+  }
+
+  it("commits the full staging intent before any external I/O and never re-increments the Story version", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.intent`;
+    let observedColumn: string | null = null;
+    const recording = new RecordingProvider({
+      fetch: async (authority): Promise<DownloadedMedia> => {
+        expect(authority.providerMediaId).toBe(providerMediaId);
+        const intent = await prisma.storyMedia.findUniqueOrThrow({
+          where: { providerMediaId: authority.providerMediaId },
+        });
+        await prisma.$queryRaw`SELECT "id" FROM "Story" WHERE "id" = ${story.id}::uuid FOR UPDATE NOWAIT`;
+        const storyRow = await prisma.story.findUniqueOrThrow({
+          where: { id: story.id },
+        });
+        expect(intent).toMatchObject({
+          storyId: story.id,
+          providerMediaId,
+          mediaType: "IMAGE",
+          status: MediaProcessingStatus.FETCHING,
+          position: 0,
+          caption: "one\ntwo",
+          altText: null,
+          wordpressMediaId: null,
+          sha256: null,
+          fileSizeBytes: null,
+          mimeType: "image/jpeg",
+        });
+        expect(storyRow.version).toBe(1);
+        const eventRow = await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        });
+        expect(eventRow).toMatchObject({
+          processingStatus: InboundProcessingStatus.PROCESSING,
+          processedAt: null,
+        });
+        expect(
+          await prisma.auditLog.count({
+            where: {
+              storyId: story.id,
+              eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+            },
+          }),
+        ).toBe(1);
+        observedColumn = intent.caption;
+        return {
+          bytes: JPEG,
+          mimeType: "image/jpeg",
+          size: JPEG.length,
+          sha256: JPEG_SHA,
+        };
+      },
+    });
+    const storeRecording = new RecordingStore(new ProofObjectStore());
+    const service = serviceWith(prisma, recording, storeRecording);
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-intent",
+      InboundEventType.IMAGE,
+      {
+        image: {
+          id: providerMediaId,
+          mime_type: "image/jpeg",
+          caption: "one\r\ntwo",
+        },
+      },
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    expect(observedColumn).toBe("one\ntwo");
+    expect(recording.calls).toHaveLength(1);
+    expect(storeRecording.puts).toHaveLength(1);
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    expect(storeRecording.puts).toEqual([mediaObjectKey(media.id)]);
+    expect(media.status).toBe(MediaProcessingStatus.FETCHED);
+    expect(media.fileSizeBytes).toBe(4n);
+    expect(media.sha256).toBe(JPEG_SHA);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.PROCESSED,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    });
+    const completedEvent = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: event.id },
+    });
+    expect(completedEvent.processedAt).not.toBeNull();
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("proves the object write is in flight before the completion transaction and completion waits for verified evidence", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.io`;
+    let objectObservedFetching = false;
+    const provider = new RecordingProvider({
+      fetch: async (authority): Promise<DownloadedMedia> => {
+        await prisma.$queryRaw`SELECT "id" FROM "Story" WHERE "id" = ${story.id}::uuid FOR UPDATE NOWAIT`;
+        expect(
+          await prisma.storyMedia.findUniqueOrThrow({
+            where: { providerMediaId: authority.providerMediaId },
+          }),
+        ).toMatchObject({ status: MediaProcessingStatus.FETCHING });
+        return {
+          bytes: JPEG,
+          mimeType: "image/jpeg",
+          size: JPEG.length,
+          sha256: JPEG_SHA,
+        };
+      },
+    });
+    const store = new RecordingStore({
+      putIfAbsent: async (key, media): Promise<"CREATED" | "EXISTS"> => {
+        stagedObjects.set(key, media);
+        const observed = await prisma.storyMedia.findUniqueOrThrow({
+          where: { providerMediaId },
+        });
+        expect(observed.status).toBe(MediaProcessingStatus.FETCHING);
+        const eventRow = await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        });
+        expect(eventRow.processingStatus).toBe(
+          InboundProcessingStatus.PROCESSING,
+        );
+        expect(eventRow.processedAt).toBeNull();
+        objectObservedFetching = true;
+        return "CREATED";
+      },
+      head: (key): Promise<StoredObjectHead | null> => {
+        const media = stagedObjects.get(key);
+        return Promise.resolve(
+          media
+            ? { size: media.size, sha256: media.sha256, mimeType: media.mimeType }
+            : null,
+        );
+      },
+      read: async (key): Promise<Buffer> => {
+        const media = stagedObjects.get(key);
+        if (!media) return Promise.reject(new Error("missing"));
+        return media.bytes;
+      },
+    });
+    const service = serviceWith(prisma, provider, store);
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-io",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    expect(objectObservedFetching).toBe(true);
+  });
+
+  it("keeps the durable object, a reconciliation path, and no false terminal state when the completion transaction fails", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.completion-failure`;
+    const runClient = new PrismaService();
+    let failCompletion = false;
+    const rawTransaction = runClient.$transaction.bind(runClient);
+    runClient.$transaction = ((interactive: unknown, ...rest: unknown[]) => {
+      if (failCompletion) {
+        failCompletion = false;
+        return Promise.reject(new Error("simulated completion write failure"));
+      }
+      return rawTransaction(interactive as never, ...(rest as never[]));
+    }) as typeof runClient.$transaction;
+    try {
+      const provider = new RecordingProvider({
+        fetch: (authority): Promise<DownloadedMedia> => {
+          expect(authority.providerMediaId).toBe(providerMediaId);
+          failCompletion = true;
+          return Promise.resolve({
+            bytes: JPEG,
+            mimeType: "image/jpeg",
+            size: JPEG.length,
+            sha256: JPEG_SHA,
+          });
+        },
+      });
+      const store = new RecordingStore(new ProofObjectStore());
+      const service = serviceWith(runClient, provider, store);
+      const event = await storedEvent(
+        owner.phoneNumber,
+        "closure-completion-failure",
+        InboundEventType.IMAGE,
+        { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+      );
+      await expect(service.process(event.id)).resolves.toMatchObject({
+        outcome: "RETRY_REQUIRED",
+        reason: "MEDIA_OBJECT_UNAVAILABLE",
+      });
+      const media = await prisma.storyMedia.findUniqueOrThrow({
+        where: { providerMediaId },
+      });
+      const key = mediaObjectKey(media.id);
+      expect(media).toMatchObject({
+        status: MediaProcessingStatus.FETCHING,
+        mimeType: "image/jpeg",
+        fileSizeBytes: null,
+        sha256: null,
+      });
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+      ).toMatchObject({
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        processedAt: null,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      });
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(1);
+      expect(store.puts).toEqual([key]);
+      const stagedObject = stagedObjects.get(key);
+      expect(stagedObject).toBeDefined();
+      expect(stagedObject?.sha256).toBe(JPEG_SHA);
+
+      const recoveryProvider = new RecordingProvider(new ProofMediaProvider());
+      const recoveryStore = new RecordingStore(new ProofObjectStore());
+      const recovered = await new MediaStagingService(
+        prisma,
+        recoveryProvider,
+        recoveryStore,
+      ).reconcile(media.id, event.id);
+      expect(recovered).toEqual({ outcome: "PROCESSED" });
+      expect(recoveryProvider.calls).toHaveLength(0);
+      expect(recoveryStore.puts).toHaveLength(0);
+      const after = await prisma.storyMedia.findUniqueOrThrow({
+        where: { id: media.id },
+      });
+      expect(after).toMatchObject({
+        status: MediaProcessingStatus.FETCHED,
+        mimeType: "image/jpeg",
+        fileSizeBytes: 4n,
+        sha256: JPEG_SHA,
+      });
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+      ).toMatchObject({
+        processingStatus: InboundProcessingStatus.PROCESSED,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      });
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(1);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            storyId: story.id,
+            eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+          },
+        }),
+      ).toBe(1);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            storyId: story.id,
+            eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+          },
+        }),
+      ).toBe(1);
+    } finally {
+      await runClient.$disconnect();
+    }
+  });
+
+  it("finalises a matching pre-existing object without provider I/O and rejects a mismatching one", async () => {
+    const { owner } = await collectingStory();
+    const providerMediaId = `closure.reconcile`;
+    const provider = new RecordingProvider({
+      fetch: (): Promise<DownloadedMedia> =>
+        Promise.reject(
+          new MediaStagingError("MEDIA_PROVIDER_UNAVAILABLE", false),
+        ),
+    });
+    const service = serviceWith(prisma, provider, new ProofObjectStore());
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-reconcile",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "RETRY_REQUIRED",
+      reason: "MEDIA_PROVIDER_UNAVAILABLE",
+    });
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    expect(media.status).toBe(MediaProcessingStatus.FETCHING);
+    const key = mediaObjectKey(media.id);
+    expect(stagedObjects.has(key)).toBe(false);
+
+    stagedObjects.set(key, {
+      bytes: JPEG,
+      mimeType: "image/jpeg",
+      size: JPEG.length,
+      sha256: JPEG_SHA,
+    });
+    const recoveryProvider = new RecordingProvider(new ProofMediaProvider());
+    const recoveryStore = new RecordingStore(new ProofObjectStore());
+    const recovered = await new MediaStagingService(
+      prisma,
+      recoveryProvider,
+      recoveryStore,
+    ).reconcile(media.id, event.id);
+    expect(recovered).toEqual({ outcome: "PROCESSED" });
+    expect(recoveryProvider.calls).toHaveLength(0);
+    expect(recoveryStore.puts).toHaveLength(0);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toMatchObject({ processingStatus: InboundProcessingStatus.PROCESSED });
+
+    const mismatchingEvent = await storedEvent(
+      owner.phoneNumber,
+      "closure-reconcile-mismatch",
+      InboundEventType.IMAGE,
+      { image: { id: `closure.reconcile.mismatch`, mime_type: "image/jpeg" } },
+    );
+    const mismatchService = serviceWith(
+      prisma,
+      new RecordingProvider({
+        fetch: (): Promise<DownloadedMedia> =>
+          Promise.reject(
+            new MediaStagingError("MEDIA_PROVIDER_UNAVAILABLE", false),
+          ),
+      }),
+      new ProofObjectStore(),
+    );
+    await expect(mismatchService.process(mismatchingEvent.id)).resolves.toMatchObject({
+      outcome: "RETRY_REQUIRED",
+      reason: "MEDIA_PROVIDER_UNAVAILABLE",
+    });
+    const mismatchMedia = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId: "closure.reconcile.mismatch" },
+    });
+    const mismatchKey = mediaObjectKey(mismatchMedia.id);
+    stagedObjects.set(mismatchKey, {
+      bytes: Buffer.from([0x01]),
+      mimeType: "image/png",
+      size: 1,
+      sha256: createHash("sha256").update(Buffer.from([0x01])).digest("hex"),
+    });
+    const conflictStore = new RecordingStore(new ProofObjectStore());
+    const conflicted = await new MediaStagingService(
+      prisma,
+      recoveryProvider,
+      conflictStore,
+    ).reconcile(mismatchMedia.id, mismatchingEvent.id);
+    expect(conflicted).toMatchObject({
+      outcome: "RETRY_REQUIRED",
+      reason: "MEDIA_OBJECT_CONFLICT",
+    });
+    expect(conflictStore.puts).toHaveLength(0);
+    expect(
+      await prisma.storyMedia.findUniqueOrThrow({
+        where: { id: mismatchMedia.id },
+      }),
+    ).toMatchObject({ status: MediaProcessingStatus.FETCHING });
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: mismatchingEvent.id },
+      }),
+    ).toMatchObject({ processingStatus: InboundProcessingStatus.PROCESSING });
+    expect(stagedObjects.get(mismatchKey)?.size).toBe(1);
+  });
+
+  it("reconciles idempotently without additional DB mutations or I/O", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.idempotent`;
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-idempotent",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    await expect(processor(prisma).process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    const first = await new MediaStagingService(
+      prisma,
+      new ProofMediaProvider(),
+      new ProofObjectStore(),
+    ).reconcile(media.id, event.id);
+    expect(first).toEqual({ outcome: "PROCESSED" });
+    const prior = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: event.id },
+    });
+    const provider = new RecordingProvider(new ProofMediaProvider());
+    const store = new RecordingStore(new ProofObjectStore());
+    const second = await new MediaStagingService(
+      prisma,
+      provider,
+      store,
+    ).reconcile(media.id, event.id);
+    expect(second).toEqual({ outcome: "PROCESSED" });
+    expect(provider.calls).toHaveLength(0);
+    expect(store.puts).toHaveLength(0);
+    const after = await prisma.storyMedia.findUniqueOrThrow({
+      where: { id: media.id },
+    });
+    expect(after).toMatchObject({ status: MediaProcessingStatus.FETCHED });
+    const now = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: event.id },
+    });
+    expect(now.processedAt).toEqual(prior.processedAt);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: story.id,
+          eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("leaves stable terminal database states for every definitive media failure", async () => {
+    const cases: Array<{
+      label: string;
+      error: MediaStagingError;
+    }> = [
+      {
+        label: "mime-mismatch",
+        error: new MediaStagingError("MEDIA_MIME_MISMATCH", true),
+      },
+      {
+        label: "too-large",
+        error: new MediaStagingError("MEDIA_TOO_LARGE", true),
+      },
+      {
+        label: "size-mismatch",
+        error: new MediaStagingError("MEDIA_SIZE_MISMATCH", true),
+      },
+      {
+        label: "hash-mismatch",
+        error: new MediaStagingError("MEDIA_HASH_MISMATCH", true),
+      },
+    ];
+    for (const testCase of cases) {
+      const { owner, story } = await collectingStory();
+      const providerMediaId = `closure.definitive.${testCase.label}`;
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `closure-definitive-${testCase.label}`,
+        InboundEventType.IMAGE,
+        { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+      );
+      const service = serviceWith(
+        prisma,
+        new ThrowingProvider(testCase.error),
+        new ProofObjectStore(),
+      );
+      await expect(service.process(event.id)).resolves.toMatchObject({
+        outcome: "FAILED",
+        reason: testCase.error.code,
+      });
+      const media = await prisma.storyMedia.findUniqueOrThrow({
+        where: { providerMediaId },
+      });
+      expect(media.status).toBe(MediaProcessingStatus.FAILED);
+      expect(media.sha256).toBeNull();
+      expect(media.fileSizeBytes).toBeNull();
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        }),
+      ).toMatchObject({
+        processingStatus: InboundProcessingStatus.FAILED,
+        lastErrorCode: testCase.error.code,
+        lastErrorMessage: null,
+      });
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(1);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            storyId: story.id,
+            eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_FAILED,
+          },
+        }),
+      ).toBe(1);
+    }
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.definitive.conflict`;
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-definitive-conflict",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    const service = serviceWith(
+      prisma,
+      new ProofMediaProvider(),
+      new ConflictingHeadStore(),
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "FAILED",
+      reason: "MEDIA_OBJECT_CONFLICT",
+    });
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    expect(media.status).toBe(MediaProcessingStatus.FAILED);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+    expect(
+      await prisma.storyMedia.count({ where: { storyId: story.id } }),
+    ).toBe(1);
+  });
+
+  it("never claims a false terminal state for transient or ambiguous staging failures", async () => {
+    const transient: Array<{ label: string; error: MediaStagingError }> = [
+      {
+        label: "metadata-timeout",
+        error: new MediaStagingError("MEDIA_PROVIDER_UNAVAILABLE", false),
+      },
+      {
+        label: "connection-reset",
+        error: new MediaStagingError("MEDIA_PROVIDER_UNAVAILABLE", false),
+      },
+      {
+        label: "store-before-effect",
+        error: new MediaStagingError("MEDIA_OBJECT_UNAVAILABLE", false),
+      },
+    ];
+    for (const testCase of transient) {
+      const { owner, story } = await collectingStory();
+      const providerMediaId = `closure.transient.${testCase.label}`;
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `closure-transient-${testCase.label}`,
+        InboundEventType.IMAGE,
+        { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+      );
+      const thrower = new ThrowingProvider(testCase.error);
+      const service = serviceWith(
+        prisma,
+        thrower,
+        new ProofObjectStore(),
+      );
+      await expect(service.process(event.id)).resolves.toMatchObject({
+        outcome: "RETRY_REQUIRED",
+        reason: testCase.error.code,
+      });
+      expect(thrower.calls).toHaveLength(1);
+      const media = await prisma.storyMedia.findUniqueOrThrow({
+        where: { providerMediaId },
+      });
+      expect(media.status).toBe(MediaProcessingStatus.FETCHING);
+      expect(media.sha256).toBeNull();
+      expect(media.fileSizeBytes).toBeNull();
+      const eventRow = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: event.id },
+      });
+      expect(eventRow.processingStatus).toBe(InboundProcessingStatus.PROCESSING);
+      expect(eventRow.processedAt).toBeNull();
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(1);
+    }
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.transient.ambiguous-after-effect`;
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-transient-ambiguous",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    const ambiguousStore = new RecordingStore({
+      putIfAbsent(
+        key: string,
+        media: DownloadedMedia,
+      ): Promise<"CREATED" | "EXISTS"> {
+        stagedObjects.set(key, media);
+        throw new MediaStagingError("MEDIA_OBJECT_UNAVAILABLE", false);
+      },
+      head(key: string): Promise<StoredObjectHead | null> {
+        const media = stagedObjects.get(key);
+        return Promise.resolve(
+          media
+            ? { size: media.size, sha256: media.sha256, mimeType: media.mimeType }
+            : null,
+        );
+      },
+      async read(key: string): Promise<Buffer> {
+        const media = stagedObjects.get(key);
+        if (!media) return Promise.reject(new Error("missing"));
+        return media.bytes;
+      },
+    });
+    const service = serviceWith(
+      prisma,
+      new ProofMediaProvider(),
+      ambiguousStore,
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "RETRY_REQUIRED",
+      reason: "MEDIA_OBJECT_UNAVAILABLE",
+    });
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    expect(media.status).toBe(MediaProcessingStatus.FETCHING);
+    const key = mediaObjectKey(media.id);
+    expect(stagedObjects.has(key)).toBe(true);
+    expect(ambiguousStore.puts).toEqual([key]);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.PROCESSING,
+      processedAt: null,
+    });
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+        .version,
+    ).toBe(1);
+  });
+
+  it("regresses IMAGE events outside COLLECTING_MEDIA to IGNORED without any staging I/O", async () => {
+    for (const state of [
+      ConversationState.IDLE,
+      ConversationState.AWAITING_HEADLINE,
+      ConversationState.AWAITING_BODY,
+    ]) {
+      const owner = await reporter();
+      const conversation = await prisma.conversation.create({
+        data: {
+          reporterId: owner.id,
+          state,
+          currentStoryId: null,
+        },
+      });
+      const mediaBefore = await prisma.storyMedia.count();
+      const provider = new RecordingProvider(new ProofMediaProvider());
+      const store = new RecordingStore(new ProofObjectStore());
+      const service = serviceWith(prisma, provider, store);
+      const event = await storedEvent(
+        owner.phoneNumber,
+        `closure-state-${state}`,
+        InboundEventType.IMAGE,
+        {
+          image: {
+            id: `closure.image.${state}`,
+            mime_type: "image/jpeg",
+          },
+        },
+      );
+      await expect(service.process(event.id)).resolves.toMatchObject({
+        outcome: "IGNORED",
+        reason: "IMAGE_NOT_ACCEPTED_IN_STATE",
+      });
+      expect(await prisma.storyMedia.count()).toBe(mediaBefore);
+      expect(provider.calls).toHaveLength(0);
+      expect(store.puts).toHaveLength(0);
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+      ).toMatchObject({
+        processingStatus: InboundProcessingStatus.IGNORED,
+        lastErrorCode: "IMAGE_NOT_ACCEPTED_IN_STATE",
+      });
+      expect(
+        await prisma.conversation.findUniqueOrThrow({
+          where: { id: conversation.id },
+        }),
+      ).toMatchObject({ state, currentStoryId: null });
+    }
+  });
+
+  it("keeps a later IMAGE order-blocked without intent, version, audit, or staging I/O", async () => {
+    const owner = await reporter();
+    const first = await storedEvent(
+      owner.phoneNumber,
+      "closure-blocked-earlier",
+      InboundEventType.TEXT,
+      { text: { body: "blocking" } },
+    );
+    const provider = new RecordingProvider(new ProofMediaProvider());
+    const store = new RecordingStore(new ProofObjectStore());
+    const service = serviceWith(prisma, provider, store);
+    const later = await storedEvent(
+      owner.phoneNumber,
+      "closure-blocked-later",
+      InboundEventType.IMAGE,
+      {
+        image: {
+          id: "closure.image.blocked",
+          mime_type: "image/jpeg",
+        },
+      },
+    );
+    await expect(service.process(later.id)).resolves.toMatchObject({
+      outcome: "ORDER_BLOCKED",
+    });
+    const blocked = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: later.id },
+    });
+    expect(blocked.processingStatus).toBe(InboundProcessingStatus.RECEIVED);
+    expect(blocked.processingAttempts).toBe(0);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: first.id } }),
+    ).toMatchObject({ processingStatus: InboundProcessingStatus.RECEIVED });
+    expect(
+      await prisma.storyMedia.count({ where: { providerMediaId: "closure.image.blocked" } }),
+    ).toBe(0);
+    expect(
+      await prisma.story.count({ where: { reporterId: owner.id } }),
+    ).toBe(0);
+    expect(provider.calls).toHaveLength(0);
+    expect(store.puts).toHaveLength(0);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+          inboundEventId: later.id,
+        },
+      }),
+    ).toBe(0);
+  });
+
+  it("leaves unknown and inactive IMAGE events IGNORED with zero staging I/O", async () => {
+    const unknownPhone = `+2999${run}${String(sequence++).padStart(2, "0")}`;
+    const unknownEvent = await storedEvent(
+      unknownPhone,
+      "closure-unknown",
+      InboundEventType.IMAGE,
+      { image: { id: "closure.image.unknown", mime_type: "image/jpeg" } },
+    );
+    const unknownProvider = new RecordingProvider(new ProofMediaProvider());
+    const unknownStore = new RecordingStore(new ProofObjectStore());
+    const unknownService = serviceWith(prisma, unknownProvider, unknownStore);
+    await expect(unknownService.process(unknownEvent.id)).resolves.toMatchObject({
+      outcome: "IGNORED",
+      reason: IGNORED_REASON.UNKNOWN,
+    });
+    expect(unknownProvider.calls).toHaveLength(0);
+    expect(unknownStore.puts).toHaveLength(0);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: unknownEvent.id },
+      }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.IGNORED,
+      lastErrorCode: IGNORED_REASON.UNKNOWN,
+    });
+
+    const inactive = await reporter(ReporterStatus.INACTIVE);
+    const inactiveEvent = await storedEvent(
+      inactive.phoneNumber,
+      "closure-inactive",
+      InboundEventType.IMAGE,
+      { image: { id: "closure.image.inactive", mime_type: "image/jpeg" } },
+    );
+    const inactiveProvider = new RecordingProvider(new ProofMediaProvider());
+    const inactiveStore = new RecordingStore(new ProofObjectStore());
+    const inactiveService = serviceWith(prisma, inactiveProvider, inactiveStore);
+    await expect(inactiveService.process(inactiveEvent.id)).resolves.toMatchObject({
+      outcome: "IGNORED",
+      reason: IGNORED_REASON.INACTIVE,
+    });
+    expect(inactiveProvider.calls).toHaveLength(0);
+    expect(inactiveStore.puts).toHaveLength(0);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: inactiveEvent.id },
+      }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.IGNORED,
+      lastErrorCode: IGNORED_REASON.INACTIVE,
+    });
+    expect(
+      await prisma.storyMedia.count({
+        where: {
+          providerMediaId: { in: ["closure.image.unknown", "closure.image.inactive"] },
+        },
+      }),
+    ).toBe(0);
+  });
+
+  it("isolates cross-Reporter media: no association, mutation, audit, or I/O against another Reporter's Story", async () => {
+    const {
+      owner: attacker,
+      story: attackerStory,
+      conversation: attackerConversation,
+    } = await collectingStory();
+    const { story: victimStory, conversation: victimConversation } =
+      await collectingStory();
+    const provider = new RecordingProvider(new ProofMediaProvider());
+    const store = new RecordingStore(new ProofObjectStore());
+    const attackerEvent = await storedEvent(
+      attacker.phoneNumber,
+      "closure-cross-attacker",
+      InboundEventType.IMAGE,
+      {
+        image: {
+          id: "closure.image.attacker-own",
+          mime_type: "image/jpeg",
+        },
+      },
+    );
+    await expect(
+      serviceWith(prisma, provider, store).process(attackerEvent.id),
+    ).resolves.toMatchObject({ outcome: "PROCESSED" });
+    expect(
+      await prisma.storyMedia.count({ where: { storyId: attackerStory.id } }),
+    ).toBe(1);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: attackerStory.id } }))
+        .version,
+    ).toBe(1);
+    const callsBeforeForged = provider.calls.length;
+    const putsBeforeForged = store.puts.length;
+
+    const forged = await storedEvent(
+      attacker.phoneNumber,
+      "closure-cross-forged",
+      InboundEventType.IMAGE,
+      {
+        image: {
+          id: "closure.image.forged",
+          mime_type: "image/jpeg",
+        },
+      },
+    );
+    const pool = await clients(1);
+    try {
+      await expect(
+        pool[0]!.$transaction((tx) =>
+          storyProcessor(pool[0]!).process(tx, {
+            eventId: forged.id,
+            reporterId: attacker.id,
+            conversationId: victimConversation.id,
+            conversationState: ConversationState.COLLECTING_MEDIA,
+            conversationVersion: victimConversation.version,
+            expectedStoryVersion: victimStory.version,
+            parsed: {
+              kind: "IMAGE",
+              providerMediaId: "closure.image.forged",
+              mimeType: "image/jpeg",
+            },
+          }),
+        ),
+      ).rejects.toThrow();
+    } finally {
+      await pool[0]!.$disconnect();
+    }
+    expect(provider.calls).toHaveLength(callsBeforeForged);
+    expect(store.puts).toHaveLength(putsBeforeForged);
+    expect(
+      await prisma.storyMedia.count({ where: { storyId: victimStory.id } }),
+    ).toBe(0);
+    expect(
+      (await prisma.story.findUniqueOrThrow({ where: { id: victimStory.id } }))
+        .version,
+    ).toBe(0);
+    expect(
+      await prisma.conversation.findUniqueOrThrow({
+        where: { id: victimConversation.id },
+      }),
+    ).toMatchObject({
+      state: ConversationState.COLLECTING_MEDIA,
+      version: victimConversation.version,
+    });
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: victimStory.id,
+          eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+        },
+      }),
+    ).toBe(0);
+    expect(attackerStory.id).not.toBe(victimStory.id);
+    expect(attackerConversation.id).not.toBe(victimConversation.id);
+  });
+
+  it("stores only safe content-free fields in every media audit and never duplicates the association", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = `closure.audit-safe`;
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-audit-safe",
+      InboundEventType.IMAGE,
+      {
+        image: {
+          id: providerMediaId,
+          mime_type: "image/jpeg",
+          caption: "sensitive-caption-never-audited",
+        },
+      },
+    );
+    await expect(processor(prisma).process(event.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const media = await prisma.storyMedia.findUniqueOrThrow({
+      where: { providerMediaId },
+    });
+    const audits = await prisma.auditLog.findMany({
+      where: {
+        storyId: story.id,
+        eventType: {
+          in: [
+            STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+            MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+          ],
+        },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(audits).toHaveLength(2);
+    for (const audit of audits) {
+      expect(audit.reporterId).toBe(owner.id);
+      expect(audit.storyId).toBe(story.id);
+      expect(audit.inboundEventId).toBe(event.id);
+      expect(audit.entityType).toBe("StoryMedia");
+      expect(audit.entityId).toBe(media.id);
+      expect(JSON.stringify(audit.metadata)).not.toContain(
+        "sensitive-caption-never-audited",
+      );
+      expect(JSON.stringify({ ...audit, metadata: audit.metadata })).not.toContain(
+        owner.phoneNumber,
+      );
+      expect(JSON.stringify({ ...audit, metadata: audit.metadata })).not.toContain(
+        "https://",
+      );
+    }
+    expect(audits[0]).toMatchObject({
+      eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,
+      metadata: {
+        versionBefore: 0,
+        versionAfter: 1,
+        storyMediaId: media.id,
+        position: 0,
+        mimeType: "image/jpeg",
+      },
+    });
+    expect(audits[1]).toMatchObject({
+      eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+      metadata: {
+        mimeType: "image/jpeg",
+        size: JPEG.length,
+        sha256: JPEG_SHA,
+      },
+    });
   });
 });

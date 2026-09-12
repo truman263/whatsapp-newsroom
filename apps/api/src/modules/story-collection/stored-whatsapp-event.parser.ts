@@ -5,6 +5,7 @@ import type {
   ParsedStoredEvent,
   StoredEventInput,
 } from "./story-collection.types";
+import type { ApprovedImageMime } from "../media-staging/media-staging.types";
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -115,7 +116,17 @@ export class StoredWhatsappEventParser {
         )
           return malformed();
       }
-      return { kind: "IMAGE" };
+      return {
+        kind: "IMAGE",
+        providerMediaId: image.id,
+        mimeType: image.mime_type as ApprovedImageMime,
+        ...(typeof image.sha256 === "string"
+          ? { providerSha256: image.sha256 }
+          : {}),
+        ...(typeof image.caption === "string"
+          ? { caption: image.caption.replace(/\r\n?/gu, "\n") }
+          : {}),
+      };
     }
     return { kind: "UNKNOWN" };
   }

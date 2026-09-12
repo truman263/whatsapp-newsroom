@@ -80,7 +80,13 @@ describe("StoredWhatsappEventParser", () => {
           },
         }),
       ),
-    ).toEqual({ kind: "IMAGE" });
+    ).toEqual({
+      kind: "IMAGE",
+      providerMediaId: "opaque.media-id:1",
+      mimeType: "image/jpeg",
+      providerSha256: sha256,
+      caption: "one\ntwo",
+    });
   });
 
   it.each([

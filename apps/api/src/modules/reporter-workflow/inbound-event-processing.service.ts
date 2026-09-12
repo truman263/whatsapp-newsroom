@@ -1,6 +1,8 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Optional } from "@nestjs/common";
 import { AuditActorType, InboundProcessingStatus } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
+import { MediaStagingService } from "../media-staging/media-staging.service";
+import type { MediaAuthority } from "../media-staging/media-staging.types";
 import { StoredWhatsappEventParser } from "../story-collection/stored-whatsapp-event.parser";
 import { StoryCollectionError } from "../story-collection/story-collection.errors";
 import { StoryEventProcessor } from "../story-collection/story-event-processor.service";
@@ -16,6 +18,17 @@ import type {
   EventProcessingResult,
 } from "./reporter-workflow.types";
 
+type ProcessingPhase =
+  | EventProcessingResult
+  | {
+      outcome: "MEDIA_INTENT";
+      mediaId: string;
+      storyId: string;
+      authority: MediaAuthority;
+      reporterId: string;
+      conversationId: string;
+    };
+
 @Injectable()
 export class InboundEventProcessingService {
   constructor(
@@ -24,6 +37,7 @@ export class InboundEventProcessingService {
     private readonly conversations: ConversationProvisioningService,
     private readonly storedEvents: StoredWhatsappEventParser,
     private readonly stories: StoryEventProcessor,
+    @Optional() private readonly mediaStaging?: MediaStagingService,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -67,7 +81,7 @@ export class InboundEventProcessingService {
   async process(eventId: string): Promise<EventProcessingResult> {
     const claim = await this.claim(eventId);
     if (claim.outcome !== "CLAIMED") return claim;
-    return this.prisma.$transaction(async (tx) => {
+    const phase = await this.prisma.$transaction<ProcessingPhase>(async (tx) => {
       const locked = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT "id" FROM "InboundEvent" WHERE "id" = ${eventId}::uuid FOR UPDATE
       `;
@@ -178,6 +192,13 @@ export class InboundEventProcessingService {
         expectedStoryVersion,
         parsed,
       });
+      if (storyResult.outcome === "MEDIA_INTENT") {
+        return {
+          ...storyResult,
+          reporterId: authorization.reporterId,
+          conversationId: conversation.id,
+        };
+      }
       if (storyResult.outcome === "IGNORED") {
         await tx.auditLog.create({
           data: {
@@ -226,5 +247,19 @@ export class InboundEventProcessingService {
         conversationId: conversation.id,
       };
     });
+    if (phase.outcome !== "MEDIA_INTENT") return phase;
+    if (!this.mediaStaging)
+      return { outcome: "RETRY_REQUIRED", reason: "MEDIA_STAGING_UNAVAILABLE" };
+    const staged = await this.mediaStaging.stage(
+      phase.mediaId,
+      eventId,
+      phase.authority,
+    );
+    if (staged.outcome !== "PROCESSED") return staged;
+    return {
+      outcome: "PROCESSED",
+      reporterId: phase.reporterId,
+      conversationId: phase.conversationId,
+    };
   }
 }

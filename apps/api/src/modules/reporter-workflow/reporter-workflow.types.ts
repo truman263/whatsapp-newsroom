@@ -48,6 +48,7 @@ export type EventProcessingResult =
       outcome: "IGNORED";
       reason: "REPORTER_UNKNOWN" | "REPORTER_INACTIVE" | StoryIgnoredReason;
     }
-  | { outcome: "FAILED"; reason: "MALFORMED_STORED_EVENT" }
+  | { outcome: "FAILED"; reason: string }
+  | { outcome: "RETRY_REQUIRED"; reason: string }
   | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };

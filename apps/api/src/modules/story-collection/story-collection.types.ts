@@ -3,6 +3,7 @@ import type {
   InboundEventType,
   Prisma,
 } from "@prisma/client";
+import type { MediaAuthority } from "../media-staging/media-staging.types";
 
 export type StoredEventInput = {
   providerMessageId: string;
@@ -15,7 +16,7 @@ export type StoredEventInput = {
 export type ParsedStoredEvent =
   | { kind: "TEXT"; text: string }
   | { kind: "INTERACTIVE"; replyId: string }
-  | { kind: "IMAGE" }
+  | ({ kind: "IMAGE" } & MediaAuthority)
   | { kind: "UNKNOWN" };
 
 export type StoryProcessInput = {
@@ -29,7 +30,14 @@ export type StoryProcessInput = {
 };
 
 export type StoryProcessResult =
-  { outcome: "PROCESSED" } | { outcome: "IGNORED"; reason: StoryIgnoredReason };
+  | { outcome: "PROCESSED" }
+  | {
+      outcome: "MEDIA_INTENT";
+      mediaId: string;
+      storyId: string;
+      authority: MediaAuthority;
+    }
+  | { outcome: "IGNORED"; reason: StoryIgnoredReason };
 
 export type StoryIgnoredReason =
   | "STORY_START_REQUIRED"
@@ -41,5 +49,5 @@ export type StoryIgnoredReason =
   | "TEXT_NOT_ACCEPTED_IN_STATE"
   | "UNSUPPORTED_INTERACTION"
   | "UNSUPPORTED_EVENT_TYPE"
-  | "MEDIA_COLLECTION_NOT_ENABLED"
+  | "IMAGE_NOT_ACCEPTED_IN_STATE"
   | "CONTROL_NOT_ENABLED";
