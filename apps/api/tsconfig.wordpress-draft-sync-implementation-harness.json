@@ -3,7 +3,7 @@
   "compilerOptions": {
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": "src/modules/wordpress-draft",
+    "rootDir": "src/modules",
     "outDir": "../../wordpress/runtime/draft-sync-implementation/.build",
     "declaration": false,
     "sourceMap": false,
@@ -11,6 +11,9 @@
     "composite": false,
     "noEmitOnError": true
   },
-  "include": ["src/modules/wordpress-draft/wordpress-draft.client.ts"],
+  "include": [
+    "src/modules/wordpress-draft/wordpress-draft.client.ts",
+    "src/modules/wordpress-transport/wordpress-secure-transport.ts"
+  ],
   "exclude": ["node_modules", "dist", "test", "**/*.spec.ts"]
 }

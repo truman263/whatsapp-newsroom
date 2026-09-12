@@ -7,7 +7,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 /** Controlled canonical draft state and transactional synchronization. */
 final class Newsroom_Bridge_Draft_Sync_REST {
 	private const NAMESPACE = 'newsroom/v1';
-	private const SYNC_CONTRACT_VERSION = 1;
+	private const SYNC_CONTRACT_VERSION = 2;
+	private const EDITORIAL_BYLINE_META = '_newsroom_editorial_byline';
 	private const ALLOWED_MIME = array( 'image/png', 'image/jpeg', 'image/webp', 'image/gif' );
 	private const MEDIA_KEY_META = '_newsroom_media_key';
 	private const MEDIA_FILE_META = '_newsroom_media_file';
@@ -103,6 +104,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 				'content'           => $state['content'],
 				'excerpt'           => $state['excerpt'],
 				'categories'        => $state['categories'],
+				'editorial_byline'  => $state['editorial_byline'],
 				'featured_media_key'=> $state['featured_media_key'],
 				'author_id' => $state['author_id'],
 				'applied_version'   => $this->state_fingerprint( $state ),
@@ -142,6 +144,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			'content'           => $payload['content'],
 			'excerpt'           => $payload['excerpt'],
 			'categories'        => $payload['categories'],
+			'editorial_byline'  => $payload['editorial_byline'],
 			'thumbnail_id'      => $thumbnail_target,
 			'featured_media_key'=> $payload['featured_media_key'],
 			'status'            => 'draft',
@@ -250,7 +253,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 
 	public function validated_sync_payload( WP_REST_Request $request ) {
 		$input   = $request->get_json_params();
-		$allowed = array( 'draft_key', 'title', 'content', 'excerpt', 'categories', 'featured_media_key', 'expected_version' );
+		$allowed = array( 'draft_key', 'title', 'content', 'excerpt', 'categories', 'editorial_byline', 'featured_media_key', 'expected_version' );
 
 		if ( ! is_array( $input ) || wp_is_numeric_array( $input ) ) {
 			return $this->invalid_payload( 'The request body must be a JSON object.' );
@@ -286,6 +289,10 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			return $this->invalid_payload( 'Excerpt must be a string.' );
 		}
 
+		if ( ! array_key_exists( 'editorial_byline', $input ) || ! $this->editorial_byline_is_valid( $input['editorial_byline'] ) ) {
+			return $this->invalid_payload( 'The editorial_byline must be a non-empty string of at most 200 Unicode code points.' );
+		}
+
 		if ( ! array_key_exists( 'featured_media_key', $input ) ) {
 			return $this->invalid_payload( 'The featured_media_key field is required; pass null to clear the featured media.' );
 		}
@@ -315,6 +322,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			'content'            => $input['content'],
 			'excerpt'            => isset( $input['excerpt'] ) ? $input['excerpt'] : '',
 			'categories'         => $categories,
+			'editorial_byline'   => $input['editorial_byline'],
 			'featured_media_key' => null === $input['featured_media_key'] ? null : (string) $input['featured_media_key'],
 			'expected_version'   => $expected_version,
 		);
@@ -498,6 +506,10 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 		}
 		$categories = array_values( array_unique( array_filter( array_map( 'intval', $categories ) ) ) );
 		sort( $categories, SORT_NUMERIC );
+		$editorial_byline = get_post_meta( $post_id, self::EDITORIAL_BYLINE_META, true );
+		if ( ! is_string( $editorial_byline ) ) {
+			throw new RuntimeException( 'editorial_byline_corrupt' );
+		}
 
 		$thumbnail     = get_post_meta( $post_id, '_thumbnail_id', true );
 		$thumbnail_id  = null;
@@ -518,6 +530,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			'content'            => (string) $post->post_content,
 			'excerpt'            => (string) $post->post_excerpt,
 			'categories'         => $categories,
+			'editorial_byline'   => $editorial_byline,
 			'thumbnail_id'       => $thumbnail_id,
 			'featured_media_key' => $featured_key,
 			'status'             => (string) $post->post_status,
@@ -641,6 +654,15 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			update_post_meta( $post_id, '_thumbnail_id', (string) $target['thumbnail_id'] );
 		}
 
+		$byline_result = update_post_meta( $post_id, self::EDITORIAL_BYLINE_META, $target['editorial_byline'] );
+		if ( false === $byline_result && (string) get_post_meta( $post_id, self::EDITORIAL_BYLINE_META, true ) !== $target['editorial_byline'] ) {
+			return new WP_Error(
+				'newsroom_draft_sync_failed',
+				'WordPress could not persist the editorial byline.',
+				array( 'status' => 503 )
+			);
+		}
+
 		return true;
 	}
 
@@ -649,6 +671,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			&& $a['content'] === $b['content']
 			&& $a['excerpt'] === $b['excerpt']
 			&& $a['categories'] === $b['categories']
+			&& $a['editorial_byline'] === $b['editorial_byline']
 			&& $a['featured_media_key'] === $b['featured_media_key']
 			&& $a['status'] === $b['status']
 			&& (int) $a['author_id'] === (int) $b['author_id']
@@ -705,6 +728,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 			'content'            => $state['content'],
 			'excerpt'            => $state['excerpt'],
 			'categories'         => $state['categories'],
+			'editorial_byline'   => $state['editorial_byline'],
 			'featured_media_key' => $state['featured_media_key'],
 		);
 
@@ -714,6 +738,14 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 		}
 
 		return hash( 'sha256', $serialized );
+	}
+
+	private function editorial_byline_is_valid( $value ) {
+		if ( ! is_string( $value ) || '' === trim( $value ) ) {
+			return false;
+		}
+		$count = preg_match_all( '/./us', $value, $matches );
+		return false !== $count && $count <= 200;
 	}
 
 	private function sync_response( $draft_key, $post_id, $replayed, array $target_state ) {

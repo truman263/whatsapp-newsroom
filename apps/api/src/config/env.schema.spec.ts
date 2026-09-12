@@ -15,10 +15,25 @@ describe("environment validation", () => {
       PORT: 3000,
       DATABASE_URL: "postgresql://test:test@localhost:5432/newsroom_test",
       WHATSAPP_ACCESS_TOKEN: "test-access-token",
-      WORDPRESS_BASE_URL: "http://localhost",
+      WORDPRESS_BASE_URL: "https://wordpress.test",
       NEWSROOM_MEDIA_STAGING_MAX_BYTES: 500000,
       WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: 5000,
     });
+  });
+
+  it("requires an HTTPS WordPress origin", () => {
+    expect(() =>
+      validateEnvironment({
+        NODE_ENV: "test",
+        WORDPRESS_BASE_URL: "http://wordpress.test",
+      }),
+    ).toThrow("Environment validation failed");
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        WORDPRESS_BASE_URL: "https://wordpress.test/subdirectory",
+      }).WORDPRESS_BASE_URL,
+    ).toBe("https://wordpress.test/subdirectory");
   });
 
   it("enforces media staging limits and alignment", () => {

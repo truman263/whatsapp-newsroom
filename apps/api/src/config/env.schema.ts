@@ -71,7 +71,7 @@ export const environmentSchema = Joi.object<Environment>({
       try {
         const url = new URL(value);
         if (
-          !["http:", "https:"].includes(url.protocol) ||
+          url.protocol !== "https:" ||
           url.username ||
           url.password ||
           url.search ||
@@ -86,7 +86,7 @@ export const environmentSchema = Joi.object<Environment>({
     })
     .when("NODE_ENV", {
       is: "test",
-      then: Joi.optional().default("http://localhost"),
+      then: Joi.optional().default("https://wordpress.test"),
       otherwise: Joi.required(),
     }),
   WORDPRESS_DRAFT_HMAC_KEY_ID: Joi.string()

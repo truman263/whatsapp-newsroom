@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Newsroom Bridge
  * Description: Private idempotent WordPress draft creation and reconciliation boundary.
- * Version: 1.3.0
+ * Version: 1.4.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  */
@@ -11,7 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'NEWSROOM_BRIDGE_VERSION', '1.3.0' );
+define( 'NEWSROOM_BRIDGE_VERSION', '1.4.0' );
 define( 'NEWSROOM_BRIDGE_SCHEMA_VERSION', '2' );
 
 require_once __DIR__ . '/includes/class-newsroom-bridge-key-ring-json.php';
