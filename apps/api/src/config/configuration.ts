@@ -11,6 +11,8 @@ export interface ApplicationConfiguration {
     phoneNumberId: string;
     verifyToken: string;
     appSecret: string;
+    graphApiVersion: string;
+    outboundRequestTimeoutMs: number;
   };
   wordpress: {
     baseUrl: string;
@@ -30,7 +32,7 @@ export interface ApplicationConfiguration {
     maxBytes: number;
     requestTimeoutMs: number;
   };
-  preview: { ttlSeconds: number };
+  preview: { ttlSeconds: number; publicOrigin: string; hmacSecret: string };
 }
 
 export default function configuration(): ApplicationConfiguration {
@@ -47,6 +49,9 @@ export default function configuration(): ApplicationConfiguration {
       phoneNumberId: environment.WHATSAPP_PHONE_NUMBER_ID,
       verifyToken: environment.WHATSAPP_VERIFY_TOKEN,
       appSecret: environment.WHATSAPP_APP_SECRET,
+      graphApiVersion: environment.WHATSAPP_GRAPH_API_VERSION,
+      outboundRequestTimeoutMs:
+        environment.WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS,
     },
     wordpress: {
       baseUrl: environment.WORDPRESS_BASE_URL,
@@ -68,6 +73,10 @@ export default function configuration(): ApplicationConfiguration {
       maxBytes: environment.NEWSROOM_MEDIA_STAGING_MAX_BYTES,
       requestTimeoutMs: environment.WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS,
     },
-    preview: { ttlSeconds: environment.NEWSROOM_PREVIEW_TTL_SECONDS },
+    preview: {
+      ttlSeconds: environment.NEWSROOM_PREVIEW_TTL_SECONDS,
+      publicOrigin: environment.NEWSROOM_PREVIEW_PUBLIC_ORIGIN,
+      hmacSecret: environment.NEWSROOM_PREVIEW_HMAC_SECRET,
+    },
   };
 }

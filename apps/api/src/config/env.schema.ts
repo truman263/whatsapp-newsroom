@@ -23,6 +23,10 @@ export interface Environment {
   NEWSROOM_MEDIA_STAGING_MAX_BYTES: number;
   WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: number;
   NEWSROOM_PREVIEW_TTL_SECONDS: number;
+  NEWSROOM_PREVIEW_PUBLIC_ORIGIN: string;
+  NEWSROOM_PREVIEW_HMAC_SECRET: string;
+  WHATSAPP_GRAPH_API_VERSION: string;
+  WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: number;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -186,6 +190,57 @@ export const environmentSchema = Joi.object<Environment>({
     .min(60)
     .max(604800)
     .default(86400),
+  NEWSROOM_PREVIEW_PUBLIC_ORIGIN: Joi.string()
+    .custom((value: string, helpers) => {
+      try {
+        const url = new URL(value);
+        if (
+          url.protocol !== "https:" ||
+          url.username ||
+          url.password ||
+          url.pathname !== "/" ||
+          url.search ||
+          url.hash
+        )
+          return helpers.error("any.invalid");
+        return url.origin;
+      } catch {
+        return helpers.error("any.invalid");
+      }
+    })
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default("https://newsroom.test"),
+      otherwise: Joi.required(),
+    }),
+  NEWSROOM_PREVIEW_HMAC_SECRET: Joi.string()
+    .custom((value: string, helpers) => {
+      if (!/^[A-Za-z0-9_-]{43}$/.test(value))
+        return helpers.error("any.invalid");
+      const decoded = Buffer.from(value, "base64url");
+      return decoded.length === 32 && decoded.toString("base64url") === value
+        ? value
+        : helpers.error("any.invalid");
+    })
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default(
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      ),
+      otherwise: Joi.required(),
+    }),
+  WHATSAPP_GRAPH_API_VERSION: Joi.string()
+    .pattern(/^v[0-9]+\.[0-9]+$/)
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default("v0.0"),
+      otherwise: Joi.required(),
+    }),
+  WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(100)
+    .max(60000)
+    .default(5000),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {

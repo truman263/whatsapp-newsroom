@@ -298,13 +298,19 @@ export class DraftPreparationService {
   async verifyPreparedAuthority(
     preparationId: string,
   ): Promise<PreparedAuthority> {
-    const aggregate = await this.revalidate(preparationId, false);
+    const aggregate = await this.revalidate(preparationId, false, true);
     const prep = aggregate.preparation;
     if (
-      prep.status !== DraftPreparationStatus.ACTIVE ||
+      !new Set<DraftPreparationStatus>([
+        DraftPreparationStatus.ACTIVE,
+        DraftPreparationStatus.READY_FOR_APPROVAL,
+      ]).has(prep.status) ||
       !prep.wordpressAppliedVersion ||
       !VERSION.test(prep.wordpressAppliedVersion) ||
-      aggregate.story.status !== StoryStatus.DRAFT_CREATED ||
+      !new Set<StoryStatus>([
+        StoryStatus.DRAFT_CREATED,
+        StoryStatus.AWAITING_APPROVAL,
+      ]).has(aggregate.story.status) ||
       !aggregate.story.wordpressPostId ||
       prep.wordpressPostId !== aggregate.story.wordpressPostId ||
       aggregate.story.media.some(
@@ -344,6 +350,7 @@ export class DraftPreparationService {
   private async revalidate(
     preparationId: string,
     retryBlocked: boolean,
+    allowPhaseE = false,
   ): Promise<{ preparation: DraftPreparation; story: Aggregate }> {
     return this.prisma.$transaction(async (tx) => {
       const prepRow = await tx.draftPreparation.findUnique({
@@ -371,22 +378,32 @@ export class DraftPreparationService {
       const event = await tx.inboundEvent.findUnique({
         where: { id: preparation.inboundEventId },
       });
-      if (
-        !story ||
-        story.version !== preparation.storyVersion ||
-        !new Set<StoryStatus>([
+      const phaseBPosture =
+        new Set<StoryStatus>([
           StoryStatus.READY,
           StoryStatus.DRAFT_CREATING,
           StoryStatus.DRAFT_CREATED,
-        ]).has(story.status) ||
+        ]).has(story?.status as StoryStatus) &&
+        event?.processingStatus === InboundProcessingStatus.PROCESSING &&
+        story?.activeInConversation?.state ===
+          ConversationState.COLLECTING_MEDIA;
+      const phaseEPosture =
+        allowPhaseE &&
+        preparation.status === DraftPreparationStatus.READY_FOR_APPROVAL &&
+        story?.status === StoryStatus.AWAITING_APPROVAL &&
+        event?.processingStatus === InboundProcessingStatus.PROCESSED &&
+        story?.activeInConversation?.state ===
+          ConversationState.AWAITING_APPROVAL;
+      if (
+        !story ||
+        story.version !== preparation.storyVersion ||
+        (!phaseBPosture && !phaseEPosture) ||
         !event ||
         event.reporterId !== story.reporterId ||
-        event.processingStatus !== InboundProcessingStatus.PROCESSING ||
         story.reporter.status !== ReporterStatus.ACTIVE ||
         !story.activeInConversation ||
         story.activeInConversation.reporterId !== story.reporterId ||
-        story.activeInConversation.currentStoryId !== story.id ||
-        story.activeInConversation.state !== ConversationState.COLLECTING_MEDIA
+        story.activeInConversation.currentStoryId !== story.id
       ) {
         if (story?.reporter.status === ReporterStatus.INACTIVE)
           throw new DraftPreparationError("REPORTER_NOT_ACTIVE");

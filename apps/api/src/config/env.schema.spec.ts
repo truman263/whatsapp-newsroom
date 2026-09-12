@@ -19,7 +19,35 @@ describe("environment validation", () => {
       NEWSROOM_MEDIA_STAGING_MAX_BYTES: 500000,
       WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: 5000,
       NEWSROOM_PREVIEW_TTL_SECONDS: 86400,
+      NEWSROOM_PREVIEW_PUBLIC_ORIGIN: "https://newsroom.test",
+      NEWSROOM_PREVIEW_HMAC_SECRET:
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      WHATSAPP_GRAPH_API_VERSION: "v0.0",
+      WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: 5000,
     });
+  });
+
+  it("validates preview and outbound security configuration", () => {
+    for (const origin of [
+      "http://newsroom.test",
+      "https://user@newsroom.test",
+      "https://newsroom.test/path",
+      "https://newsroom.test/?query=1",
+      "https://newsroom.test/#fragment",
+    ])
+      expect(() =>
+        validateEnvironment({
+          NODE_ENV: "test",
+          NEWSROOM_PREVIEW_PUBLIC_ORIGIN: origin,
+        }),
+      ).toThrow("Environment validation failed");
+    for (const version of ["19.0", "v19", "latest"])
+      expect(() =>
+        validateEnvironment({
+          NODE_ENV: "test",
+          WHATSAPP_GRAPH_API_VERSION: version,
+        }),
+      ).toThrow("Environment validation failed");
   });
 
   it("validates preview TTL boundaries", () => {

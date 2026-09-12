@@ -6,6 +6,7 @@ import { WhatsappWebhookModule } from "./modules/whatsapp-webhook/whatsapp-webho
 import { WordPressDraftModule } from "./modules/wordpress-draft/wordpress-draft.module";
 import { WordPressMediaModule } from "./modules/wordpress-media/wordpress-media.module";
 import { ReporterWorkflowModule } from "./modules/reporter-workflow/reporter-workflow.module";
+import { NewsroomPreviewModule } from "./modules/newsroom-preview/newsroom-preview.module";
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { ReporterWorkflowModule } from "./modules/reporter-workflow/reporter-wor
     WordPressDraftModule,
     WordPressMediaModule,
     ReporterWorkflowModule,
+    NewsroomPreviewModule,
   ],
 })
 export class AppModule {}
