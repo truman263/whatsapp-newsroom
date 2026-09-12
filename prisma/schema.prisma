@@ -88,8 +88,18 @@ enum ApprovalDecision {
   APPROVED
 }
 
+enum DraftPreparationStatus {
+  ACTIVE
+  RECONCILIATION_REQUIRED
+  BLOCKED
+  READY_FOR_APPROVAL
+  SUPERSEDED
+  FAILED
+}
+
 enum PublishOperation {
   CREATE_DRAFT
+  SYNC_DRAFT
   PUBLISH
 }
 
@@ -135,27 +145,28 @@ model Conversation {
 }
 
 model InboundEvent {
-  id                  String                  @id @default(uuid()) @db.Uuid
-  provider            Provider
-  providerMessageId   String                  @db.VarChar(191)
-  reporterId          String?                 @db.Uuid
-  senderPhone         String                  @db.VarChar(16)
-  senderIngestSequence BigInt                 @db.BigInt
-  eventType           InboundEventType
-  processingStatus    InboundProcessingStatus @default(RECEIVED)
-  rawPayload          Json
-  providerOccurredAt  DateTime?               @db.Timestamptz(3)
-  receivedAt          DateTime                @default(now()) @db.Timestamptz(3)
-  processingStartedAt DateTime?               @db.Timestamptz(3)
-  processedAt         DateTime?               @db.Timestamptz(3)
-  processingAttempts  Int                     @default(0)
-  lastErrorCode       String?                 @db.VarChar(100)
-  lastErrorMessage    String?                 @db.Text
-  createdAt           DateTime                @default(now()) @db.Timestamptz(3)
-  updatedAt           DateTime                @updatedAt @db.Timestamptz(3)
-  reporter            Reporter?               @relation(fields: [reporterId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  approval            Approval?
-  auditLogs           AuditLog[]
+  id                   String                  @id @default(uuid()) @db.Uuid
+  provider             Provider
+  providerMessageId    String                  @db.VarChar(191)
+  reporterId           String?                 @db.Uuid
+  senderPhone          String                  @db.VarChar(16)
+  senderIngestSequence BigInt                  @db.BigInt
+  eventType            InboundEventType
+  processingStatus     InboundProcessingStatus @default(RECEIVED)
+  rawPayload           Json
+  providerOccurredAt   DateTime?               @db.Timestamptz(3)
+  receivedAt           DateTime                @default(now()) @db.Timestamptz(3)
+  processingStartedAt  DateTime?               @db.Timestamptz(3)
+  processedAt          DateTime?               @db.Timestamptz(3)
+  processingAttempts   Int                     @default(0)
+  lastErrorCode        String?                 @db.VarChar(100)
+  lastErrorMessage     String?                 @db.Text
+  createdAt            DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime                @updatedAt @db.Timestamptz(3)
+  reporter             Reporter?               @relation(fields: [reporterId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  approval             Approval?
+  draftPreparation     DraftPreparation?
+  auditLogs            AuditLog[]
 
   @@unique([provider, providerMessageId])
   @@unique([senderPhone, senderIngestSequence])
@@ -174,25 +185,26 @@ model InboundSenderSequence {
 }
 
 model OutboundMessage {
-  id                String                @id @default(uuid()) @db.Uuid
-  reporterId        String                @db.Uuid
-  storyId           String?               @db.Uuid
-  type              OutboundMessageType
-  status            OutboundMessageStatus @default(PENDING)
-  providerMessageId String?               @unique @db.VarChar(191)
-  correlationKey    String                @unique @db.VarChar(191)
-  payload           Json
-  sendAttempts      Int                   @default(0)
-  lastErrorCode     String?               @db.VarChar(100)
-  lastErrorMessage  String?               @db.Text
-  requestedAt       DateTime              @default(now()) @db.Timestamptz(3)
-  sentAt            DateTime?             @db.Timestamptz(3)
-  deliveredAt       DateTime?             @db.Timestamptz(3)
-  failedAt          DateTime?             @db.Timestamptz(3)
-  createdAt         DateTime              @default(now()) @db.Timestamptz(3)
-  updatedAt         DateTime              @updatedAt @db.Timestamptz(3)
-  reporter          Reporter              @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  story             Story?                @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  id                             String                @id @default(uuid()) @db.Uuid
+  reporterId                     String                @db.Uuid
+  storyId                        String?               @db.Uuid
+  type                           OutboundMessageType
+  status                         OutboundMessageStatus @default(PENDING)
+  providerMessageId              String?               @unique @db.VarChar(191)
+  correlationKey                 String                @unique @db.VarChar(191)
+  payload                        Json
+  sendAttempts                   Int                   @default(0)
+  lastErrorCode                  String?               @db.VarChar(100)
+  lastErrorMessage               String?               @db.Text
+  requestedAt                    DateTime              @default(now()) @db.Timestamptz(3)
+  sentAt                         DateTime?             @db.Timestamptz(3)
+  deliveredAt                    DateTime?             @db.Timestamptz(3)
+  failedAt                       DateTime?             @db.Timestamptz(3)
+  createdAt                      DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt                      DateTime              @updatedAt @db.Timestamptz(3)
+  reporter                       Reporter              @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  story                          Story?                @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  draftPreparationApprovalPrompt DraftPreparation?     @relation("DraftPreparationApprovalPrompt")
 
   @@index([status, requestedAt])
   @@index([reporterId])
@@ -201,28 +213,29 @@ model OutboundMessage {
 }
 
 model Story {
-  id                   String            @id @default(uuid()) @db.Uuid
-  reporterId           String            @db.Uuid
-  status               StoryStatus       @default(COLLECTING)
-  headline             String?           @db.VarChar(500)
-  body                 String?           @db.Text
-  byline               String?           @db.VarChar(200)
-  version              Int               @default(0)
-  wordpressPostId      BigInt?           @unique @db.BigInt
-  wordpressDraftKey    String            @unique @default(uuid()) @db.Uuid
-  wordpressPostUrl     String?           @db.Text
-  draftCreatedAt       DateTime?         @db.Timestamptz(3)
-  approvedAt           DateTime?         @db.Timestamptz(3)
-  publishedAt          DateTime?         @db.Timestamptz(3)
-  cancelledAt          DateTime?         @db.Timestamptz(3)
-  failedAt             DateTime?         @db.Timestamptz(3)
-  createdAt            DateTime          @default(now()) @db.Timestamptz(3)
-  updatedAt            DateTime          @updatedAt @db.Timestamptz(3)
-  reporter             Reporter          @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  activeInConversation Conversation?     @relation("CurrentConversationStory")
+  id                   String             @id @default(uuid()) @db.Uuid
+  reporterId           String             @db.Uuid
+  status               StoryStatus        @default(COLLECTING)
+  headline             String?            @db.VarChar(500)
+  body                 String?            @db.Text
+  byline               String?            @db.VarChar(200)
+  version              Int                @default(0)
+  wordpressPostId      BigInt?            @unique @db.BigInt
+  wordpressDraftKey    String             @unique @default(uuid()) @db.Uuid
+  wordpressPostUrl     String?            @db.Text
+  draftCreatedAt       DateTime?          @db.Timestamptz(3)
+  approvedAt           DateTime?          @db.Timestamptz(3)
+  publishedAt          DateTime?          @db.Timestamptz(3)
+  cancelledAt          DateTime?          @db.Timestamptz(3)
+  failedAt             DateTime?          @db.Timestamptz(3)
+  createdAt            DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime           @updatedAt @db.Timestamptz(3)
+  reporter             Reporter           @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  activeInConversation Conversation?      @relation("CurrentConversationStory")
   outboundMessages     OutboundMessage[]
   media                StoryMedia[]
   approval             Approval?
+  draftPreparations    DraftPreparation[]
   publishAttempts      PublishAttempt[]
   auditLogs            AuditLog[]
   categories           StoryCategory[]
@@ -280,17 +293,51 @@ model StoryMedia {
 }
 
 model Approval {
-  id             String           @id @default(uuid()) @db.Uuid
-  storyId        String           @unique @db.Uuid
-  reporterId     String           @db.Uuid
-  inboundEventId String           @unique @db.Uuid
-  decision       ApprovalDecision @default(APPROVED)
-  createdAt      DateTime         @default(now()) @db.Timestamptz(3)
-  story          Story            @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  reporter       Reporter         @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  inboundEvent   InboundEvent     @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  id                      String           @id @default(uuid()) @db.Uuid
+  storyId                 String           @unique @db.Uuid
+  reporterId              String           @db.Uuid
+  inboundEventId          String           @unique @db.Uuid
+  draftPreparationId      String           @unique @db.Uuid
+  storyVersion            Int
+  wordpressAppliedVersion String           @db.Char(64)
+  decision                ApprovalDecision @default(APPROVED)
+  createdAt               DateTime         @default(now()) @db.Timestamptz(3)
+  story                   Story            @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  reporter                Reporter         @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  inboundEvent            InboundEvent     @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  draftPreparation        DraftPreparation @relation(fields: [draftPreparationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([reporterId])
+  @@index([storyVersion])
+  @@index([wordpressAppliedVersion])
+}
+
+model DraftPreparation {
+  id                              String                 @id @default(uuid()) @db.Uuid
+  storyId                         String                 @db.Uuid
+  inboundEventId                  String                 @unique @db.Uuid
+  storyVersion                    Int
+  status                          DraftPreparationStatus @default(ACTIVE)
+  wordpressPostId                 BigInt?                @db.BigInt
+  wordpressAppliedVersion         String?                @db.Char(64)
+  approvalPromptCorrelationKey    String                 @unique @db.VarChar(191)
+  approvalPromptOutboundMessageId String?                @unique @db.Uuid
+  previewExpiresAt                DateTime               @db.Timestamptz(3)
+  lastErrorCode                   String?                @db.VarChar(100)
+  startedAt                       DateTime               @default(now()) @db.Timestamptz(3)
+  readyAt                         DateTime?              @db.Timestamptz(3)
+  supersededAt                    DateTime?              @db.Timestamptz(3)
+  failedAt                        DateTime?              @db.Timestamptz(3)
+  createdAt                       DateTime               @default(now()) @db.Timestamptz(3)
+  updatedAt                       DateTime               @updatedAt @db.Timestamptz(3)
+  story                           Story                  @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  inboundEvent                    InboundEvent           @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  approvalPromptOutboundMessage   OutboundMessage?       @relation("DraftPreparationApprovalPrompt", fields: [approvalPromptOutboundMessageId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  approval                        Approval?
+
+  @@unique([storyId, storyVersion])
+  @@index([status, updatedAt])
+  @@index([storyId, status])
 }
 
 model PublishAttempt {

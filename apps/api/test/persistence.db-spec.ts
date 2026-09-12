@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   ConversationState,
+  type DraftPreparation,
+  DraftPreparationStatus,
   EditorialCategoryStatus,
   InboundEventType,
   OutboundMessageType,
@@ -132,6 +134,23 @@ describe("PostgreSQL persistence contract", () => {
     });
   }
 
+  async function createPreparation(
+    storyId: string,
+    inboundEventId: string,
+    name: string,
+    storyVersion = 1,
+  ): Promise<DraftPreparation> {
+    return prisma.draftPreparation.create({
+      data: {
+        storyId,
+        inboundEventId,
+        storyVersion,
+        approvalPromptCorrelationKey: correlation(`preparation-${name}`),
+        previewExpiresAt: new Date(Date.now() + 86_400_000),
+      },
+    });
+  }
+
   async function cleanupFixtures(
     displayPrefix: string,
     keyPrefix: string,
@@ -196,6 +215,15 @@ describe("PostgreSQL persistence contract", () => {
         OR: [
           { storyId: { in: storyIds } },
           { providerMediaId: { startsWith: keyPrefix } },
+        ],
+      },
+    });
+    await prisma.draftPreparation.deleteMany({
+      where: {
+        OR: [
+          { storyId: { in: storyIds } },
+          { inboundEventId: { in: inboundIds } },
+          { approvalPromptCorrelationKey: { startsWith: keyPrefix } },
         ],
       },
     });
@@ -276,12 +304,51 @@ describe("PostgreSQL persistence contract", () => {
         AND data_type IN ('timestamp with time zone', 'bigint')
       GROUP BY data_type
     `;
+    const publishOperations = await prisma.$queryRaw<Array<{ value: string }>>`
+      SELECT e.enumlabel AS value
+      FROM pg_catalog.pg_enum e
+      JOIN pg_catalog.pg_type t ON t.oid = e.enumtypid
+      WHERE t.typname = 'PublishOperation'
+      ORDER BY e.enumsortorder
+    `;
+    const preparationColumns = await prisma.$queryRaw<
+      Array<{ name: string; data_type: string; nullable: string }>
+    >`
+      SELECT column_name AS name, data_type, is_nullable AS nullable
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'DraftPreparation'
+    `;
+    const approvalColumns = await prisma.$queryRaw<
+      Array<{ name: string; data_type: string; nullable: string }>
+    >`
+      SELECT column_name AS name, data_type, is_nullable AS nullable
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'Approval'
+    `;
+    const roundSixForeignKeys = await prisma.$queryRaw<
+      Array<{ name: string; delete_action: string; update_action: string }>
+    >`
+      SELECT c.conname AS name,
+             CASE c.confdeltype WHEN 'r' THEN 'RESTRICT' ELSE c.confdeltype::text END AS delete_action,
+             CASE c.confupdtype WHEN 'c' THEN 'CASCADE' ELSE c.confupdtype::text END AS update_action
+      FROM pg_catalog.pg_constraint c
+      WHERE c.contype = 'f'
+        AND c.conname IN (
+          'DraftPreparation_storyId_fkey',
+          'DraftPreparation_inboundEventId_fkey',
+          'DraftPreparation_approvalPromptOutboundMessageId_fkey',
+          'Approval_draftPreparationId_fkey'
+        )
+    `;
 
     expect(tables.map(({ name }) => name).sort()).toEqual(
       [
         "Approval",
         "AuditLog",
         "Conversation",
+        "DraftPreparation",
         "EditorialCategory",
         "InboundEvent",
         "InboundSenderSequence",
@@ -293,17 +360,24 @@ describe("PostgreSQL persistence contract", () => {
         "StoryMedia",
       ].sort(),
     );
-    expect(enums).toHaveLength(15);
+    expect(enums).toHaveLength(16);
+    expect(publishOperations.map(({ value }) => value)).toEqual([
+      "CREATE_DRAFT",
+      "SYNC_DRAFT",
+      "PUBLISH",
+    ]);
     expect(Number(constraints.find(({ type }) => type === "f")?.count)).toBe(
-      16,
+      20,
     );
-    expect(Number(constraints.find(({ type }) => type === "c")?.count)).toBe(7);
+    expect(Number(constraints.find(({ type }) => type === "c")?.count)).toBe(
+      13,
+    );
     expect(
       Number(indexes.find(({ unique_index }) => unique_index)?.count),
-    ).toBe(17);
+    ).toBe(22);
     expect(
       Number(indexes.find(({ unique_index }) => !unique_index)?.count),
-    ).toBe(28);
+    ).toBe(32);
     expect(
       Number(
         columnTypes.find(
@@ -315,7 +389,54 @@ describe("PostgreSQL persistence contract", () => {
       Number(
         columnTypes.find(({ data_type }) => data_type === "bigint")?.count,
       ),
-    ).toBe(7);
+    ).toBe(8);
+    expect(preparationColumns).toEqual(
+      expect.arrayContaining([
+        { name: "storyVersion", data_type: "integer", nullable: "NO" },
+        { name: "wordpressPostId", data_type: "bigint", nullable: "YES" },
+        {
+          name: "wordpressAppliedVersion",
+          data_type: "character",
+          nullable: "YES",
+        },
+        {
+          name: "previewExpiresAt",
+          data_type: "timestamp with time zone",
+          nullable: "NO",
+        },
+        {
+          name: "approvalPromptOutboundMessageId",
+          data_type: "uuid",
+          nullable: "YES",
+        },
+      ]),
+    );
+    expect(approvalColumns).toEqual(
+      expect.arrayContaining([
+        { name: "draftPreparationId", data_type: "uuid", nullable: "NO" },
+        { name: "storyVersion", data_type: "integer", nullable: "NO" },
+        {
+          name: "wordpressAppliedVersion",
+          data_type: "character",
+          nullable: "NO",
+        },
+      ]),
+    );
+    expect(roundSixForeignKeys).toHaveLength(4);
+    expect(roundSixForeignKeys).toEqual(
+      expect.arrayContaining(
+        [
+          "DraftPreparation_storyId_fkey",
+          "DraftPreparation_inboundEventId_fkey",
+          "DraftPreparation_approvalPromptOutboundMessageId_fkey",
+          "Approval_draftPreparationId_fkey",
+        ].map((name) => ({
+          name,
+          delete_action: "RESTRICT",
+          update_action: "CASCADE",
+        })),
+      ),
+    );
   });
 
   it("persists nullable and non-null Reporter editorial bylines", async () => {
@@ -631,17 +752,127 @@ describe("PostgreSQL persistence contract", () => {
     );
   });
 
-  it("enforces Approval provenance uniqueness", async () => {
+  it("enforces DraftPreparation authority, nullable prompt links, and evidence FKs", async () => {
+    const reporter = await createReporter(9);
+    const story = await createStory(reporter.id, "preparation");
+    const inboundOne = await createInbound("preparation-one", reporter.id);
+    const first = await createPreparation(story.id, inboundOne.id, "one", 1);
+    expect(first).toMatchObject({
+      storyId: story.id,
+      inboundEventId: inboundOne.id,
+      storyVersion: 1,
+      status: DraftPreparationStatus.ACTIVE,
+      approvalPromptCorrelationKey: correlation("preparation-one"),
+    });
+    expect(first.startedAt).toBeInstanceOf(Date);
+    expect(first.createdAt).toBeInstanceOf(Date);
+    expect(first.updatedAt).toBeInstanceOf(Date);
+    expect(first.previewExpiresAt.getTime()).toBeGreaterThan(
+      first.startedAt.getTime(),
+    );
+
+    const inboundTwo = await createInbound("preparation-two", reporter.id);
+    await expectPrismaError(
+      prisma.draftPreparation.create({
+        data: {
+          storyId: story.id,
+          inboundEventId: inboundOne.id,
+          storyVersion: 2,
+          approvalPromptCorrelationKey: correlation("preparation-event-dup"),
+          previewExpiresAt: new Date(Date.now() + 86_400_000),
+        },
+      }),
+      "P2002",
+    );
+    await expectPrismaError(
+      prisma.draftPreparation.create({
+        data: {
+          storyId: story.id,
+          inboundEventId: inboundTwo.id,
+          storyVersion: 1,
+          approvalPromptCorrelationKey: correlation("preparation-epoch-dup"),
+          previewExpiresAt: new Date(Date.now() + 86_400_000),
+        },
+      }),
+      "P2002",
+    );
+    const second = await createPreparation(story.id, inboundTwo.id, "two", 2);
+    expect(second.storyVersion).toBe(2);
+
+    const otherStory = await createStory(reporter.id, "preparation-other");
+    const inboundThree = await createInbound("preparation-three", reporter.id);
+    await expectPrismaError(
+      prisma.draftPreparation.create({
+        data: {
+          storyId: otherStory.id,
+          inboundEventId: inboundThree.id,
+          storyVersion: 1,
+          approvalPromptCorrelationKey: first.approvalPromptCorrelationKey,
+          previewExpiresAt: new Date(Date.now() + 86_400_000),
+        },
+      }),
+      "P2002",
+    );
+
+    const prompt = await prisma.outboundMessage.create({
+      data: {
+        reporterId: reporter.id,
+        storyId: story.id,
+        type: OutboundMessageType.INTERACTIVE,
+        correlationKey: correlation("preparation-prompt"),
+        payload: { draftPreparationId: first.id },
+      },
+    });
+    await prisma.draftPreparation.update({
+      where: { id: first.id },
+      data: { approvalPromptOutboundMessageId: prompt.id },
+    });
+    await expectPrismaError(
+      prisma.draftPreparation.update({
+        where: { id: second.id },
+        data: { approvalPromptOutboundMessageId: prompt.id },
+      }),
+      "P2002",
+    );
+    await expectPrismaError(
+      prisma.story.delete({ where: { id: story.id } }),
+      "P2003",
+    );
+    await expectPrismaError(
+      prisma.inboundEvent.delete({ where: { id: inboundOne.id } }),
+      "P2003",
+    );
+    await expectPrismaError(
+      prisma.outboundMessage.delete({ where: { id: prompt.id } }),
+      "P2003",
+    );
+  });
+
+  it("enforces Approval provenance and epoch-binding uniqueness", async () => {
     const reporter = await createReporter(4);
     const storyOne = await createStory(reporter.id, "approval-one");
     const storyTwo = await createStory(reporter.id, "approval-two");
     const inboundOne = await createInbound("approval-one", reporter.id);
     const inboundTwo = await createInbound("approval-two", reporter.id);
+    const preparationOne = await createPreparation(
+      storyOne.id,
+      inboundOne.id,
+      "approval-one",
+    );
+    const preparationTwo = await createPreparation(
+      storyTwo.id,
+      inboundTwo.id,
+      "approval-two",
+    );
+    const appliedVersion = "a".repeat(64);
     await prisma.approval.create({
       data: {
         storyId: storyOne.id,
         reporterId: reporter.id,
         inboundEventId: inboundOne.id,
+        draftPreparationId: preparationOne.id,
+        storyVersion: preparationOne.storyVersion,
+        wordpressAppliedVersion: appliedVersion,
       },
     });
     await expectPrismaError(
@@ -650,6 +881,9 @@ describe("PostgreSQL persistence contract", () => {
           storyId: storyOne.id,
           reporterId: reporter.id,
           inboundEventId: inboundTwo.id,
+          draftPreparationId: preparationTwo.id,
+          storyVersion: preparationTwo.storyVersion,
+          wordpressAppliedVersion: appliedVersion,
         },
       }),
       "P2002",
@@ -660,6 +894,23 @@ describe("PostgreSQL persistence contract", () => {
           storyId: storyTwo.id,
           reporterId: reporter.id,
           inboundEventId: inboundOne.id,
+          draftPreparationId: preparationTwo.id,
+          storyVersion: preparationTwo.storyVersion,
+          wordpressAppliedVersion: appliedVersion,
+        },
+      }),
+      "P2002",
+    );
+    const inboundThree = await createInbound("approval-three", reporter.id);
+    await expectPrismaError(
+      prisma.approval.create({
+        data: {
+          storyId: storyTwo.id,
+          reporterId: reporter.id,
+          inboundEventId: inboundThree.id,
+          draftPreparationId: preparationOne.id,
+          storyVersion: preparationOne.storyVersion,
+          wordpressAppliedVersion: appliedVersion,
         },
       }),
       "P2002",
@@ -669,21 +920,27 @@ describe("PostgreSQL persistence contract", () => {
   it("enforces PublishAttempt uniqueness and positive attempt numbers", async () => {
     const reporter = await createReporter(5);
     const story = await createStory(reporter.id, "publish-attempt");
-    await prisma.publishAttempt.create({
-      data: {
-        storyId: story.id,
-        operation: PublishOperation.CREATE_DRAFT,
-        attemptNumber: 1,
-        idempotencyKey: correlation("publish-one"),
-      },
-    });
+    for (const operation of [
+      PublishOperation.CREATE_DRAFT,
+      PublishOperation.SYNC_DRAFT,
+      PublishOperation.PUBLISH,
+    ]) {
+      await prisma.publishAttempt.create({
+        data: {
+          storyId: story.id,
+          operation,
+          attemptNumber: 1,
+          idempotencyKey: correlation(`publish-${operation}`),
+        },
+      });
+    }
     await expectPrismaError(
       prisma.publishAttempt.create({
         data: {
           storyId: story.id,
           operation: PublishOperation.PUBLISH,
           attemptNumber: 1,
-          idempotencyKey: correlation("publish-one"),
+          idempotencyKey: correlation("publish-CREATE_DRAFT"),
         },
       }),
       "P2002",
@@ -776,6 +1033,66 @@ describe("PostgreSQL persistence contract", () => {
       }),
       "23514",
     );
+
+    const preparationInbound = await createInbound(
+      "checks-preparation",
+      reporter.id,
+    );
+    const preparationBase = {
+      storyId: story.id,
+      inboundEventId: preparationInbound.id,
+      storyVersion: 1,
+      approvalPromptCorrelationKey: correlation("checks-preparation"),
+      previewExpiresAt: new Date("2040-01-02T00:00:00.000Z"),
+      startedAt: new Date("2040-01-01T00:00:00.000Z"),
+    };
+    for (const data of [
+      { ...preparationBase, storyVersion: -1 },
+      { ...preparationBase, wordpressPostId: 0n },
+      { ...preparationBase, wordpressPostId: -1n },
+      { ...preparationBase, wordpressAppliedVersion: "A".repeat(64) },
+      { ...preparationBase, wordpressAppliedVersion: "a".repeat(63) },
+      { ...preparationBase, wordpressAppliedVersion: "g".repeat(64) },
+      {
+        ...preparationBase,
+        previewExpiresAt: preparationBase.startedAt,
+      },
+      {
+        ...preparationBase,
+        previewExpiresAt: new Date("2039-12-31T23:59:59.999Z"),
+      },
+    ]) {
+      await expectPrismaError(
+        prisma.draftPreparation.create({ data }),
+        "23514",
+      );
+    }
+    const validPreparation = await prisma.draftPreparation.create({
+      data: {
+        ...preparationBase,
+        wordpressPostId: 1n,
+        wordpressAppliedVersion: "a".repeat(64),
+      },
+    });
+    const approvalInbound = await createInbound("checks-approval", reporter.id);
+    const approvalBase = {
+      storyId: story.id,
+      reporterId: reporter.id,
+      inboundEventId: approvalInbound.id,
+      draftPreparationId: validPreparation.id,
+      storyVersion: 1,
+      wordpressAppliedVersion: "b".repeat(64),
+    };
+    for (const data of [
+      { ...approvalBase, storyVersion: -1 },
+      { ...approvalBase, wordpressAppliedVersion: "B".repeat(64) },
+      { ...approvalBase, wordpressAppliedVersion: "b".repeat(63) },
+      { ...approvalBase, wordpressAppliedVersion: "z".repeat(64) },
+    ]) {
+      await expectPrismaError(prisma.approval.create({ data }), "23514");
+    }
+    const validApproval = await prisma.approval.create({ data: approvalBase });
+    expect(validApproval.wordpressAppliedVersion).toBe("b".repeat(64));
   });
 
   it("restricts deletion of approval, publish, media, and audit provenance", async () => {
@@ -785,11 +1102,19 @@ describe("PostgreSQL persistence contract", () => {
       "restrict-approval",
       reporter.id,
     );
+    const approvalPreparation = await createPreparation(
+      approvalStory.id,
+      approvalInbound.id,
+      "restrict-approval",
+    );
     await prisma.approval.create({
       data: {
         storyId: approvalStory.id,
         reporterId: reporter.id,
         inboundEventId: approvalInbound.id,
+        draftPreparationId: approvalPreparation.id,
+        storyVersion: approvalPreparation.storyVersion,
+        wordpressAppliedVersion: "c".repeat(64),
       },
     });
     await expectPrismaError(
