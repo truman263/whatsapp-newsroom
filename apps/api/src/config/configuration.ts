@@ -30,6 +30,7 @@ export interface ApplicationConfiguration {
     maxBytes: number;
     requestTimeoutMs: number;
   };
+  preview: { ttlSeconds: number };
 }
 
 export default function configuration(): ApplicationConfiguration {
@@ -67,5 +68,6 @@ export default function configuration(): ApplicationConfiguration {
       maxBytes: environment.NEWSROOM_MEDIA_STAGING_MAX_BYTES,
       requestTimeoutMs: environment.WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS,
     },
+    preview: { ttlSeconds: environment.NEWSROOM_PREVIEW_TTL_SECONDS },
   };
 }

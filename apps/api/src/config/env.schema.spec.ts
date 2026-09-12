@@ -18,7 +18,30 @@ describe("environment validation", () => {
       WORDPRESS_BASE_URL: "https://wordpress.test",
       NEWSROOM_MEDIA_STAGING_MAX_BYTES: 500000,
       WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: 5000,
+      NEWSROOM_PREVIEW_TTL_SECONDS: 86400,
     });
+  });
+
+  it("validates preview TTL boundaries", () => {
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        NEWSROOM_PREVIEW_TTL_SECONDS: "60",
+      }).NEWSROOM_PREVIEW_TTL_SECONDS,
+    ).toBe(60);
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        NEWSROOM_PREVIEW_TTL_SECONDS: "604800",
+      }).NEWSROOM_PREVIEW_TTL_SECONDS,
+    ).toBe(604800);
+    for (const value of ["59", "604801", "1.5"])
+      expect(() =>
+        validateEnvironment({
+          NODE_ENV: "test",
+          NEWSROOM_PREVIEW_TTL_SECONDS: value,
+        }),
+      ).toThrow("Environment validation failed");
   });
 
   it("requires an HTTPS WordPress origin", () => {

@@ -22,6 +22,7 @@ export interface Environment {
   WORDPRESS_MEDIA_MAX_BYTES: number;
   NEWSROOM_MEDIA_STAGING_MAX_BYTES: number;
   WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: number;
+  NEWSROOM_PREVIEW_TTL_SECONDS: number;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -180,6 +181,11 @@ export const environmentSchema = Joi.object<Environment>({
     .min(100)
     .max(60000)
     .default(5000),
+  NEWSROOM_PREVIEW_TTL_SECONDS: Joi.number()
+    .integer()
+    .min(60)
+    .max(604800)
+    .default(86400),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
