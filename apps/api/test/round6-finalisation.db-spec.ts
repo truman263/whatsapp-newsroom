@@ -11,6 +11,7 @@ import {
   OutboundMessageStatus,
   Provider,
   Prisma,
+  PublishOperation,
   ReporterStatus,
   StoryStatus,
   StoryMediaType,
@@ -20,12 +21,16 @@ import { PrismaService } from "../src/database/prisma.service";
 import { DraftPreparationService } from "../src/modules/draft-preparation/draft-preparation.service";
 import type { PreparedAuthority } from "../src/modules/draft-preparation/draft-preparation.types";
 import { PreviewTokenService } from "../src/modules/newsroom-preview/newsroom-preview-token.service";
+import { NewsroomPreviewService } from "../src/modules/newsroom-preview/newsroom-preview.service";
+import { MediaStagingService } from "../src/modules/media-staging/media-staging.service";
+import type { MediaAuthority, MediaProviderClient } from "../src/modules/media-staging/media-staging.types";
 import { mediaObjectKey, type DownloadedMedia, type MediaObjectStore, type StoredObjectHead } from "../src/modules/media-staging/media-staging.types";
 import { ConversationProvisioningService } from "../src/modules/reporter-workflow/conversation-provisioning.service";
 import { ConversationStateMachineService } from "../src/modules/reporter-workflow/conversation-state-machine.service";
 import { InboundEventProcessingService } from "../src/modules/reporter-workflow/inbound-event-processing.service";
 import { ReporterAuthorizationService } from "../src/modules/reporter-workflow/reporter-authorization.service";
 import { Round6FinalisationService } from "../src/modules/reporter-workflow/round6-finalisation.service";
+import { Round6RevisionService } from "../src/modules/reporter-workflow/round6-revision.service";
 import { StoredWhatsappEventParser } from "../src/modules/story-collection/stored-whatsapp-event.parser";
 import { StoryEventProcessor } from "../src/modules/story-collection/story-event-processor.service";
 import { draftStateFingerprint, type CanonicalDraftState, type WordPressDraftState } from "../src/modules/wordpress-draft/wordpress-draft-state";
@@ -45,7 +50,11 @@ const prisma = new PrismaService();
 class ProofStore implements MediaObjectStore {
   readonly objects = new Map<string, DownloadedMedia>();
   readonly calls: string[] = [];
-  putIfAbsent(): Promise<"CREATED"> { return Promise.resolve("CREATED"); }
+  putIfAbsent(key: string, media: DownloadedMedia): Promise<"CREATED" | "EXISTS"> {
+    if (this.objects.has(key)) return Promise.resolve("EXISTS");
+    this.objects.set(key, media);
+    return Promise.resolve("CREATED");
+  }
   head(key: string): Promise<StoredObjectHead | null> {
     this.calls.push(`head:${key}`);
     const item = this.objects.get(key);
@@ -55,6 +64,23 @@ class ProofStore implements MediaObjectStore {
     this.calls.push(`read:${key}`);
     const item = this.objects.get(key);
     return item ? Promise.resolve(item.bytes) : Promise.reject(new Error("missing"));
+  }
+}
+
+class ProofMediaProvider implements MediaProviderClient {
+  readonly calls: MediaAuthority[] = [];
+  fetch(authority: MediaAuthority): Promise<DownloadedMedia> {
+    this.calls.push(authority);
+    const bytes = Buffer.concat([
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      Buffer.alloc(8, 9),
+    ]);
+    return Promise.resolve({
+      bytes,
+      mimeType: "image/png",
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
   }
 }
 
@@ -97,14 +123,15 @@ class ProofMedia {
   }
 }
 
-type Integrated = { process: InboundEventProcessingService; preparation: DraftPreparationService; round6: Round6FinalisationService; store: ProofStore; draft: ProofDraft; media: ProofMedia; sends: string[] };
+type Integrated = { process: InboundEventProcessingService; preparation: DraftPreparationService; round6: Round6FinalisationService; store: ProofStore; provider: ProofMediaProvider; draft: ProofDraft; media: ProofMedia; sends: string[]; config: ConfigService<ApplicationConfiguration, true> };
 function integrated(cutover: Date): Integrated {
-  const store = new ProofStore(); const draft = new ProofDraft(); const media = new ProofMedia(); const sends: string[] = [];
+  const store = new ProofStore(); const provider = new ProofMediaProvider(); const draft = new ProofDraft(); const media = new ProofMedia(); const sends: string[] = [];
   const config = { get: (key: string) => key === "round6.controlCutoverAt" ? cutover : 86400 } as unknown as ConfigService<ApplicationConfiguration, true>;
   const preparation = new DraftPreparationService(prisma, config, store, draft as unknown as WordPressDraftClient, media as unknown as WordPressMediaClient);
   const machine = new ConversationStateMachineService(prisma);
   const round6 = new Round6FinalisationService(prisma, preparation, new ApprovalPromptService(), { dispatchOne: (id: string) => { sends.push(id); return Promise.resolve("SENT"); } } as never, machine);
-  return { process: new InboundEventProcessingService(prisma, new ReporterAuthorizationService(), new ConversationProvisioningService(), new StoredWhatsappEventParser(), new StoryEventProcessor(machine), undefined, config, preparation, round6), preparation, round6, store, draft, media, sends };
+  const revisions = new Round6RevisionService(machine);
+  return { process: new InboundEventProcessingService(prisma, new ReporterAuthorizationService(), new ConversationProvisioningService(), new StoredWhatsappEventParser(), new StoryEventProcessor(machine), new MediaStagingService(prisma, provider, store), config, preparation, round6, revisions), preparation, round6, store, provider, draft, media, sends, config };
 }
 
 class ProofMetaTransport implements MetaOutboundTransport {
@@ -117,7 +144,7 @@ class ProofMetaTransport implements MetaOutboundTransport {
 }
 
 function integratedMeta(result: MetaTransportResponse | Error): Integrated & { dispatcher: WhatsappOutboundDispatcher; transport: ProofMetaTransport } {
-  const store = new ProofStore(); const draft = new ProofDraft(); const media = new ProofMedia(); const sends: string[] = [];
+  const store = new ProofStore(); const provider = new ProofMediaProvider(); const draft = new ProofDraft(); const media = new ProofMedia(); const sends: string[] = [];
   const config = new ConfigService({
     round6: { controlCutoverAt: new Date(0) },
     preview: { ttlSeconds: 86400, hmacSecret: Buffer.alloc(32, 7).toString("base64url"), publicOrigin: "https://preview.test" },
@@ -129,8 +156,8 @@ function integratedMeta(result: MetaTransportResponse | Error): Integrated & { d
   const dispatcher = new WhatsappOutboundDispatcher(prisma, new PreviewTokenService(config, preparation), client, config);
   const machine = new ConversationStateMachineService(prisma);
   const round6 = new Round6FinalisationService(prisma, preparation, new ApprovalPromptService(), dispatcher, machine);
-  const process = new InboundEventProcessingService(prisma, new ReporterAuthorizationService(), new ConversationProvisioningService(), new StoredWhatsappEventParser(), new StoryEventProcessor(machine), undefined, config, preparation, round6);
-  return { process, preparation, round6, store, draft, media, sends, dispatcher, transport };
+  const process = new InboundEventProcessingService(prisma, new ReporterAuthorizationService(), new ConversationProvisioningService(), new StoredWhatsappEventParser(), new StoryEventProcessor(machine), new MediaStagingService(prisma, provider, store), config, preparation, round6, new Round6RevisionService(machine));
+  return { process, preparation, round6, store, provider, draft, media, sends, config, dispatcher, transport };
 }
 
 let ingest = 1n;
@@ -156,6 +183,80 @@ async function inboundSeed(receivedAt: Date, providerOccurredAt: Date, mediaCoun
 async function loadMedia(runtime: Integrated, storyId: string): Promise<void> {
   const rows = await prisma.storyMedia.findMany({ where: { storyId }, orderBy: { position: "asc" } });
   for (const row of rows) { const bytes = Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), Buffer.alloc(8, row.position + 1)]); runtime.store.objects.set(mediaObjectKey(row.id), { bytes, mimeType: "image/png", size: Number(row.fileSizeBytes), sha256: row.sha256! }); }
+}
+
+async function controlEvent(
+  reporterId: string,
+  control: string,
+  receivedAt = new Date(),
+  interactive = false,
+  providerOccurredAt = new Date(Math.floor(Date.now() / 1000) * 1000),
+): Promise<string> {
+  const reporter = await prisma.reporter.findUniqueOrThrow({
+    where: { id: reporterId },
+  });
+  providerOccurredAt = new Date(
+    Math.floor(providerOccurredAt.getTime() / 1000) * 1000,
+  );
+  const providerMessageId = randomUUID();
+  const event = await prisma.inboundEvent.create({
+    data: {
+      provider: Provider.WHATSAPP,
+      providerMessageId,
+      senderPhone: reporter.phoneNumber,
+      senderIngestSequence: ingest++,
+      eventType: interactive
+        ? InboundEventType.INTERACTIVE
+        : InboundEventType.TEXT,
+      receivedAt,
+      providerOccurredAt,
+      rawPayload: {
+        message: {
+          id: providerMessageId,
+          from: reporter.phoneNumber.slice(1),
+          timestamp: String(Math.floor(providerOccurredAt.getTime() / 1000)),
+          type: interactive ? "interactive" : "text",
+          ...(interactive
+            ? {
+                interactive: {
+                  type: "button_reply",
+                  button_reply: { id: control, title: "Revise" },
+                },
+              }
+            : { text: { body: control } }),
+        },
+      },
+    },
+  });
+  return event.id;
+}
+
+async function imageEvent(reporterId: string): Promise<string> {
+  const reporter = await prisma.reporter.findUniqueOrThrow({ where: { id: reporterId } });
+  const providerMessageId = randomUUID();
+  const providerMediaId = `opaque.media:${randomUUID()}`;
+  const occurredAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+  const event = await prisma.inboundEvent.create({
+    data: {
+      provider: Provider.WHATSAPP,
+      providerMessageId,
+      senderPhone: reporter.phoneNumber,
+      senderIngestSequence: ingest++,
+      eventType: InboundEventType.IMAGE,
+      receivedAt: new Date(),
+      providerOccurredAt: occurredAt,
+      rawPayload: {
+        message: {
+          id: providerMessageId,
+          from: reporter.phoneNumber.slice(1),
+          timestamp: String(Math.floor(occurredAt.getTime() / 1000)),
+          type: "image",
+          image: { id: providerMediaId, mime_type: "image/png", caption: "New image" },
+        },
+      },
+    },
+  });
+  return event.id;
 }
 
 async function seed(): Promise<PreparedAuthority> {
@@ -565,5 +666,967 @@ describe("Round 6 Phase E", () => {
     } finally {
       holder.$transaction = originalTransaction; dnsLookup.mockRestore();
     }
+  });
+});
+
+describe("Round 6B.5 /revise revision", () => {
+  beforeEach(async () =>
+    prisma.$executeRawUnsafe('TRUNCATE TABLE "Reporter" CASCADE'),
+  );
+
+  async function posture(
+    runtime: Integrated,
+    mediaCount = 0,
+  ): Promise<{
+    eventId: string;
+    storyId: string;
+    conversationId: string;
+    reporterId: string;
+    storyVersion: number;
+    conversationVersion: number;
+    preparation: Awaited<ReturnType<typeof prisma.draftPreparation.findFirstOrThrow>>;
+  }> {
+    const value = await inboundSeed(new Date(), new Date(), mediaCount);
+    if (mediaCount > 0) await loadMedia(runtime, value.storyId);
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: {
+        activeInConversation: true,
+        draftPreparations: true,
+        media: true,
+      },
+    });
+    return {
+      ...value,
+      storyVersion: story.version,
+      conversationVersion: story.activeInConversation!.version,
+      preparation: story.draftPreparations[0]!,
+    };
+  }
+
+  it.each([
+    ["cutover - 1ms", -1, false],
+    ["exactly at cutover", 0, true],
+    ["cutover + 1ms", 1, true],
+  ] as const)(
+    "%s resolves revision eligibility from receivedAt only",
+    async (_name, delta, eligible) => {
+      const cutover = new Date("2030-01-01T00:00:00.000Z");
+      const runtime = integrated(cutover);
+      const value = await inboundSeed(
+        new Date(cutover.getTime()),
+        new Date(cutover.getTime() - 60_000),
+      );
+      await expect(runtime.process.process(value.eventId)).resolves.toMatchObject(
+        { outcome: "PROCESSED" },
+      );
+      const first = await prisma.story.findUniqueOrThrow({
+        where: { id: value.storyId },
+        include: { activeInConversation: true, draftPreparations: true },
+      });
+      const draftCallsBefore = runtime.draft.calls.length;
+      const mediaCallsBefore = runtime.media.calls.length;
+      const storeCallsBefore = runtime.store.calls.length;
+      const reviseId = await controlEvent(
+        value.reporterId,
+        "/revise",
+        new Date(cutover.getTime() + delta),
+      );
+      const result = await runtime.process.process(reviseId);
+      const revisionEvent = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: reviseId },
+      });
+      const after = await prisma.story.findUniqueOrThrow({
+        where: { id: value.storyId },
+        include: { activeInConversation: true, draftPreparations: true },
+      });
+      if (eligible) {
+        expect(result).toMatchObject({
+          outcome: "PROCESSED",
+          reporterId: value.reporterId,
+          conversationId: value.conversationId,
+        });
+        expect(revisionEvent.processingStatus).toBe(
+          InboundProcessingStatus.PROCESSED,
+        );
+        expect(after).toMatchObject({
+          status: StoryStatus.COLLECTING,
+          version: first.version + 1,
+        });
+        expect(after.draftPreparations[0]).toMatchObject({
+          status: DraftPreparationStatus.SUPERSEDED,
+        });
+        expect(after.draftPreparations[0]!.supersededAt).not.toBeNull();
+        expect(after.activeInConversation).toMatchObject({
+          state: ConversationState.COLLECTING_MEDIA,
+          version: first.activeInConversation!.version + 1,
+        });
+        expect(runtime.sends).toHaveLength(1);
+      } else {
+        expect(result).toEqual({
+          outcome: "IGNORED",
+          reason: "CONTROL_NOT_ENABLED",
+        });
+        expect(revisionEvent.processingStatus).toBe(
+          InboundProcessingStatus.IGNORED,
+        );
+        expect(after).toMatchObject({
+          status: StoryStatus.AWAITING_APPROVAL,
+          version: first.version,
+        });
+        expect(after.draftPreparations[0]).toMatchObject({
+          status: DraftPreparationStatus.READY_FOR_APPROVAL,
+          supersededAt: null,
+        });
+        expect(after.activeInConversation).toMatchObject({
+          state: ConversationState.AWAITING_APPROVAL,
+          version: first.activeInConversation!.version,
+        });
+        expect(await prisma.draftPreparation.count()).toBe(1);
+        expect(runtime.sends).toHaveLength(1);
+      }
+      expect(runtime.draft.calls).toHaveLength(draftCallsBefore);
+      expect(runtime.media.calls).toHaveLength(mediaCallsBefore);
+      expect(runtime.store.calls).toHaveLength(storeCallsBefore);
+    },
+  );
+
+  it.each([
+    ["IDLE", ConversationState.IDLE],
+    ["AWAITING_HEADLINE", ConversationState.AWAITING_HEADLINE],
+    ["AWAITING_BODY", ConversationState.AWAITING_BODY],
+    ["COLLECTING_MEDIA", ConversationState.COLLECTING_MEDIA],
+  ] as const)(
+    "rejects /revise while the conversation is in %s",
+    async (_name, state) => {
+      const runtime = integrated(new Date(0));
+      const reporter = await prisma.reporter.create({
+        data: {
+          phoneNumber: `+263${randomUUID().replace(/\D/g, "").slice(0, 8).padEnd(8, "3")}`,
+          displayName: "State",
+          status: ReporterStatus.ACTIVE,
+        },
+      });
+      const story = await prisma.story.create({
+        data: {
+          reporterId: reporter.id,
+          status: StoryStatus.COLLECTING,
+          headline: "Exact headline",
+          body: "Exact body",
+          byline: "Proof Byline",
+          version: 2,
+        },
+      });
+      await prisma.conversation.create({
+        data: {
+          reporterId: reporter.id,
+          state,
+          currentStoryId: story.id,
+          version: 1,
+        },
+      });
+      const reviseId = await controlEvent(reporter.id, "/revise");
+      await expect(runtime.process.process(reviseId)).resolves.toEqual({
+        outcome: "IGNORED",
+        reason: "TEXT_NOT_ACCEPTED_IN_STATE",
+      });
+      const event = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: reviseId },
+      });
+      expect(event.processingStatus).toBe(InboundProcessingStatus.IGNORED);
+      expect(
+        (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
+          .version,
+      ).toBe(2);
+      expect(await prisma.draftPreparation.count()).toBe(0);
+      expect(runtime.draft.calls).toHaveLength(0);
+      expect(runtime.sends).toHaveLength(0);
+    },
+  );
+
+  it("fails closed when the story has left the awaiting posture toward publishing", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    await prisma.story.update({
+      where: { id: value.storyId },
+      data: { status: StoryStatus.PUBLISHING },
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "STORY_REVISION_CONFLICT",
+    });
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { activeInConversation: true, draftPreparations: true },
+    });
+    expect(after.status).toBe(StoryStatus.PUBLISHING);
+    expect(after.version).toBe(value.storyVersion);
+    expect(after.draftPreparations[0]).toMatchObject({
+      status: DraftPreparationStatus.READY_FOR_APPROVAL,
+      supersededAt: null,
+    });
+    expect(after.activeInConversation).toMatchObject({
+      state: ConversationState.AWAITING_APPROVAL,
+      version: value.conversationVersion,
+    });
+  });
+
+  it("fails closed when the approval prompt link on the preparation is gone", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    await prisma.draftPreparation.updateMany({
+      data: { approvalPromptOutboundMessageId: null },
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "STORY_REVISION_CONFLICT",
+    });
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(after.version).toBe(value.storyVersion);
+    expect(after.draftPreparations[0]!.status).toBe(
+      DraftPreparationStatus.READY_FOR_APPROVAL,
+    );
+    expect(await prisma.outboundMessage.count()).toBe(1);
+  });
+
+  it("fails closed when the story epoch no longer matches the prepared version", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+    });
+    await prisma.story.update({
+      where: { id: story.id },
+      data: { version: story.version + 1 },
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "STORY_REVISION_CONFLICT",
+    });
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(after.version).toBe(story.version + 1);
+    expect(after.draftPreparations).toHaveLength(1);
+    expect(after.draftPreparations[0]).toMatchObject({
+      status: DraftPreparationStatus.READY_FOR_APPROVAL,
+    });
+  });
+
+  it("fails closed against cross-reporter ownership of the conversation story", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const other = await prisma.reporter.create({
+      data: {
+        phoneNumber: `+263${randomUUID().replace(/\D/g, "").slice(0, 9).padEnd(9, "2")}`,
+        displayName: "Other",
+        status: ReporterStatus.ACTIVE,
+      },
+    });
+    await prisma.conversation.update({
+      where: { id: value.conversationId },
+      data: { reporterId: other.id },
+    });
+    const reviseId = await controlEvent(other.id, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "STORY_REVISION_CONFLICT",
+    });
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(story.version).toBe(value.storyVersion);
+    expect(story.draftPreparations[0]!.status).toBe(
+      DraftPreparationStatus.READY_FOR_APPROVAL,
+    );
+  });
+
+  it("converges 20 concurrent /revise calls on exactly one supersession and one bump", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    const settled = await Promise.allSettled(
+      Array.from({ length: 20 }, () => runtime.process.process(reviseId)),
+    );
+    expect(settled.every((row) => row.status === "fulfilled")).toBe(true);
+    const outcomes = settled.map((row) =>
+      (row as PromiseFulfilledResult<Awaited<ReturnType<InboundEventProcessingService["process"]>>>)
+        .value,
+    );
+    expect(
+      outcomes.filter((row) => row.outcome === "PROCESSED"),
+    ).toHaveLength(1);
+    expect(
+      outcomes.filter((row) => row.outcome === "NOT_CLAIMED"),
+    ).toHaveLength(19);
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { activeInConversation: true, draftPreparations: true },
+    });
+    expect(after.status).toBe(StoryStatus.COLLECTING);
+    expect(after.version).toBe(value.storyVersion + 1);
+    expect(after.draftPreparations).toHaveLength(1);
+    expect(after.draftPreparations[0]).toMatchObject({
+      status: DraftPreparationStatus.SUPERSEDED,
+      storyVersion: value.storyVersion,
+    });
+    expect(after.activeInConversation).toMatchObject({
+      state: ConversationState.COLLECTING_MEDIA,
+      version: value.conversationVersion + 1,
+    });
+    const event = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: reviseId },
+    });
+    expect(event).toMatchObject({
+      processingStatus: InboundProcessingStatus.PROCESSED,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    });
+    expect(event.processedAt).not.toBeNull();
+    expect(
+      await prisma.auditLog.count({
+        where: { storyId: value.storyId, eventType: "story_revision_requested" },
+      }),
+    ).toBe(1);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          storyId: value.storyId,
+          eventType: "draft_preparation_superseded",
+        },
+      }),
+    ).toBe(1);
+    expect(await prisma.approval.count()).toBe(0);
+  });
+
+  it("does not bump the epoch again for a distinct duplicate /revise", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const first = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(first)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const second = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(second)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "TEXT_NOT_ACCEPTED_IN_STATE",
+    });
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { activeInConversation: true, draftPreparations: true },
+    });
+    expect(after.version).toBe(value.storyVersion + 1);
+    expect(after.status).toBe(StoryStatus.COLLECTING);
+    expect(after.draftPreparations).toHaveLength(1);
+    expect(after.draftPreparations[0]).toMatchObject({
+      status: DraftPreparationStatus.SUPERSEDED,
+    });
+    expect(after.activeInConversation).toMatchObject({
+      state: ConversationState.COLLECTING_MEDIA,
+      version: value.conversationVersion + 1,
+    });
+  });
+
+  it("rolls back every revision mutation when the enclosing transaction fails", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const revisions = new Round6RevisionService(
+      new ConversationStateMachineService(prisma),
+    );
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await prisma.inboundEvent.update({
+      where: { id: reviseId },
+      data: {
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        reporterId: value.reporterId,
+      },
+    });
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await revisions.reviseInTransaction(tx, {
+          inboundEventId: reviseId,
+          reporterId: value.reporterId,
+          conversationId: value.conversationId,
+          storyId: value.storyId,
+          expectedStoryVersion: value.storyVersion,
+        });
+        throw new Error("injected rollback");
+      }),
+    ).rejects.toThrow("injected rollback");
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { activeInConversation: true, draftPreparations: true },
+    });
+    expect(after.status).toBe(StoryStatus.AWAITING_APPROVAL);
+    expect(after.version).toBe(value.storyVersion);
+    expect(after.draftPreparations[0]).toMatchObject({
+      status: DraftPreparationStatus.READY_FOR_APPROVAL,
+      supersededAt: null,
+    });
+    expect(after.activeInConversation).toMatchObject({
+      state: ConversationState.AWAITING_APPROVAL,
+      version: value.conversationVersion,
+    });
+    const event = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: reviseId },
+    });
+    expect(event.processingStatus).toBe(InboundProcessingStatus.PROCESSING);
+    expect(
+      await prisma.auditLog.count({ where: { inboundEventId: reviseId } }),
+    ).toBe(0);
+  });
+
+  it("reuses the same WordPress post across the full no-edit /done -> /revise -> /done cycle", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await inboundSeed(new Date(), new Date(), 1);
+    await loadMedia(runtime, value.storyId);
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const first = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { activeInConversation: true, draftPreparations: true },
+    });
+    const p1 = first.draftPreparations[0]!;
+    const firstMessage = await prisma.outboundMessage.findFirstOrThrow({
+      where: { storyId: first.id },
+    });
+    const draftCallsBefore = runtime.draft.calls.length;
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const revised = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: {
+        activeInConversation: true,
+        draftPreparations: true,
+        media: true,
+      },
+    });
+    expect(revised.status).toBe(StoryStatus.COLLECTING);
+    expect(revised.version).toBe(first.version + 1);
+    expect(revised.activeInConversation).toMatchObject({
+      state: ConversationState.COLLECTING_MEDIA,
+      version: first.activeInConversation!.version + 1,
+    });
+    const p1After = revised.draftPreparations.find((row) => row.id === p1.id)!;
+    expect(p1After).toMatchObject({
+      status: DraftPreparationStatus.SUPERSEDED,
+      wordpressPostId: p1.wordpressPostId,
+      wordpressAppliedVersion: p1.wordpressAppliedVersion,
+      previewExpiresAt: p1.previewExpiresAt,
+      readyAt: p1.readyAt,
+      approvalPromptOutboundMessageId: firstMessage.id,
+      approvalPromptCorrelationKey: p1.approvalPromptCorrelationKey,
+    });
+    expect(p1After.supersededAt).not.toBeNull();
+    expect(p1After.wordpressAppliedVersion).toMatch(/^[0-9a-f]{64}$/u);
+    expect(revised.media).toHaveLength(1);
+    expect(revised.media[0]).toMatchObject({
+      status: MediaProcessingStatus.UPLOADED,
+    });
+    expect(await prisma.outboundMessage.count()).toBe(1);
+    expect(runtime.draft.calls).toHaveLength(draftCallsBefore);
+    expect(runtime.sends).toHaveLength(1);
+    const secondDone = await controlEvent(value.reporterId, "/done");
+    await expect(runtime.process.process(secondDone)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const second = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: {
+        activeInConversation: true,
+        draftPreparations: true,
+        media: true,
+      },
+    });
+    expect(second.status).toBe(StoryStatus.AWAITING_APPROVAL);
+    expect(second.version).toBe(first.version + 2);
+    expect(second.wordpressPostId).toEqual(first.wordpressPostId);
+    expect(second.wordpressDraftKey).toEqual(first.wordpressDraftKey);
+    expect(second.activeInConversation).toMatchObject({
+      state: ConversationState.AWAITING_APPROVAL,
+      version: first.activeInConversation!.version + 2,
+    });
+    expect(second.draftPreparations).toHaveLength(2);
+    const p2 = second.draftPreparations.find((row) => row.id !== p1After.id)!;
+    expect(p2).toMatchObject({
+      status: DraftPreparationStatus.READY_FOR_APPROVAL,
+      storyVersion: second.version,
+      wordpressPostId: first.wordpressPostId,
+    });
+    expect(p2.id).not.toBe(p1After.id);
+    expect(p2.readyAt).not.toBeNull();
+    expect(p2.approvalPromptOutboundMessageId).not.toBeNull();
+    expect(p2.approvalPromptOutboundMessageId).not.toBe(firstMessage.id);
+    expect(await prisma.outboundMessage.count()).toBe(2);
+    expect(runtime.sends).toHaveLength(2);
+    expect(runtime.media.calls.filter((call) => call.startsWith("upload:"))).toHaveLength(1);
+    expect(runtime.draft.calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+    expect(runtime.draft.posts.size).toBe(1);
+    expect(await prisma.approval.count()).toBe(0);
+    expect(
+      await prisma.publishAttempt.count({
+        where: { operation: PublishOperation.PUBLISH },
+      }),
+    ).toBe(0);
+  });
+
+  it("replaces categories exactly B over A on revision and keeps the same post count", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await inboundSeed(new Date(), new Date());
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const first = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { categories: { include: { category: true } } },
+    });
+    const categoryA = first.categories[0]!.category;
+    const categoryB = await prisma.editorialCategory.create({
+      data: {
+        wordpressCategoryId: wordpressCategory++,
+        name: "Proof B",
+        slug: `proof-b-${randomUUID()}`,
+        status: EditorialCategoryStatus.ACTIVE,
+      },
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const categoryEvent = await controlEvent(
+      value.reporterId,
+      `/categories ${categoryB.slug}`,
+    );
+    await expect(runtime.process.process(categoryEvent)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const mid = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { categories: { include: { category: true } } },
+    });
+    expect(mid.categories.map((row) => row.category.slug)).toEqual([
+      categoryB.slug,
+    ]);
+    expect(mid.categories.some((row) => row.category.id === categoryA.id)).toBe(
+      false,
+    );
+    const createCalls = runtime.draft.calls.filter((call) =>
+      call.startsWith("create:"),
+    ).length;
+    const secondDone = await controlEvent(value.reporterId, "/done");
+    await expect(runtime.process.process(secondDone)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const second = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { categories: { include: { category: true } } },
+    });
+    expect(second.wordpressPostId).toEqual(first.wordpressPostId);
+    expect(second.categories.map((row) => row.category.slug)).toEqual([
+      categoryB.slug,
+    ]);
+    expect(runtime.draft.calls.filter((call) => call.startsWith("create:"))).toHaveLength(createCalls);
+    expect(runtime.draft.posts.size).toBe(1);
+    expect(await prisma.approval.count()).toBe(0);
+    expect(
+      await prisma.publishAttempt.count({
+        where: { operation: PublishOperation.PUBLISH },
+      }),
+    ).toBe(0);
+  });
+
+  it("reuses retained media and stages a new image exactly once", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await inboundSeed(new Date(), new Date(), 1);
+    await loadMedia(runtime, value.storyId);
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const pos0 = (
+      await prisma.storyMedia.findMany({
+        where: { storyId: value.storyId },
+        orderBy: { position: "asc" },
+      })
+    )[0]!;
+    const pos0UploadsAtFirstDone = runtime.media.calls.filter(
+      (call) => call === `upload:${pos0.id}`,
+    ).length;
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const imageEventId = await imageEvent(value.reporterId);
+    await expect(runtime.process.process(imageEventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const mid = await prisma.storyMedia.findMany({
+      where: { storyId: value.storyId },
+      orderBy: { position: "asc" },
+    });
+    expect(mid.map((row) => row.position)).toEqual([0, 1]);
+    expect(mid[0]).toMatchObject({
+      status: MediaProcessingStatus.UPLOADED,
+      id: pos0.id,
+    });
+    expect(mid[1]).toMatchObject({ status: MediaProcessingStatus.FETCHED });
+    const secondDone = await controlEvent(value.reporterId, "/done");
+    await expect(runtime.process.process(secondDone)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const after = await prisma.storyMedia.findMany({
+      where: { storyId: value.storyId },
+      orderBy: { position: "asc" },
+    });
+    expect(after.map((row) => row.position)).toEqual([0, 1]);
+    expect(after[0]).toMatchObject({
+      id: pos0.id,
+      status: MediaProcessingStatus.UPLOADED,
+      wordpressMediaId: pos0.wordpressMediaId,
+    });
+    expect(after[1]).toMatchObject({ status: MediaProcessingStatus.UPLOADED });
+    expect(
+      runtime.media.calls.filter((call) => call === `get:${pos0.id}`),
+    ).toHaveLength(1);
+    expect(
+      runtime.media.calls.filter((call) => call === `upload:${pos0.id}`),
+    ).toHaveLength(pos0UploadsAtFirstDone);
+    expect(
+      runtime.media.calls.filter((call) => call === `upload:${mid[1]!.id}`),
+    ).toHaveLength(1);
+    expect(
+      runtime.provider.calls.filter(
+        (authority) =>
+          authority.providerMediaId === mid[1]!.providerMediaId,
+      ),
+    ).toHaveLength(1);
+    expect(runtime.sends).toHaveLength(2);
+    expect(await prisma.approval.count()).toBe(0);
+    expect(
+      await prisma.publishAttempt.count({
+        where: { operation: PublishOperation.PUBLISH },
+      }),
+    ).toBe(0);
+  });
+
+  it("issues a fresh preview token for the second epoch and keeps the first stale", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await posture(runtime);
+    const config = new ConfigService({
+      preview: {
+        ttlSeconds: 86400,
+        hmacSecret: Buffer.alloc(32, 7).toString("base64url"),
+        publicOrigin: "https://preview.test",
+      },
+    }) as unknown as ConfigService<ApplicationConfiguration, true>;
+    const tokens = new PreviewTokenService(config, runtime.preparation);
+    const newsroom = new NewsroomPreviewService(
+      prisma,
+      tokens,
+      runtime.preparation,
+      runtime.store,
+    );
+    const firstToken = await tokens.issue(value.preparation.id);
+    expect(firstToken).toContain(".");
+    await expect(newsroom.render(firstToken)).resolves.toMatchObject({
+      headline: "Exact headline",
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    await expect(tokens.issue(value.preparation.id)).rejects.toThrow();
+    await expect(newsroom.render(firstToken)).rejects.toThrow();
+    const secondDone = await controlEvent(value.reporterId, "/done");
+    await expect(runtime.process.process(secondDone)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const p2 = await prisma.draftPreparation.findFirstOrThrow({
+      where: {
+        storyId: value.storyId,
+        status: DraftPreparationStatus.READY_FOR_APPROVAL,
+      },
+    });
+    const secondToken = await tokens.issue(p2.id);
+    expect(secondToken).not.toBe(firstToken);
+    await expect(newsroom.render(secondToken)).resolves.toMatchObject({
+      headline: "Exact headline",
+    });
+  });
+
+  it("never dispatches a stale prompt once the revision has superseded it", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await inboundSeed(new Date(), new Date());
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const message = await prisma.outboundMessage.findFirstOrThrow({
+      where: { storyId: value.storyId },
+    });
+    expect(message.status).toBe(OutboundMessageStatus.PENDING);
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const config = new ConfigService({
+      preview: {
+        ttlSeconds: 86400,
+        hmacSecret: Buffer.alloc(32, 7).toString("base64url"),
+        publicOrigin: "https://preview.test",
+      },
+      whatsapp: {
+        accessToken: "test-only-token",
+        phoneNumberId: "123456789",
+        graphApiVersion: "v99.0",
+        outboundRequestTimeoutMs: 1000,
+      },
+    }) as unknown as ConfigService<ApplicationConfiguration, true>;
+    const proofTransport = new ProofMetaTransport({
+      status: 200,
+      body: { messages: [{ id: "wamid.race-a" }] },
+    });
+    const dispatcher = new WhatsappOutboundDispatcher(
+      prisma,
+      new PreviewTokenService(config, runtime.preparation),
+      new WhatsappOutboundClient(config, proofTransport),
+      config,
+    );
+    await expect(dispatcher.dispatchOne(message.id)).resolves.toBe(
+      "NOT_CLAIMED",
+    );
+    await expect(dispatcher.dispatchPending(10)).resolves.toEqual([
+      "NOT_CLAIMED",
+    ]);
+    const after = await prisma.outboundMessage.findUniqueOrThrow({
+      where: { id: message.id },
+    });
+    expect(after.status).toBe(OutboundMessageStatus.PENDING);
+    expect(after.sendAttempts).toBe(0);
+    expect(proofTransport.requests).toHaveLength(0);
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+    });
+    expect(story.status).toBe(StoryStatus.COLLECTING);
+  });
+
+  it("leaves a dispatched prompt historical when revision arrives after delivery", async () => {
+    const runtime = integratedMeta({
+      status: 200,
+      body: { messages: [{ id: "wamid.race-b" }] },
+    });
+    const value = await inboundSeed(new Date(), new Date());
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const message = await prisma.outboundMessage.findFirstOrThrow({
+      where: { storyId: value.storyId },
+    });
+    expect(message.status).toBe(OutboundMessageStatus.SENT);
+    expect(message.providerMessageId).toBe("wamid.race-b");
+    expect(runtime.transport.requests).toHaveLength(1);
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const historical = await prisma.outboundMessage.findUniqueOrThrow({
+      where: { id: message.id },
+    });
+    expect(historical.status).toBe(OutboundMessageStatus.SENT);
+    expect(historical.providerMessageId).toBe("wamid.race-b");
+    expect(runtime.transport.requests).toHaveLength(1);
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(story.status).toBe(StoryStatus.COLLECTING);
+    expect(story.draftPreparations[0]!.status).toBe(
+      DraftPreparationStatus.SUPERSEDED,
+    );
+    expect(await prisma.outboundMessage.count()).toBe(1);
+    expect(await prisma.approval.count()).toBe(0);
+  });
+
+  it("fails the second /done closed when retained media lacks supersession authority", async () => {
+    const runtime = integrated(new Date(0));
+    const value = await inboundSeed(new Date(), new Date(), 1);
+    await loadMedia(runtime, value.storyId);
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const revision = await controlEvent(value.reporterId, "/revise");
+    await expect(runtime.process.process(revision)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    await prisma.draftPreparation.update({
+      where: { id: story.draftPreparations[0]!.id },
+      data: { status: DraftPreparationStatus.ACTIVE, supersededAt: null },
+    });
+    const secondDone = await controlEvent(value.reporterId, "/done");
+    await expect(runtime.process.process(secondDone)).resolves.toEqual({
+      outcome: "IGNORED",
+      reason: "COMPLETENESS_NOT_SATISFIED",
+    });
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(after.status).toBe(StoryStatus.COLLECTING);
+    expect(after.version).toBe(story.version);
+    expect(after.draftPreparations).toHaveLength(1);
+    expect(runtime.draft.calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+    expect(runtime.media.calls.filter((call) => call.startsWith("upload:"))).toHaveLength(1);
+    expect(await prisma.approval.count()).toBe(0);
+  });
+
+  it.each([
+    ["wordpressMediaId null", { wordpressMediaId: null }],
+    ["wordpressMediaId zero", { wordpressMediaId: 0n }],
+    ["zero bytes", { fileSizeBytes: 0n }],
+    ["invalid sha256", { sha256: "invalid" }],
+    ["unsupported mime", { mimeType: "text/plain" }],
+    ["downgraded status", { status: MediaProcessingStatus.RECEIVED }],
+  ] as const)(
+    "rejects unsafe retained media %# on second /done",
+    async (_name, mutation) => {
+      const runtime = integrated(new Date(0));
+      const value = await inboundSeed(new Date(), new Date(), 1);
+      await loadMedia(runtime, value.storyId);
+      await expect(runtime.process.process(value.eventId)).resolves.toMatchObject(
+        { outcome: "PROCESSED" },
+      );
+      const revision = await controlEvent(value.reporterId, "/revise");
+      await expect(runtime.process.process(revision)).resolves.toMatchObject({
+        outcome: "PROCESSED",
+      });
+      const story = await prisma.story.findUniqueOrThrow({
+        where: { id: value.storyId },
+      });
+      await prisma.storyMedia.updateMany({
+        where: { storyId: value.storyId },
+        data: mutation,
+      });
+      const secondDone = await controlEvent(value.reporterId, "/done");
+      await expect(runtime.process.process(secondDone)).resolves.toEqual({
+        outcome: "IGNORED",
+        reason: "COMPLETENESS_NOT_SATISFIED",
+      });
+      const after = await prisma.story.findUniqueOrThrow({
+        where: { id: value.storyId },
+        include: { draftPreparations: true },
+      });
+      expect(after.version).toBe(story.version);
+      expect(after.status).toBe(StoryStatus.COLLECTING);
+      expect(after.draftPreparations).toHaveLength(1);
+      expect(runtime.draft.calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
+      expect(runtime.media.calls.filter((call) => call.startsWith("upload:"))).toHaveLength(1);
+      expect(await prisma.approval.count()).toBe(0);
+    },
+  );
+
+  it("proves the /revise transaction performs zero external I/O", async () => {
+    const runtime = integratedMeta({
+      status: 200,
+      body: { messages: [{ id: "wamid.io-revise" }] },
+    });
+    const value = await inboundSeed(new Date(), new Date(), 1);
+    await loadMedia(runtime, value.storyId);
+    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    const reviseId = await controlEvent(value.reporterId, "/revise");
+    let transactionDepth = 0;
+    const trace: string[] = [];
+    type TxCallback = (tx: Prisma.TransactionClient) => Promise<unknown>;
+    type TxInvoker = (
+      callback: TxCallback,
+      options?: {
+        maxWait?: number;
+        timeout?: number;
+        isolationLevel?: Prisma.TransactionIsolationLevel;
+      },
+    ) => Promise<unknown>;
+    const holder = prisma as unknown as { $transaction: TxInvoker };
+    const originalTransaction = holder.$transaction.bind(prisma);
+    holder.$transaction = async (callback, options): Promise<unknown> =>
+      originalTransaction(async (tx): Promise<unknown> => {
+        transactionDepth += 1;
+        trace.push("transaction:open");
+        try {
+          return await callback(tx);
+        } finally {
+          trace.push("transaction:commit");
+          transactionDepth -= 1;
+        }
+      }, options);
+    const guard = (name: string): void => {
+      expect(transactionDepth).toBe(0);
+      trace.push(name);
+    };
+    const oldHead = runtime.store.head.bind(runtime.store);
+    runtime.store.head = (key): ReturnType<typeof oldHead> =>
+      oldHead(key).then((value) => (guard("object:head"), value));
+    const oldRead = runtime.store.read.bind(runtime.store);
+    runtime.store.read = (key): ReturnType<typeof oldRead> =>
+      oldRead(key).then((value) => (guard("object:read"), value));
+    const oldMediaGet = runtime.media.getMediaByKey.bind(runtime.media);
+    runtime.media.getMediaByKey = (key): ReturnType<typeof oldMediaGet> =>
+      oldMediaGet(key).then((value) => (guard("wordpress-media:get"), value));
+    const oldMediaUpload = runtime.media.uploadMedia.bind(runtime.media);
+    runtime.media.uploadMedia = (input): ReturnType<typeof oldMediaUpload> =>
+      oldMediaUpload(input).then((value) => (guard("wordpress-media:upload"), value));
+    const oldDraftGet = runtime.draft.getDraftByKey.bind(runtime.draft);
+    runtime.draft.getDraftByKey = (key): ReturnType<typeof oldDraftGet> =>
+      oldDraftGet(key).then((value) => (guard("wordpress-draft:get"), value));
+    const oldDraftCreate = runtime.draft.createDraft.bind(runtime.draft);
+    runtime.draft.createDraft = (input): ReturnType<typeof oldDraftCreate> =>
+      oldDraftCreate(input).then((value) => (guard("wordpress-draft:create"), value));
+    const oldDraftState = runtime.draft.getDraftState.bind(runtime.draft);
+    runtime.draft.getDraftState = (key): ReturnType<typeof oldDraftState> =>
+      oldDraftState(key).then((value) => (guard("wordpress-draft:state"), value));
+    const oldDraftSync = runtime.draft.syncDraft.bind(runtime.draft);
+    runtime.draft.syncDraft = (input): ReturnType<typeof oldDraftSync> =>
+      oldDraftSync(input).then((value) => (guard("wordpress-draft:sync"), value));
+    const oldMeta = runtime.transport.send.bind(runtime.transport);
+    runtime.transport.send = (request): ReturnType<typeof oldMeta> =>
+      oldMeta(request).then((value) => (guard("meta:send"), value));
+    const dnsLookup = jest.spyOn(dns, "lookup");
+    try {
+      await expect(runtime.process.process(reviseId)).resolves.toMatchObject({
+        outcome: "PROCESSED",
+      });
+      expect(transactionDepth).toBe(0);
+      expect(dnsLookup).not.toHaveBeenCalled();
+      expect(
+        trace.filter((entry) => !entry.startsWith("transaction:")),
+      ).toEqual([]);
+    } finally {
+      holder.$transaction = originalTransaction;
+      dnsLookup.mockRestore();
+    }
+    const after = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+      include: { draftPreparations: true },
+    });
+    expect(after.draftPreparations[0]!.status).toBe(
+      DraftPreparationStatus.SUPERSEDED,
+    );
+    expect(await prisma.approval.count()).toBe(0);
   });
 });

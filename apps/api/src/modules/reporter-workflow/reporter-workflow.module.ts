@@ -8,6 +8,7 @@ import { InboundEventProcessingService } from "./inbound-event-processing.servic
 import { ReporterAuthorizationService } from "./reporter-authorization.service";
 import { ReporterProvisioningService } from "./reporter-provisioning.service";
 import { Round6FinalisationService } from "./round6-finalisation.service";
+import { Round6RevisionService } from "./round6-revision.service";
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { Round6FinalisationService } from "./round6-finalisation.service";
     ConversationStateMachineService,
     InboundEventProcessingService,
     Round6FinalisationService,
+    Round6RevisionService,
   ],
   exports: [
     ReporterProvisioningService,

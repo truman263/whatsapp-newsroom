@@ -35,7 +35,7 @@ describe("DraftPreparation Round 6B.2 boundaries", () => {
     expect(inbound).toContain("DraftPreparationService");
   });
 
-  it("gates done by cutover and does not enable revise or approve controls", () => {
+  it("gates done and revise by cutover and does not enable approve controls", () => {
     const processor = readFileSync(
       resolve(
         process.cwd(),
@@ -46,9 +46,11 @@ describe("DraftPreparation Round 6B.2 boundaries", () => {
     expect(processor).toContain(
       'command === "newsroom:v1:story:done" || command === "/done"',
     );
+    expect(processor).toContain(
+      'command === "newsroom:v1:story:revise" || command === "/revise"',
+    );
     expect(processor).toContain('return ignored("CONTROL_NOT_ENABLED")');
     expect(processor).toContain("round6DoneEnabled");
-    expect(processor).not.toContain('"/revise"');
     expect(processor).not.toContain('"/approve"');
   });
 });

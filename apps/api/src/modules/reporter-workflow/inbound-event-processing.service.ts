@@ -18,6 +18,10 @@ import {
 import { ReporterAuthorizationService } from "./reporter-authorization.service";
 import { ReporterWorkflowError } from "./reporter-workflow.errors";
 import { Round6FinalisationService } from "./round6-finalisation.service";
+import {
+  Round6RevisionError,
+  Round6RevisionService,
+} from "./round6-revision.service";
 import type {
   EventClaimResult,
   EventProcessingResult,
@@ -51,6 +55,7 @@ export class InboundEventProcessingService {
     private readonly config?: ConfigService<ApplicationConfiguration, true>,
     @Optional() private readonly draftPreparations?: DraftPreparationService,
     @Optional() private readonly round6?: Round6FinalisationService,
+    @Optional() private readonly revisions?: Round6RevisionService,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -269,6 +274,34 @@ export class InboundEventProcessingService {
                 | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
                 | "STORY_FINALISATION_CONFLICT";
               return { outcome: "IGNORED", reason };
+            }
+            throw error;
+          }
+        }
+        if (storyResult.outcome === "REVISION_INTENT") {
+          if (!this.revisions)
+            throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
+          try {
+            const revised = await this.revisions.reviseInTransaction(tx, {
+              inboundEventId: event.id,
+              reporterId: authorization.reporterId,
+              conversationId: conversation.id,
+              storyId: storyResult.storyId,
+              expectedStoryVersion: expectedStoryVersion!,
+            });
+            return { outcome: "PROCESSED", ...revised };
+          } catch (error) {
+            if (error instanceof Round6RevisionError) {
+              await tx.inboundEvent.update({
+                where: { id: event.id },
+                data: {
+                  processingStatus: InboundProcessingStatus.IGNORED,
+                  processedAt: new Date(),
+                  lastErrorCode: error.code,
+                  lastErrorMessage: null,
+                },
+              });
+              return { outcome: "IGNORED", reason: error.code };
             }
             throw error;
           }

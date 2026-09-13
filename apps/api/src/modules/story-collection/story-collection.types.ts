@@ -33,6 +33,7 @@ export type StoryProcessInput = {
 export type StoryProcessResult =
   | { outcome: "PROCESSED" }
   | { outcome: "FINALISATION_INTENT"; storyId: string }
+  | { outcome: "REVISION_INTENT"; storyId: string }
   | {
       outcome: "MEDIA_INTENT";
       mediaId: string;

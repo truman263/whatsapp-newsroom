@@ -52,7 +52,8 @@ export type EventProcessingResult =
         | StoryIgnoredReason
         | "COMPLETENESS_NOT_SATISFIED"
         | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
-        | "STORY_FINALISATION_CONFLICT";
+        | "STORY_FINALISATION_CONFLICT"
+        | "STORY_REVISION_CONFLICT";
     }
   | { outcome: "FAILED"; reason: string }
   | { outcome: "RETRY_REQUIRED"; reason: string }

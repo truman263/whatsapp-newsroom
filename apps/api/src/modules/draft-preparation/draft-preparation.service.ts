@@ -118,6 +118,22 @@ export class DraftPreparationService {
       story.version !== input.expectedStoryVersion
     )
       throw new DraftPreparationError("STORY_FINALISATION_CONFLICT");
+    const supersededAuthority = await tx.draftPreparation.findFirst({
+      where: {
+        storyId: story.id,
+        status: DraftPreparationStatus.SUPERSEDED,
+        storyVersion: { lt: story.version },
+        wordpressPostId: story.wordpressPostId,
+        wordpressAppliedVersion: { not: null },
+        approvalPromptOutboundMessageId: { not: null },
+      },
+      orderBy: { storyVersion: "desc" },
+      select: { wordpressAppliedVersion: true },
+    });
+    const retainedMediaAuthority =
+      !!story.wordpressPostId &&
+      !!supersededAuthority?.wordpressAppliedVersion &&
+      VERSION.test(supersededAuthority.wordpressAppliedVersion);
     const incomplete =
       !story.headline?.trim() ||
       !story.body?.trim() ||
@@ -125,13 +141,19 @@ export class DraftPreparationService {
       story.categories.length === 0 ||
       story.media.some(
         (item) =>
-          item.status !== MediaProcessingStatus.FETCHED ||
           !item.mimeType ||
           !APPROVED_MIME.has(item.mimeType) ||
           item.fileSizeBytes === null ||
           item.fileSizeBytes <= 0n ||
           !item.sha256 ||
-          !SHA256.test(item.sha256),
+          !SHA256.test(item.sha256) ||
+          (item.status !== MediaProcessingStatus.FETCHED &&
+            !(
+              item.status === MediaProcessingStatus.UPLOADED &&
+              retainedMediaAuthority &&
+              item.wordpressMediaId !== null &&
+              item.wordpressMediaId > 0n
+            )),
       );
     if (incomplete) {
       await this.audit(tx, "story_finalisation_rejected_incomplete", input, {

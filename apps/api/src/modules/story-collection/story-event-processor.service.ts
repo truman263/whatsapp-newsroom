@@ -52,6 +52,21 @@ export class StoryEventProcessor {
         ? { outcome: "FINALISATION_INTENT", storyId: current.currentStoryId }
         : ignored("TEXT_NOT_ACCEPTED_IN_STATE");
     }
+    if (command === "newsroom:v1:story:revise" || command === "/revise") {
+      if (!input.round6DoneEnabled) return ignored("CONTROL_NOT_ENABLED");
+      if (
+        input.conversationState !== ConversationState.AWAITING_APPROVAL ||
+        input.expectedStoryVersion === null
+      )
+        return ignored("TEXT_NOT_ACCEPTED_IN_STATE");
+      const current = await tx.conversation.findFirst({
+        where: { id: input.conversationId, reporterId: input.reporterId },
+        select: { currentStoryId: true },
+      });
+      return current?.currentStoryId
+        ? { outcome: "REVISION_INTENT", storyId: current.currentStoryId }
+        : ignored("TEXT_NOT_ACCEPTED_IN_STATE");
+    }
     await tx.$queryRaw`
       SELECT "id" FROM "Conversation"
       WHERE "id" = ${input.conversationId}::uuid AND "reporterId" = ${input.reporterId}::uuid
