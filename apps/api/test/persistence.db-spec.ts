@@ -181,15 +181,6 @@ describe("PostgreSQL persistence contract", () => {
     });
     const categoryIds = categories.map(({ id }) => id);
 
-    await prisma.approval.deleteMany({
-      where: {
-        OR: [
-          { reporterId: { in: reporterIds } },
-          { storyId: { in: storyIds } },
-          { inboundEventId: { in: inboundIds } },
-        ],
-      },
-    });
     await prisma.auditLog.deleteMany({
       where: {
         OR: [
@@ -201,6 +192,15 @@ describe("PostgreSQL persistence contract", () => {
     });
     await prisma.publishAttempt.deleteMany({
       where: { storyId: { in: storyIds } },
+    });
+    await prisma.approval.deleteMany({
+      where: {
+        OR: [
+          { reporterId: { in: reporterIds } },
+          { storyId: { in: storyIds } },
+          { inboundEventId: { in: inboundIds } },
+        ],
+      },
     });
     await prisma.storyCategory.deleteMany({
       where: {
@@ -367,14 +367,14 @@ describe("PostgreSQL persistence contract", () => {
       "PUBLISH",
     ]);
     expect(Number(constraints.find(({ type }) => type === "f")?.count)).toBe(
-      20,
+      21,
     );
     expect(Number(constraints.find(({ type }) => type === "c")?.count)).toBe(
-      13,
+      14,
     );
     expect(
       Number(indexes.find(({ unique_index }) => unique_index)?.count),
-    ).toBe(22);
+    ).toBe(23);
     expect(
       Number(indexes.find(({ unique_index }) => !unique_index)?.count),
     ).toBe(32);
@@ -923,7 +923,6 @@ describe("PostgreSQL persistence contract", () => {
     for (const operation of [
       PublishOperation.CREATE_DRAFT,
       PublishOperation.SYNC_DRAFT,
-      PublishOperation.PUBLISH,
     ]) {
       await prisma.publishAttempt.create({
         data: {
@@ -934,6 +933,31 @@ describe("PostgreSQL persistence contract", () => {
         },
       });
     }
+    const inbound = await createInbound("publish-authority", reporter.id);
+    const preparation = await createPreparation(
+      story.id,
+      inbound.id,
+      "publish-authority",
+    );
+    const approval = await prisma.approval.create({
+      data: {
+        storyId: story.id,
+        reporterId: reporter.id,
+        inboundEventId: inbound.id,
+        draftPreparationId: preparation.id,
+        storyVersion: preparation.storyVersion,
+        wordpressAppliedVersion: "d".repeat(64),
+      },
+    });
+    await prisma.publishAttempt.create({
+      data: {
+        storyId: story.id,
+        operation: PublishOperation.PUBLISH,
+        attemptNumber: 1,
+        idempotencyKey: correlation("publish-PUBLISH"),
+        approvalId: approval.id,
+      },
+    });
     await expectPrismaError(
       prisma.publishAttempt.create({
         data: {
@@ -941,6 +965,7 @@ describe("PostgreSQL persistence contract", () => {
           operation: PublishOperation.PUBLISH,
           attemptNumber: 1,
           idempotencyKey: correlation("publish-CREATE_DRAFT"),
+          approvalId: approval.id,
         },
       }),
       "P2002",
@@ -960,7 +985,7 @@ describe("PostgreSQL persistence contract", () => {
       prisma.publishAttempt.create({
         data: {
           storyId: story.id,
-          operation: PublishOperation.PUBLISH,
+          operation: PublishOperation.CREATE_DRAFT,
           attemptNumber: 0,
           idempotencyKey: correlation("publish-invalid"),
         },
@@ -1107,7 +1132,7 @@ describe("PostgreSQL persistence contract", () => {
       approvalInbound.id,
       "restrict-approval",
     );
-    await prisma.approval.create({
+    const approval = await prisma.approval.create({
       data: {
         storyId: approvalStory.id,
         reporterId: reporter.id,
@@ -1133,6 +1158,7 @@ describe("PostgreSQL persistence contract", () => {
         operation: PublishOperation.PUBLISH,
         attemptNumber: 1,
         idempotencyKey: correlation("restrict-publish"),
+        approvalId: approval.id,
       },
     });
     await expectPrismaError(

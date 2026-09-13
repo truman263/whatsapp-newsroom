@@ -34,6 +34,7 @@ export interface ApplicationConfiguration {
   };
   preview: { ttlSeconds: number; publicOrigin: string; hmacSecret: string };
   round6: { controlCutoverAt: Date };
+  round7: { controlCutoverAt: Date };
 }
 
 export default function configuration(): ApplicationConfiguration {
@@ -80,5 +81,6 @@ export default function configuration(): ApplicationConfiguration {
       hmacSecret: environment.NEWSROOM_PREVIEW_HMAC_SECRET,
     },
     round6: { controlCutoverAt: environment.ROUND6_CONTROL_CUTOVER_AT },
+    round7: { controlCutoverAt: environment.ROUND7_CONTROL_CUTOVER_AT },
   };
 }

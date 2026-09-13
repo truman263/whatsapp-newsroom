@@ -1,5 +1,28 @@
 import { validateEnvironment } from "./env.schema";
 
+function completeNonTestEnvironment(
+  nodeEnvironment: "development" | "production",
+): NodeJS.ProcessEnv {
+  return {
+    NODE_ENV: nodeEnvironment,
+    DATABASE_URL: "postgresql://test:test@localhost:5432/newsroom_test",
+    WHATSAPP_ACCESS_TOKEN: "test-access-token",
+    WHATSAPP_PHONE_NUMBER_ID: "123456789",
+    WHATSAPP_VERIFY_TOKEN: "test-verify-token",
+    WHATSAPP_APP_SECRET: "test-app-secret",
+    WORDPRESS_BASE_URL: "https://wordpress.test",
+    WORDPRESS_DRAFT_HMAC_KEY_ID: "test-draft-key",
+    WORDPRESS_DRAFT_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    WORDPRESS_MEDIA_HMAC_KEY_ID: "test-media-key",
+    WORDPRESS_MEDIA_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    NEWSROOM_PREVIEW_PUBLIC_ORIGIN: "https://newsroom.test",
+    NEWSROOM_PREVIEW_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    WHATSAPP_GRAPH_API_VERSION: "v0.0",
+    ROUND6_CONTROL_CUTOVER_AT: "2026-09-13T16:00:00.000Z",
+    ROUND7_CONTROL_CUTOVER_AT: "2026-09-13T17:00:00.000Z",
+  };
+}
+
 describe("environment validation", () => {
   it("fails fast when production service configuration is missing", () => {
     expect(() => validateEnvironment({ NODE_ENV: "production" })).toThrow(
@@ -26,6 +49,7 @@ describe("environment validation", () => {
       WHATSAPP_GRAPH_API_VERSION: "v0.0",
       WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: 5000,
       ROUND6_CONTROL_CUTOVER_AT: new Date("9999-12-31T23:59:59.999Z"),
+      ROUND7_CONTROL_CUTOVER_AT: new Date("9999-12-31T23:59:59.999Z"),
     });
   });
 
@@ -69,6 +93,50 @@ describe("environment validation", () => {
           WHATSAPP_GRAPH_API_VERSION: version,
         }),
       ).toThrow("Environment validation failed");
+  });
+
+  it("requires and parses the canonical Round 7 cutover", () => {
+    expect(
+      validateEnvironment({ NODE_ENV: "test" }).ROUND7_CONTROL_CUTOVER_AT,
+    ).toEqual(new Date("9999-12-31T23:59:59.999Z"));
+
+    for (const nodeEnvironment of ["development", "production"] as const) {
+      const complete = completeNonTestEnvironment(nodeEnvironment);
+      expect(validateEnvironment(complete)).toMatchObject({
+        NODE_ENV: nodeEnvironment,
+        ROUND7_CONTROL_CUTOVER_AT: new Date("2026-09-13T17:00:00.000Z"),
+      });
+      const withoutRound7 = { ...complete };
+      delete withoutRound7.ROUND7_CONTROL_CUTOVER_AT;
+      expect(() => validateEnvironment(withoutRound7)).toThrow(
+        "ROUND7_CONTROL_CUTOVER_AT",
+      );
+    }
+
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        ROUND7_CONTROL_CUTOVER_AT: "2026-09-13T17:00:00.000Z",
+      }).ROUND7_CONTROL_CUTOVER_AT,
+    ).toEqual(new Date("2026-09-13T17:00:00.000Z"));
+
+    for (const value of [
+      "2026-09-13T17:00:00Z",
+      "2026-09-13T19:00:00.000+02:00",
+      "2026-09-13T17:00:00.00Z",
+      "2026-02-30T17:00:00.000Z",
+      "2026-09-13T24:00:00.000Z",
+      " 2026-09-13T17:00:00.000Z",
+      "2026-09-13T17:00:00.000Z ",
+      "arbitrary text",
+    ]) {
+      expect(() =>
+        validateEnvironment({
+          NODE_ENV: "test",
+          ROUND7_CONTROL_CUTOVER_AT: value,
+        }),
+      ).toThrow("Environment validation failed");
+    }
   });
 
   it("validates preview TTL boundaries", () => {

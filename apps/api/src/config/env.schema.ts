@@ -28,6 +28,7 @@ export interface Environment {
   WHATSAPP_GRAPH_API_VERSION: string;
   WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: number;
   ROUND6_CONTROL_CUTOVER_AT: Date;
+  ROUND7_CONTROL_CUTOVER_AT: Date;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -256,6 +257,20 @@ export const environmentSchema = Joi.object<Environment>({
       then: Joi.optional().default("9999-12-31T23:59:59.999Z"),
       otherwise: Joi.required(),
     }),
+  ROUND7_CONTROL_CUTOVER_AT: Joi.string()
+    .custom((value: string, helpers) => {
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value))
+        return helpers.error("any.invalid");
+      const date = new Date(value);
+      return !Number.isNaN(date.getTime()) && date.toISOString() === value
+        ? date
+        : helpers.error("any.invalid");
+    })
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default("9999-12-31T23:59:59.999Z"),
+      otherwise: Joi.required(),
+    }),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
@@ -280,13 +295,23 @@ export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
     );
   }
 
-  const cutover: unknown = Reflect.get(
+  const round6Cutover: unknown = Reflect.get(
     validation.value,
     "ROUND6_CONTROL_CUTOVER_AT",
+  );
+  const round7Cutover: unknown = Reflect.get(
+    validation.value,
+    "ROUND7_CONTROL_CUTOVER_AT",
   );
   return {
     ...validation.value,
     ROUND6_CONTROL_CUTOVER_AT:
-      cutover instanceof Date ? cutover : new Date(String(cutover)),
+      round6Cutover instanceof Date
+        ? round6Cutover
+        : new Date(String(round6Cutover)),
+    ROUND7_CONTROL_CUTOVER_AT:
+      round7Cutover instanceof Date
+        ? round7Cutover
+        : new Date(String(round7Cutover)),
   };
 }

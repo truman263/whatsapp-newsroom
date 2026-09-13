@@ -306,6 +306,7 @@ model Approval {
   reporter                Reporter         @relation(fields: [reporterId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   inboundEvent            InboundEvent     @relation(fields: [inboundEventId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   draftPreparation        DraftPreparation @relation(fields: [draftPreparationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  publishAttempt          PublishAttempt?  @relation("ApprovalPublishAttempt")
 
   @@index([reporterId])
   @@index([storyVersion])
@@ -356,6 +357,8 @@ model PublishAttempt {
   createdAt       DateTime             @default(now()) @db.Timestamptz(3)
   updatedAt       DateTime             @updatedAt @db.Timestamptz(3)
   story           Story                @relation(fields: [storyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  approvalId      String?              @unique @db.Uuid
+  approval        Approval?            @relation("ApprovalPublishAttempt", fields: [approvalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([storyId, operation, attemptNumber])
   @@index([storyId, createdAt])
