@@ -265,6 +265,14 @@ async function main() {
       "apps/api/src/modules/draft-preparation/draft-preparation.service.ts",
     ),
   );
+  const { ConversationProvisioningService } = require(resolve(repo, "apps/api/src/modules/reporter-workflow/conversation-provisioning.service.ts"));
+  const { ConversationStateMachineService } = require(resolve(repo, "apps/api/src/modules/reporter-workflow/conversation-state-machine.service.ts"));
+  const { InboundEventProcessingService } = require(resolve(repo, "apps/api/src/modules/reporter-workflow/inbound-event-processing.service.ts"));
+  const { ReporterAuthorizationService } = require(resolve(repo, "apps/api/src/modules/reporter-workflow/reporter-authorization.service.ts"));
+  const { Round6FinalisationService } = require(resolve(repo, "apps/api/src/modules/reporter-workflow/round6-finalisation.service.ts"));
+  const { StoredWhatsappEventParser } = require(resolve(repo, "apps/api/src/modules/story-collection/stored-whatsapp-event.parser.ts"));
+  const { StoryEventProcessor } = require(resolve(repo, "apps/api/src/modules/story-collection/story-event-processor.service.ts"));
+  const { ApprovalPromptService } = require(resolve(repo, "apps/api/src/modules/whatsapp-outbound/approval-prompt.service.ts"));
   const { WordPressDraftClient } = require(
     resolve(
       repo,
@@ -319,12 +327,36 @@ async function main() {
       ),
     read: (key) => Promise.resolve(stored.get(key)),
   };
+  const runtimeConfig = new ConfigService({
+    preview: { ttlSeconds: 86400 },
+    round6: { controlCutoverAt: new Date(0) },
+  });
   const service = new DraftPreparationService(
     prisma,
-    new ConfigService({ preview: { ttlSeconds: 86400 } }),
+    runtimeConfig,
     store,
     drafts,
     media,
+  );
+  const stateMachine = new ConversationStateMachineService(prisma);
+  const dispatched = [];
+  const round6 = new Round6FinalisationService(
+    prisma,
+    service,
+    new ApprovalPromptService(),
+    { dispatchOne: (id) => { dispatched.push(id); return Promise.resolve("SENT"); } },
+    stateMachine,
+  );
+  const inbound = new InboundEventProcessingService(
+    prisma,
+    new ReporterAuthorizationService(),
+    new ConversationProvisioningService(),
+    new StoredWhatsappEventParser(),
+    new StoryEventProcessor(stateMachine),
+    undefined,
+    runtimeConfig,
+    service,
+    round6,
   );
   const category = await prisma.editorialCategory.create({
     data: {
@@ -337,8 +369,9 @@ async function main() {
   async function seed(mediaCount) {
     const reporter = await prisma.reporter.create({
       data: {
-        phoneNumber: `+263${randomUUID().replace(/-/g, "").slice(0, 8)}`,
+        phoneNumber: `+2637${String(Date.now()).slice(-7)}${mediaCount}`,
         displayName: "Proof",
+        editorialByline: "Reporter Example",
         status: enums.ReporterStatus.ACTIVE,
       },
     });
@@ -358,16 +391,27 @@ async function main() {
         currentStoryId: story.id,
       },
     });
+    const providerMessageId = randomUUID();
+    const occurredAt = new Date(Math.floor(Date.now() / 1000) * 1000);
     const event = await prisma.inboundEvent.create({
       data: {
         provider: enums.Provider.WHATSAPP,
-        providerMessageId: randomUUID(),
-        reporterId: reporter.id,
+        providerMessageId,
         senderPhone: reporter.phoneNumber,
         senderIngestSequence: BigInt(Date.now()) + BigInt(mediaCount),
         eventType: enums.InboundEventType.TEXT,
-        processingStatus: enums.InboundProcessingStatus.PROCESSING,
-        rawPayload: {},
+        processingStatus: enums.InboundProcessingStatus.RECEIVED,
+        receivedAt: new Date(),
+        providerOccurredAt: occurredAt,
+        rawPayload: {
+          message: {
+            id: providerMessageId,
+            from: reporter.phoneNumber.slice(1),
+            timestamp: String(Math.floor(occurredAt.getTime() / 1000)),
+            type: "text",
+            text: { body: "/done" },
+          },
+        },
       },
     });
     await prisma.storyCategory.create({
@@ -394,35 +438,30 @@ async function main() {
     }
     return { reporter, story, conversation, event };
   }
+  const baselinePostCount = Number(wp(["post", "list", "--post_type=post", "--format=count"]));
+  let completedPathCount = 0;
   for (const mediaCount of [0, 2]) {
     const value = await seed(mediaCount);
-    const preparation = await prisma.$transaction((tx) =>
-      service.finalizeInTransaction(tx, {
-        inboundEventId: value.event.id,
-        reporterId: value.reporter.id,
-        conversationId: value.conversation.id,
-        storyId: value.story.id,
-        expectedStoryVersion: value.story.version,
-      }),
-    );
-    const result = await service.prepare(preparation.preparationId);
+    const result = await inbound.process(value.event.id);
     assert(
-      result.outcome === "PREPARED",
-      `saga did not prepare (${result.outcome}:${result.errorCode ?? "none"}; ${JSON.stringify(responseStatuses.slice(-5))})`,
+      result.outcome === "PROCESSED",
+      `full inbound saga did not complete (${result.outcome}:${result.reason ?? "none"}; ${JSON.stringify(responseStatuses.slice(-5))})`,
     );
     const final = await prisma.story.findUnique({
       where: { id: value.story.id },
       include: {
         draftPreparations: true,
         publishAttempts: true,
+        outboundMessages: true,
         media: true,
         activeInConversation: true,
       },
     });
     assert(
-      final.status === "DRAFT_CREATED" &&
-        final.activeInConversation.state === "COLLECTING_MEDIA" &&
-        final.draftPreparations[0].status === "ACTIVE",
+      final.status === "AWAITING_APPROVAL" &&
+        final.activeInConversation.state === "AWAITING_APPROVAL" &&
+        final.draftPreparations[0].status === "READY_FOR_APPROVAL" &&
+        final.outboundMessages.length === 1,
       "local posture mismatch",
     );
     assert(
@@ -434,15 +473,30 @@ async function main() {
     const state = await drafts.getDraftState(final.wordpressDraftKey);
     assert(
       state.status === "draft" &&
+        state.title === "Proof headline" &&
+        state.content === "Proof body" &&
         state.editorial_byline === "Reporter Example" &&
+        state.categories.length === 1 &&
+        state.categories[0] === categoryId &&
+        state.author_id === 3 &&
         state.featured_media_key === (final.media[0]?.id ?? null),
       "WordPress state mismatch",
     );
+    assert(
+      (await prisma.approval.count({ where: { storyId: value.story.id } })) === 0 &&
+        (await prisma.publishAttempt.count({ where: { storyId: value.story.id, operation: enums.PublishOperation.PUBLISH } })) === 0 &&
+        final.publishAttempts.every((attempt) => attempt.operation !== "PUBLISH") &&
+        dispatched.filter((id) => id === final.outboundMessages[0].id).length === 1,
+      "approval/publish/fake-Meta posture mismatch",
+    );
+    completedPathCount += 1;
+    const postCount = Number(wp(["post", "list", "--post_type=post", "--format=count"]));
+    assert(postCount === baselinePostCount + completedPathCount, "unexpected WordPress post count");
     pass(
       mediaCount === 0
-        ? "zero_media_live_orchestration"
-        : "multi_media_live_orchestration",
-      { media: mediaCount, post_id: state.post_id, status: state.status },
+        ? "zero_media_full_inbound_orchestration"
+        : "multi_media_full_inbound_orchestration",
+      { media: mediaCount, post_id: state.post_id, post_count: postCount, status: state.status, author_id: state.author_id, category_id: state.categories[0], featured_media_key: state.featured_media_key },
     );
   }
   evidence.runtime = {

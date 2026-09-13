@@ -46,7 +46,13 @@ export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }
   | {
       outcome: "IGNORED";
-      reason: "REPORTER_UNKNOWN" | "REPORTER_INACTIVE" | StoryIgnoredReason;
+      reason:
+        | "REPORTER_UNKNOWN"
+        | "REPORTER_INACTIVE"
+        | StoryIgnoredReason
+        | "COMPLETENESS_NOT_SATISFIED"
+        | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
+        | "STORY_FINALISATION_CONFLICT";
     }
   | { outcome: "FAILED"; reason: string }
   | { outcome: "RETRY_REQUIRED"; reason: string }

@@ -24,7 +24,7 @@ function body(id = "wamid.e2e"): Record<string, unknown> {
           {
             field: "messages",
             value: {
-              metadata: { phone_number_id: "test-phone-number-id" },
+              metadata: { phone_number_id: "123456789" },
               messages: [
                 {
                   id,
@@ -56,7 +56,7 @@ describe("WhatsApp webhook (e2e)", () => {
     process.env.NODE_ENV = "test";
     process.env.WHATSAPP_APP_SECRET = secret;
     process.env.WHATSAPP_VERIFY_TOKEN = verifyToken;
-    process.env.WHATSAPP_PHONE_NUMBER_ID = "test-phone-number-id";
+    process.env.WHATSAPP_PHONE_NUMBER_ID = "123456789";
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(PrismaService)
       .useValue({

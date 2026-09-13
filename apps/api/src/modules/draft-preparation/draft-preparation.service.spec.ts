@@ -19,7 +19,7 @@ describe("DraftPreparation Round 6B.2 boundaries", () => {
     }
   });
 
-  it("does not wire DraftPreparationModule into operational application flow", () => {
+  it("keeps DraftPreparation out of AppModule while allowing the Round 6B.4 workflow integration", () => {
     const app = readFileSync(
       resolve(process.cwd(), "src/app.module.ts"),
       "utf8",
@@ -32,10 +32,10 @@ describe("DraftPreparation Round 6B.2 boundaries", () => {
       "utf8",
     );
     expect(app).not.toContain("DraftPreparationModule");
-    expect(inbound).not.toContain("DraftPreparationService");
+    expect(inbound).toContain("DraftPreparationService");
   });
 
-  it("leaves done disabled and does not enable revise or approve controls", () => {
+  it("gates done by cutover and does not enable revise or approve controls", () => {
     const processor = readFileSync(
       resolve(
         process.cwd(),
@@ -47,6 +47,7 @@ describe("DraftPreparation Round 6B.2 boundaries", () => {
       'command === "newsroom:v1:story:done" || command === "/done"',
     );
     expect(processor).toContain('return ignored("CONTROL_NOT_ENABLED")');
+    expect(processor).toContain("round6DoneEnabled");
     expect(processor).not.toContain('"/revise"');
     expect(processor).not.toContain('"/approve"');
   });

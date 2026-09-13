@@ -1,6 +1,10 @@
 import { Injectable, Optional } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { AuditActorType, InboundProcessingStatus } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
+import type { ApplicationConfiguration } from "../../config/configuration";
+import { DraftPreparationError } from "../draft-preparation/draft-preparation.errors";
+import { DraftPreparationService } from "../draft-preparation/draft-preparation.service";
 import { MediaStagingService } from "../media-staging/media-staging.service";
 import type { MediaAuthority } from "../media-staging/media-staging.types";
 import { StoredWhatsappEventParser } from "../story-collection/stored-whatsapp-event.parser";
@@ -13,6 +17,7 @@ import {
 } from "./reporter-workflow.audit";
 import { ReporterAuthorizationService } from "./reporter-authorization.service";
 import { ReporterWorkflowError } from "./reporter-workflow.errors";
+import { Round6FinalisationService } from "./round6-finalisation.service";
 import type {
   EventClaimResult,
   EventProcessingResult,
@@ -27,6 +32,10 @@ type ProcessingPhase =
       authority: MediaAuthority;
       reporterId: string;
       conversationId: string;
+    }
+  | {
+      outcome: "FINALISATION_INTENT";
+      preparationId: string;
     };
 
 @Injectable()
@@ -38,6 +47,10 @@ export class InboundEventProcessingService {
     private readonly storedEvents: StoredWhatsappEventParser,
     private readonly stories: StoryEventProcessor,
     @Optional() private readonly mediaStaging?: MediaStagingService,
+    @Optional()
+    private readonly config?: ConfigService<ApplicationConfiguration, true>,
+    @Optional() private readonly draftPreparations?: DraftPreparationService,
+    @Optional() private readonly round6?: Round6FinalisationService,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -80,173 +93,249 @@ export class InboundEventProcessingService {
 
   async process(eventId: string): Promise<EventProcessingResult> {
     const claim = await this.claim(eventId);
-    if (claim.outcome !== "CLAIMED") return claim;
-    const phase = await this.prisma.$transaction<ProcessingPhase>(async (tx) => {
-      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+    if (claim.outcome !== "CLAIMED") {
+      if (claim.outcome !== "NOT_CLAIMED") return claim;
+      if (!this.round6) return claim;
+      const existing = await this.round6.preparationForProcessingEvent(eventId);
+      if (!existing) return claim;
+      const event = await this.prisma.inboundEvent.findUnique({
+        where: { id: eventId },
+        select: { processingStatus: true },
+      });
+      if (event?.processingStatus !== InboundProcessingStatus.PROCESSING)
+        return claim;
+      return this.round6.resume(existing.id);
+    }
+    const phase = await this.prisma.$transaction<ProcessingPhase>(
+      async (tx) => {
+        const locked = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT "id" FROM "InboundEvent" WHERE "id" = ${eventId}::uuid FOR UPDATE
       `;
-      if (!locked[0])
-        throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
-      const event = await tx.inboundEvent.findUniqueOrThrow({
-        where: { id: eventId },
-        select: {
-          id: true,
-          senderPhone: true,
-          reporterId: true,
-          processingStatus: true,
-          providerMessageId: true,
-          eventType: true,
-          rawPayload: true,
-          providerOccurredAt: true,
-        },
-      });
-      if (event.processingStatus !== InboundProcessingStatus.PROCESSING)
-        throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
-      const authorization = await this.authorization.authorizeInTransaction(
-        tx,
-        event.senderPhone,
-      );
-      if (authorization.outcome !== "ACTIVE") {
-        if (event.reporterId !== null)
-          throw new ReporterWorkflowError("INBOUND_EVENT_ASSOCIATION_CONFLICT");
-        const reason =
-          authorization.outcome === "UNKNOWN"
-            ? IGNORED_REASON.UNKNOWN
-            : IGNORED_REASON.INACTIVE;
-        const now = new Date();
-        await tx.auditLog.create({
-          data: {
-            eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_IGNORED,
-            actorType: AuditActorType.SYSTEM,
-            inboundEventId: event.id,
-            entityType: "InboundEvent",
-            entityId: event.id,
-            metadata: { reason },
+        if (!locked[0])
+          throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
+        const event = await tx.inboundEvent.findUniqueOrThrow({
+          where: { id: eventId },
+          select: {
+            id: true,
+            senderPhone: true,
+            reporterId: true,
+            processingStatus: true,
+            providerMessageId: true,
+            eventType: true,
+            rawPayload: true,
+            providerOccurredAt: true,
+            receivedAt: true,
           },
         });
-        await tx.inboundEvent.update({
-          where: { id: event.id },
-          data: {
-            processingStatus: InboundProcessingStatus.IGNORED,
-            processedAt: now,
-            lastErrorCode: reason,
-            lastErrorMessage: null,
-          },
-        });
-        return { outcome: "IGNORED", reason };
-      }
-      if (
-        event.reporterId !== null &&
-        event.reporterId !== authorization.reporterId
-      )
-        throw new ReporterWorkflowError("INBOUND_EVENT_ASSOCIATION_CONFLICT");
-      await tx.inboundEvent.update({
-        where: { id: event.id },
-        data: { reporterId: authorization.reporterId },
-      });
-      let parsed;
-      try {
-        parsed = this.storedEvents.parse({
-          providerMessageId: event.providerMessageId,
-          senderPhone: event.senderPhone,
-          eventType: event.eventType,
-          providerOccurredAt: event.providerOccurredAt,
-          rawPayload: event.rawPayload,
-        });
-      } catch (error: unknown) {
-        if (
-          error instanceof StoryCollectionError &&
-          error.code === "MALFORMED_STORED_EVENT"
-        ) {
+        if (event.processingStatus !== InboundProcessingStatus.PROCESSING)
+          throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
+        const authorization = await this.authorization.authorizeInTransaction(
+          tx,
+          event.senderPhone,
+        );
+        if (authorization.outcome !== "ACTIVE") {
+          if (event.reporterId !== null)
+            throw new ReporterWorkflowError(
+              "INBOUND_EVENT_ASSOCIATION_CONFLICT",
+            );
+          const reason =
+            authorization.outcome === "UNKNOWN"
+              ? IGNORED_REASON.UNKNOWN
+              : IGNORED_REASON.INACTIVE;
+          const now = new Date();
+          await tx.auditLog.create({
+            data: {
+              eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_IGNORED,
+              actorType: AuditActorType.SYSTEM,
+              inboundEventId: event.id,
+              entityType: "InboundEvent",
+              entityId: event.id,
+              metadata: { reason },
+            },
+          });
           await tx.inboundEvent.update({
             where: { id: event.id },
             data: {
-              processingStatus: InboundProcessingStatus.FAILED,
-              processedAt: new Date(),
-              lastErrorCode: error.code,
+              processingStatus: InboundProcessingStatus.IGNORED,
+              processedAt: now,
+              lastErrorCode: reason,
               lastErrorMessage: null,
             },
           });
-          return { outcome: "FAILED", reason: error.code };
+          return { outcome: "IGNORED", reason };
         }
-        throw error;
-      }
-      const conversation = await this.conversations.getOrCreateInTransaction(
-        tx,
-        authorization.reporterId,
-      );
-      const expectedStoryVersion = conversation.currentStoryId
-        ? (
-            await tx.story.findUniqueOrThrow({
-              where: { id: conversation.currentStoryId },
-              select: { version: true },
-            })
-          ).version
-        : null;
-      const storyResult = await this.stories.process(tx, {
-        eventId: event.id,
-        reporterId: authorization.reporterId,
-        conversationId: conversation.id,
-        conversationState: conversation.state,
-        conversationVersion: conversation.version,
-        expectedStoryVersion,
-        parsed,
-      });
-      if (storyResult.outcome === "MEDIA_INTENT") {
-        return {
-          ...storyResult,
+        if (
+          event.reporterId !== null &&
+          event.reporterId !== authorization.reporterId
+        )
+          throw new ReporterWorkflowError("INBOUND_EVENT_ASSOCIATION_CONFLICT");
+        await tx.inboundEvent.update({
+          where: { id: event.id },
+          data: { reporterId: authorization.reporterId },
+        });
+        let parsed;
+        try {
+          parsed = this.storedEvents.parse({
+            providerMessageId: event.providerMessageId,
+            senderPhone: event.senderPhone,
+            eventType: event.eventType,
+            providerOccurredAt: event.providerOccurredAt,
+            rawPayload: event.rawPayload,
+          });
+        } catch (error: unknown) {
+          if (
+            error instanceof StoryCollectionError &&
+            error.code === "MALFORMED_STORED_EVENT"
+          ) {
+            await tx.inboundEvent.update({
+              where: { id: event.id },
+              data: {
+                processingStatus: InboundProcessingStatus.FAILED,
+                processedAt: new Date(),
+                lastErrorCode: error.code,
+                lastErrorMessage: null,
+              },
+            });
+            return { outcome: "FAILED", reason: error.code };
+          }
+          throw error;
+        }
+        const conversation = await this.conversations.getOrCreateInTransaction(
+          tx,
+          authorization.reporterId,
+        );
+        const expectedStoryVersion = conversation.currentStoryId
+          ? (
+              await tx.story.findUniqueOrThrow({
+                where: { id: conversation.currentStoryId },
+                select: { version: true },
+              })
+            ).version
+          : null;
+        const storyResult = await this.stories.process(tx, {
+          eventId: event.id,
           reporterId: authorization.reporterId,
           conversationId: conversation.id,
-        };
-      }
-      if (storyResult.outcome === "IGNORED") {
+          conversationState: conversation.state,
+          conversationVersion: conversation.version,
+          expectedStoryVersion,
+          parsed,
+          round6DoneEnabled:
+            event.receivedAt.getTime() >=
+            (
+              this.config?.get("round6.controlCutoverAt", { infer: true }) ??
+              new Date("9999-12-31T23:59:59.999Z")
+            ).getTime(),
+        });
+        if (storyResult.outcome === "FINALISATION_INTENT") {
+          if (!this.draftPreparations)
+            throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
+          try {
+            const preparation =
+              await this.draftPreparations.finalizeInTransaction(tx, {
+                inboundEventId: event.id,
+                reporterId: authorization.reporterId,
+                conversationId: conversation.id,
+                storyId: storyResult.storyId,
+                expectedStoryVersion: expectedStoryVersion!,
+              });
+            return {
+              outcome: "FINALISATION_INTENT",
+              preparationId: preparation.preparationId,
+            };
+          } catch (error) {
+            if (
+              error instanceof DraftPreparationError &&
+              [
+                "COMPLETENESS_NOT_SATISFIED",
+                "CATEGORY_SELECTION_NO_LONGER_ACTIVE",
+                "STORY_FINALISATION_CONFLICT",
+              ].includes(error.code)
+            ) {
+              await tx.inboundEvent.update({
+                where: { id: event.id },
+                data: {
+                  processingStatus: InboundProcessingStatus.IGNORED,
+                  processedAt: new Date(),
+                  lastErrorCode: error.code,
+                  lastErrorMessage: null,
+                },
+              });
+              const reason:
+                | "COMPLETENESS_NOT_SATISFIED"
+                | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
+                | "STORY_FINALISATION_CONFLICT" = error.code as
+                | "COMPLETENESS_NOT_SATISFIED"
+                | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
+                | "STORY_FINALISATION_CONFLICT";
+              return { outcome: "IGNORED", reason };
+            }
+            throw error;
+          }
+        }
+        if (storyResult.outcome === "MEDIA_INTENT") {
+          return {
+            ...storyResult,
+            reporterId: authorization.reporterId,
+            conversationId: conversation.id,
+          };
+        }
+        if (storyResult.outcome === "IGNORED") {
+          await tx.auditLog.create({
+            data: {
+              eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_IGNORED,
+              actorType: AuditActorType.REPORTER,
+              reporterId: authorization.reporterId,
+              inboundEventId: event.id,
+              entityType: "InboundEvent",
+              entityId: event.id,
+              metadata: { reason: storyResult.reason },
+            },
+          });
+          await tx.inboundEvent.update({
+            where: { id: event.id },
+            data: {
+              processingStatus: InboundProcessingStatus.IGNORED,
+              processedAt: new Date(),
+              lastErrorCode: storyResult.reason,
+              lastErrorMessage: null,
+            },
+          });
+          return { outcome: "IGNORED", reason: storyResult.reason };
+        }
         await tx.auditLog.create({
           data: {
-            eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_IGNORED,
+            eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_AUTHORIZED,
             actorType: AuditActorType.REPORTER,
             reporterId: authorization.reporterId,
             inboundEventId: event.id,
             entityType: "InboundEvent",
             entityId: event.id,
-            metadata: { reason: storyResult.reason },
           },
         });
         await tx.inboundEvent.update({
           where: { id: event.id },
           data: {
-            processingStatus: InboundProcessingStatus.IGNORED,
+            processingStatus: InboundProcessingStatus.PROCESSED,
             processedAt: new Date(),
-            lastErrorCode: storyResult.reason,
+            lastErrorCode: null,
             lastErrorMessage: null,
           },
         });
-        return { outcome: "IGNORED", reason: storyResult.reason };
-      }
-      await tx.auditLog.create({
-        data: {
-          eventType: REPORTER_WORKFLOW_AUDIT.INBOUND_EVENT_AUTHORIZED,
-          actorType: AuditActorType.REPORTER,
+        return {
+          outcome: "PROCESSED",
           reporterId: authorization.reporterId,
-          inboundEventId: event.id,
-          entityType: "InboundEvent",
-          entityId: event.id,
-        },
-      });
-      await tx.inboundEvent.update({
-        where: { id: event.id },
-        data: {
-          processingStatus: InboundProcessingStatus.PROCESSED,
-          processedAt: new Date(),
-          lastErrorCode: null,
-          lastErrorMessage: null,
-        },
-      });
-      return {
-        outcome: "PROCESSED",
-        reporterId: authorization.reporterId,
-        conversationId: conversation.id,
-      };
-    });
+          conversationId: conversation.id,
+        };
+      },
+    );
+    if (phase.outcome === "FINALISATION_INTENT")
+      return this.round6
+        ? this.round6.resume(phase.preparationId)
+        : {
+            outcome: "RETRY_REQUIRED",
+            reason: "DRAFT_PREPARATION_UNAVAILABLE",
+          };
     if (phase.outcome !== "MEDIA_INTENT") return phase;
     if (!this.mediaStaging)
       return { outcome: "RETRY_REQUIRED", reason: "MEDIA_STAGING_UNAVAILABLE" };

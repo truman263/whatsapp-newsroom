@@ -27,6 +27,7 @@ export interface Environment {
   NEWSROOM_PREVIEW_HMAC_SECRET: string;
   WHATSAPP_GRAPH_API_VERSION: string;
   WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: number;
+  ROUND6_CONTROL_CUTOVER_AT: Date;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -51,10 +52,10 @@ export const environmentSchema = Joi.object<Environment>({
       otherwise: Joi.required(),
     }),
   WHATSAPP_PHONE_NUMBER_ID: Joi.string()
-    .min(1)
+    .pattern(/^[0-9]{1,32}$/)
     .when("NODE_ENV", {
       is: "test",
-      then: Joi.optional().default("test-phone-number-id"),
+      then: Joi.optional().default("123456789"),
       otherwise: Joi.required(),
     }),
   WHATSAPP_VERIFY_TOKEN: Joi.string()
@@ -241,6 +242,20 @@ export const environmentSchema = Joi.object<Environment>({
     .min(100)
     .max(60000)
     .default(5000),
+  ROUND6_CONTROL_CUTOVER_AT: Joi.string()
+    .custom((value: string, helpers) => {
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value))
+        return helpers.error("any.invalid");
+      const date = new Date(value);
+      return !Number.isNaN(date.getTime()) && date.toISOString() === value
+        ? date
+        : helpers.error("any.invalid");
+    })
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default("9999-12-31T23:59:59.999Z"),
+      otherwise: Joi.required(),
+    }),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
@@ -265,5 +280,13 @@ export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
     );
   }
 
-  return validation.value;
+  const cutover: unknown = Reflect.get(
+    validation.value,
+    "ROUND6_CONTROL_CUTOVER_AT",
+  );
+  return {
+    ...validation.value,
+    ROUND6_CONTROL_CUTOVER_AT:
+      cutover instanceof Date ? cutover : new Date(String(cutover)),
+  };
 }

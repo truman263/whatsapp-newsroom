@@ -15,6 +15,7 @@ describe("environment validation", () => {
       PORT: 3000,
       DATABASE_URL: "postgresql://test:test@localhost:5432/newsroom_test",
       WHATSAPP_ACCESS_TOKEN: "test-access-token",
+      WHATSAPP_PHONE_NUMBER_ID: "123456789",
       WORDPRESS_BASE_URL: "https://wordpress.test",
       NEWSROOM_MEDIA_STAGING_MAX_BYTES: 500000,
       WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS: 5000,
@@ -24,7 +25,27 @@ describe("environment validation", () => {
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
       WHATSAPP_GRAPH_API_VERSION: "v0.0",
       WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: 5000,
+      ROUND6_CONTROL_CUTOVER_AT: new Date("9999-12-31T23:59:59.999Z"),
     });
+  });
+
+  it("requires a canonical Round 6 cutover outside test", () => {
+    for (const value of ["2026-09-13T00:00:00Z", "invalid"])
+      expect(() =>
+        validateEnvironment({
+          NODE_ENV: "production",
+          ROUND6_CONTROL_CUTOVER_AT: value,
+        }),
+      ).toThrow("Environment validation failed");
+    expect(() => validateEnvironment({ NODE_ENV: "production" })).toThrow(
+      "Environment validation failed",
+    );
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        ROUND6_CONTROL_CUTOVER_AT: "2026-09-13T00:00:00.000Z",
+      }).ROUND6_CONTROL_CUTOVER_AT,
+    ).toEqual(new Date("2026-09-13T00:00:00.000Z"));
   });
 
   it("validates preview and outbound security configuration", () => {

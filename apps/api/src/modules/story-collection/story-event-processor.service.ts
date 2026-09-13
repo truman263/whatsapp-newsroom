@@ -31,6 +31,27 @@ export class StoryEventProcessor {
     tx: Prisma.TransactionClient,
     input: StoryProcessInput,
   ): Promise<StoryProcessResult> {
+    const command =
+      input.parsed.kind === "TEXT"
+        ? input.parsed.text.trim()
+        : input.parsed.kind === "INTERACTIVE"
+          ? input.parsed.replyId
+          : null;
+    if (command === "newsroom:v1:story:done" || command === "/done") {
+      if (!input.round6DoneEnabled) return ignored("CONTROL_NOT_ENABLED");
+      if (
+        input.conversationState !== ConversationState.COLLECTING_MEDIA ||
+        input.expectedStoryVersion === null
+      )
+        return ignored("TEXT_NOT_ACCEPTED_IN_STATE");
+      const current = await tx.conversation.findFirst({
+        where: { id: input.conversationId, reporterId: input.reporterId },
+        select: { currentStoryId: true },
+      });
+      return current?.currentStoryId
+        ? { outcome: "FINALISATION_INTENT", storyId: current.currentStoryId }
+        : ignored("TEXT_NOT_ACCEPTED_IN_STATE");
+    }
     await tx.$queryRaw`
       SELECT "id" FROM "Conversation"
       WHERE "id" = ${input.conversationId}::uuid AND "reporterId" = ${input.reporterId}::uuid
@@ -44,13 +65,6 @@ export class StoryEventProcessor {
       conversation.version !== input.conversationVersion
     )
       throw new StoryCollectionError("STORY_DOMAIN_CONFLICT");
-    const command =
-      input.parsed.kind === "TEXT"
-        ? input.parsed.text.trim()
-        : input.parsed.kind === "INTERACTIVE"
-          ? input.parsed.replyId
-          : null;
-
     if (input.parsed.kind === "UNKNOWN")
       return ignored("UNSUPPORTED_EVENT_TYPE");
     if (
@@ -58,8 +72,6 @@ export class StoryEventProcessor {
       conversation.state !== ConversationState.COLLECTING_MEDIA
     )
       return ignored("IMAGE_NOT_ACCEPTED_IN_STATE");
-    if (command === "newsroom:v1:story:done" || command === "/done")
-      return ignored("CONTROL_NOT_ENABLED");
     if (
       input.parsed.kind === "INTERACTIVE" &&
       command !== "newsroom:v1:story:start" &&

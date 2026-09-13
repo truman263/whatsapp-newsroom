@@ -27,10 +27,12 @@ export type StoryProcessInput = {
   conversationVersion: number;
   expectedStoryVersion: number | null;
   parsed: ParsedStoredEvent;
+  round6DoneEnabled?: boolean;
 };
 
 export type StoryProcessResult =
   | { outcome: "PROCESSED" }
+  | { outcome: "FINALISATION_INTENT"; storyId: string }
   | {
       outcome: "MEDIA_INTENT";
       mediaId: string;
