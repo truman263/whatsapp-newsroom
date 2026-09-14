@@ -14,6 +14,8 @@ export interface Environment {
   WORDPRESS_REQUEST_TIMEOUT_MS: number;
   WORDPRESS_RECONCILIATION_ATTEMPTS: number;
   WORDPRESS_RECONCILIATION_DELAY_MS: number;
+  WORDPRESS_PUBLISH_HMAC_KEY_ID: string;
+  WORDPRESS_PUBLISH_HMAC_SECRET: string;
   WORDPRESS_MEDIA_HMAC_KEY_ID: string;
   WORDPRESS_MEDIA_HMAC_SECRET: string;
   WORDPRESS_MEDIA_REQUEST_TIMEOUT_MS: number;
@@ -134,6 +136,16 @@ export const environmentSchema = Joi.object<Environment>({
     .min(0)
     .max(10000)
     .default(100),
+  WORDPRESS_PUBLISH_HMAC_KEY_ID: Joi.string()
+    .pattern(/^[a-z0-9][a-z0-9._-]{0,63}$/)
+    .when("NODE_ENV", { is: "test", then: Joi.optional().default("test-publish-key"), otherwise: Joi.required() }),
+  WORDPRESS_PUBLISH_HMAC_SECRET: Joi.string()
+    .custom((value: string, helpers) => {
+      if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return helpers.error("any.invalid");
+      const decoded = Buffer.from(value, "base64url");
+      return decoded.length === 32 && decoded.toString("base64url") === value ? value : helpers.error("any.invalid");
+    })
+    .when("NODE_ENV", { is: "test", then: Joi.optional().default("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), otherwise: Joi.required() }),
   WORDPRESS_MEDIA_HMAC_KEY_ID: Joi.string()
     .pattern(/^[a-z0-9][a-z0-9._-]{0,63}$/)
     .when("NODE_ENV", {

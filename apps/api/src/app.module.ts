@@ -7,6 +7,7 @@ import { WordPressDraftModule } from "./modules/wordpress-draft/wordpress-draft.
 import { WordPressMediaModule } from "./modules/wordpress-media/wordpress-media.module";
 import { ReporterWorkflowModule } from "./modules/reporter-workflow/reporter-workflow.module";
 import { NewsroomPreviewModule } from "./modules/newsroom-preview/newsroom-preview.module";
+import { WordPressPublicationModule } from "./modules/wordpress-publication/wordpress-publication.module";
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { NewsroomPreviewModule } from "./modules/newsroom-preview/newsroom-previ
     WordPressMediaModule,
     ReporterWorkflowModule,
     NewsroomPreviewModule,
+    WordPressPublicationModule,
   ],
 })
 export class AppModule {}

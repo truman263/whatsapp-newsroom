@@ -38,6 +38,8 @@ services:
       NEWSROOM_BRIDGE_MEDIA_HMAC_KEYS_JSON: ${NEWSROOM_BRIDGE_MEDIA_HMAC_KEYS_JSON}
       NEWSROOM_BRIDGE_MEDIA_MAX_BYTES: ${NEWSROOM_BRIDGE_MEDIA_MAX_BYTES}
       NEWSROOM_BRIDGE_SECURITY_LOGGING_ENABLED: ${NEWSROOM_BRIDGE_SECURITY_LOGGING_ENABLED}
+      NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON: ${NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON}
+      NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON: ${NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON}
       WORDPRESS_CONFIG_EXTRA: |
         define( 'WP_ENVIRONMENT_TYPE', 'local' );
         define( 'NEWSROOM_BRIDGE_USER_ID', (int) getenv( 'NEWSROOM_BRIDGE_USER_ID' ) );
@@ -53,6 +55,8 @@ services:
         define( 'NEWSROOM_BRIDGE_MEDIA_HMAC_ENABLED', '1' === $$newsroom_media_hmac ? true : ( '0' === $$newsroom_media_hmac ? false : $$newsroom_media_hmac ) );
         define( 'NEWSROOM_BRIDGE_MEDIA_HMAC_KEYS_JSON', (string) getenv( 'NEWSROOM_BRIDGE_MEDIA_HMAC_KEYS_JSON' ) );
         define( 'NEWSROOM_BRIDGE_MEDIA_MAX_BYTES', (int) getenv( 'NEWSROOM_BRIDGE_MEDIA_MAX_BYTES' ) );
+        define( 'NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON', (string) getenv( 'NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON' ) );
+        define( 'NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON', (string) getenv( 'NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON' ) );
         $$newsroom_logging_flag = getenv( 'NEWSROOM_BRIDGE_SECURITY_LOGGING_ENABLED' );
         define( 'NEWSROOM_BRIDGE_SECURITY_LOGGING_ENABLED', '1' === $$newsroom_logging_flag ? true : ( '0' === $$newsroom_logging_flag ? false : $$newsroom_logging_flag ) );
         unset( $$newsroom_lockdown_flag, $$newsroom_hmac_flag, $$newsroom_logging_flag, $$newsroom_media_lockdown, $$newsroom_media_hmac );

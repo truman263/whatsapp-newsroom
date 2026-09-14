@@ -39,6 +39,13 @@ final class Newsroom_Bridge_Auth {
 		$route       = $this->current_external_rest_route();
 		$uses_hmac   = $this->has_any_hmac_header();
 		$is_newsroom = 0 === strpos( $route, '/newsroom/' );
+		$method      = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) : '';
+
+		// Exact publication routes belong to the isolated publish authenticator,
+		// but a legacy draft credential on either route always fails closed here.
+		if ( Newsroom_Bridge_Publish_Auth::is_route( $method, $route ) && ! $uses_hmac ) {
+			return $result;
+		}
 
 		if ( ! $uses_hmac && ! $is_newsroom ) {
 			return $result;
@@ -48,7 +55,6 @@ final class Newsroom_Bridge_Auth {
 			return $result;
 		}
 
-		$method   = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) : '';
 		$category = $this->route_category( $method, $route );
 		if ( '' === $category ) {
 			return $this->failure( 'route_scope', '', 'unsupported' );

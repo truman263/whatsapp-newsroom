@@ -417,6 +417,15 @@ function rawDraftSignedRequest(method, route, { keyId, secret, body = Buffer.all
   });
 }
 
+function rawPublishSignedRequest(method, route, { keyId, secret, body = Buffer.alloc(0), headers: extraHeaders = {} } = {}) {
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const canonical = ["newsroom-publish-hmac-v1", keyId, method, route, timestamp, sha256Buffer(body)].join("\n");
+  const signature = createHmac("sha256", decodeDraftSecret(secret)).update(canonical).digest("base64url");
+  const headers = { "x-newsroom-publish-auth-version": "newsroom-publish-hmac-v1", "x-newsroom-publish-key-id": keyId, "x-newsroom-publish-timestamp": timestamp, "x-newsroom-publish-signature": signature, ...extraHeaders };
+  if (method === "POST") headers["content-type"] = "application/json";
+  return request(method, `/wp-json${route}`, { headers, body: method === "GET" ? undefined : body });
+}
+
 function rawMediaSignedUpload({ keyId, secret, mediaKey, filename, mime, body }) {
   const timestamp = String(Math.floor(Date.now() / 1000));
   const canonical = ["newsroom-media-hmac-v1", keyId, "POST", "/newsroom-media/v1/media", timestamp, mediaKey, sha256Buffer(Buffer.from(filename, "utf8")), mime, sha256Buffer(body)].join("\n");
@@ -614,6 +623,10 @@ function repositorySecretOccurrences(secret) {
     };
     runtimeEnv.NEWSROOM_BRIDGE_DRAFT_HMAC_KEYS_JSON = JSON.stringify([{ id: draftKeyId, secret: draftSecret }]);
     runtimeEnv.NEWSROOM_BRIDGE_MEDIA_HMAC_KEYS_JSON = JSON.stringify([{ id: mediaKeyId, secret: mediaSecret }]);
+    const publishKeyId = "publish-local-v1";
+    const publishSecret = randomSecret();
+    runtimeEnv.NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON = JSON.stringify([{ id: publishKeyId, secret: publishSecret }]);
+    runtimeEnv.NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON = JSON.stringify({ [publishKeyId]: 5 });
     const nonSecretRuntimeValues = ["3", "2", "1", mediaKeyId, draftKeyId, String(port)];
     knownSecrets.push(...Object.values(runtimeEnv).filter((value) => !nonSecretRuntimeValues.includes(value) && value.length >= 8));
     writeRuntimeEnv();
@@ -649,10 +662,12 @@ function repositorySecretOccurrences(secret) {
     wp(["rewrite", "structure", "/%postname%/", "--hard"]);
     wpEval("add_role( 'newsroom_media_service', 'Newsroom Media Service', array( 'read' => true, 'upload_files' => true ) ); echo 'ok';");
     wpEval("add_role( 'newsroom_draft_service', 'Newsroom Draft Service', array( 'read' => true, 'edit_posts' => true, 'assign_categories' => true ) ); echo 'ok';");
+    wpEval("add_role( 'newsroom_publish_service', 'Newsroom Publish Service', array( 'read' => true, 'publish_newsroom_publications' => true ) ); echo 'ok';");
     const mediaUserId = Number(wp(["user", "create", "runtime_media", "media@example.invalid", "--role=newsroom_media_service", `--user_pass=${runtimeEnv.ADMIN_PASSWORD}`, "--porcelain"], { sensitive: true }));
     const draftUserId = Number(wp(["user", "create", "runtime_draft", "draft@example.invalid", "--role=newsroom_draft_service", `--user_pass=${runtimeEnv.ADMIN_PASSWORD}`, "--porcelain"], { sensitive: true }));
     const authorUserId = Number(wp(["user", "create", "runtime_author", "author@example.invalid", "--role=author", `--user_pass=${runtimeEnv.ADMIN_PASSWORD}`, "--porcelain"], { sensitive: true }));
-    assert(mediaUserId === 2 && draftUserId === 3 && authorUserId === 4, "User fixture IDs do not match the isolated plan.");
+    const publishUserId = Number(wp(["user", "create", "runtime_publish", "publish@example.invalid", "--role=newsroom_publish_service", `--user_pass=${runtimeEnv.ADMIN_PASSWORD}`, "--porcelain"], { sensitive: true }));
+    assert(mediaUserId === 2 && draftUserId === 3 && authorUserId === 4 && publishUserId === 5, "User fixture IDs do not match the isolated plan.");
     categoryIds = {};
     for (const name of ["catA", "catB", "catC"]) {
       const id = Number(wp(["term", "create", "category", name, "--porcelain"]));
@@ -663,12 +678,12 @@ function repositorySecretOccurrences(secret) {
     wp(["plugin", "activate", "newsroom-bridge"]);
     const prodStatus = wp(["plugin", "get", "newsroom-bridge", "--field=status"]);
     const prodVersion = wp(["plugin", "get", "newsroom-bridge", "--field=version"]);
-    assert(prodStatus === "active" && prodVersion === "1.4.0", "Production plugin activation/version mismatch.");
-    assert(wpEval("echo NEWSROOM_BRIDGE_VERSION . '|' . NEWSROOM_BRIDGE_SCHEMA_VERSION . '|' . NEWSROOM_BRIDGE_MEDIA_SCHEMA_VERSION;") === "1.4.0|2|1", "Version/constants mismatch.");
+    assert(prodStatus === "active" && prodVersion === "1.5.0", "Production plugin activation/version mismatch.");
+    assert(wpEval("echo NEWSROOM_BRIDGE_VERSION . '|' . NEWSROOM_BRIDGE_SCHEMA_VERSION . '|' . NEWSROOM_BRIDGE_MEDIA_SCHEMA_VERSION . '|' . NEWSROOM_BRIDGE_PUBLICATIONS_SCHEMA_VERSION;") === "1.5.0|2|1|1", "Version/constants mismatch.");
     assert(wp(["option", "get", "newsroom_bridge_schema_version"]) === "2", "Draft schema version changed.");
     assert(wp(["option", "get", "newsroom_bridge_media_schema_version"]) === "1", "Media schema version changed.");
     const newsroomTables = db("SHOW TABLES LIKE 'wp_newsroom%'").split(/\r?\n/).filter(Boolean);
-    assert(JSON.stringify(newsroomTables) === JSON.stringify(["wp_newsroom_media", "wp_newsroom_reconciliation"]), "Unexpected newsroom database tables exist.");
+    assert(JSON.stringify(newsroomTables) === JSON.stringify(["wp_newsroom_media", "wp_newsroom_publications", "wp_newsroom_reconciliation"]), "Unexpected newsroom database tables exist.");
 
     const syncRouteInfo = wpEval(`
       $routes = rest_get_server()->get_routes();
@@ -679,13 +694,17 @@ function repositorySecretOccurrences(secret) {
       echo $checks['sync_put'] && $checks['sync_state'] ? 'both' : 'missing';
     `);
     assert(syncRouteInfo === "both", "Sync routes were not registered on the proof server.");
+    const publishConfigProbe = wpEval(`$a=new Newsroom_Bridge_Publish_Auth();$r=new ReflectionClass($a);$k=$r->getProperty('keys');$k->setAccessible(true);$u=$r->getProperty('users');$u->setAccessible(true);echo count($k->getValue($a)).'|'.count($u->getValue($a)).'|'.NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON.'|'.NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON;`);
+    assert(publishConfigProbe.startsWith("1|1|"), `Publication config probe failed: ${publishConfigProbe}`);
+    const earlyPublishProbe = await rawPublishSignedRequest("GET", `/newsroom/v1/publications/${randomUUID()}`, { keyId: publishKeyId, secret: publishSecret });
+    assert(earlyPublishProbe.status === 404, `Early publication auth probe failed (${earlyPublishProbe.status}): ${earlyPublishProbe.text}`);
 
     const draftCapsOk = userCap(draftUserId, "read") === "1" && userCap(draftUserId, "edit_posts") === "1" && userCap(draftUserId, "assign_categories") === "1" && userCap(draftUserId, "upload_files") === "0" && userCap(draftUserId, "publish_posts") === "0" && userCap(draftUserId, "manage_options") === "0" && userCap(draftUserId, "unfiltered_html") === "0" && userCap(draftUserId, "activate_plugins") === "0";
     const mediaCapsOk = userCap(mediaUserId, "read") === "1" && userCap(mediaUserId, "upload_files") === "1" && userCap(mediaUserId, "edit_posts") === "0" && userCap(mediaUserId, "publish_posts") === "0";
     assert(draftCapsOk && mediaCapsOk, "Draft/media service policies do not match the approved capability model.");
     pass("activation_and_schema", {
       plugin: "active",
-      bridge: "1.4.0",
+      bridge: "1.5.0",
       draft_schema: "2",
       media_schema: "1",
       tables: newsroomTables,
@@ -2111,6 +2130,111 @@ function repositorySecretOccurrences(secret) {
       shutdown_after_callback_failure: 0,
       failure_status: 503,
     });
+
+    const publicationDraftKey = randomUUID();
+    const publicationCreate = await draftPostCreate(publicationDraftKey, "Publication Proof", "Publication body", "", [categoryIds.catA]);
+    assert(publicationCreate.status === 201, "Publication proof draft creation failed.");
+    const publicationPostId = JSON.parse(publicationCreate.text).post_id;
+    const publicationSync = await draftPutSync(publicationDraftKey, "Publication Proof", "Publication body", "", [categoryIds.catA], null);
+    assert(publicationSync.status === 200, "Publication proof draft sync failed.");
+    const publicationVersion = JSON.parse(publicationSync.text).applied_version;
+    const publicationKey = randomUUID();
+    const publicationBody = Buffer.from(JSON.stringify({ publish_key: publicationKey, draft_key: publicationDraftKey, expected_applied_version: publicationVersion, post_id: publicationPostId }), "utf8");
+    const authCookieNames = JSON.parse(wpEval("echo wp_json_encode( array( AUTH_COOKIE, SECURE_AUTH_COOKIE, LOGGED_IN_COOKIE ) );"));
+    const authIsolationCases = [
+      ["prior_auth_true", { "x-newsroom-test-prior-auth": "1" }],
+      ["current_user", { "x-newsroom-test-current-user": "1" }],
+      ["authorization", { authorization: "Basic rejected" }],
+      ["auth_cookie", { cookie: `${authCookieNames[0]}=rejected` }],
+      ["secure_auth_cookie", { cookie: `${authCookieNames[1]}=rejected` }],
+      ["logged_in_cookie", { cookie: `${authCookieNames[2]}=rejected` }],
+      ["draft_mixed", { "x-newsroom-auth-version": "1" }],
+      ["media_mixed", { "x-newsroom-media-auth-version": "1" }],
+    ];
+    for (const [label, headers] of authIsolationCases) {
+      const rejected = await rawPublishSignedRequest("POST", "/newsroom/v1/publications", { keyId: publishKeyId, secret: publishSecret, body: publicationBody, headers });
+      assert(rejected.status === 401, `Publication auth isolation ${label} was not rejected (${rejected.status}): ${rejected.text}`);
+    }
+    assert(postInfo(publicationPostId).status === "draft" && Number(db(`SELECT COUNT(*) FROM wp_newsroom_publications WHERE publish_key='${publicationKey}'`)) === 0, "Rejected publication credentials acquired authority.");
+
+    const transactionStartProbe = wpEval(`
+      $database = new Newsroom_Bridge_DB();
+      $sync = new Newsroom_Bridge_Draft_Sync_REST( $database, new Newsroom_Bridge_Media_DB(), new Newsroom_Bridge_Reconciliation( $database ) );
+      $publication = new Newsroom_Bridge_Publish_REST( new Newsroom_Bridge_Publish_Auth(), $sync, $database, static function () { return false; } );
+      $request = new WP_REST_Request( 'POST', '/newsroom/v1/publications' );
+      $request->set_header( 'content-type', 'application/json' );
+      $request->set_body( '${sqlEscape(publicationBody.toString("utf8"))}' );
+      $response = $publication->publish( $request );
+      echo is_wp_error( $response ) ? $response->get_error_code() : 'unexpected_success';
+    `);
+    assert(transactionStartProbe === "newsroom_publication_storage_error", `Transaction-start failure did not fail closed: ${transactionStartProbe}`);
+    assert(postInfo(publicationPostId).status === "draft" && Number(db(`SELECT COUNT(*) FROM wp_newsroom_publications WHERE publish_key='${publicationKey}'`)) === 0, "Transaction-start failure leaked publication authority.");
+    for (const hook of ["transition_post_status", "publish_post", "save_post", "wp_after_insert_post", "clean_post_cache"]) wp(["option", "delete", `newsroom_publication_hook_${hook}`], { allowFailure: true });
+    const publicationResponse = await rawPublishSignedRequest("POST", "/newsroom/v1/publications", { keyId: publishKeyId, secret: publishSecret, body: publicationBody });
+    assert(publicationResponse.status === 200 && JSON.parse(publicationResponse.text).status === "publish", `Publication failed (${publicationResponse.status}): ${publicationResponse.text}`);
+    const firstEvidence = publicationResponse.text;
+    const replay = await rawPublishSignedRequest("POST", "/newsroom/v1/publications", { keyId: publishKeyId, secret: publishSecret, body: publicationBody });
+    assert(replay.status === 200 && replay.text === firstEvidence, "PUBLISHED replay did not return stable evidence.");
+    const ledgerGet = await rawPublishSignedRequest("GET", `/newsroom/v1/publications/${publicationKey}`, { keyId: publishKeyId, secret: publishSecret });
+    const ledgerBody = JSON.parse(ledgerGet.text);
+    assert(ledgerGet.status === 200 && ledgerBody.status === "PUBLISHED" && ledgerBody.post_id === publicationPostId, "Publication GET did not return ledger evidence.");
+    for (const hook of ["transition_post_status", "publish_post", "save_post", "wp_after_insert_post", "clean_post_cache"]) assert(observerOption(`newsroom_publication_hook_${hook}`) === "", `Publication unexpectedly fired ${hook}.`);
+    const manualPostId = Number(wp(["post", "create", "--post_type=post", "--post_status=publish", "--post_title=Manual", `--post_author=${draftUserId}`, "--porcelain"]));
+    const manualKey = randomUUID();
+    db(`INSERT INTO wp_newsroom_reconciliation (draft_key,post_id,payload_hash,actor_user_id,reservation_token,created_at,updated_at) VALUES ('${manualKey}',${manualPostId},'${"0".repeat(64)}',${draftUserId},NULL,UTC_TIMESTAMP(),UTC_TIMESTAMP())`);
+    const manualPublishKey = randomUUID();
+    const manualBody = Buffer.from(JSON.stringify({ publish_key: manualPublishKey, draft_key: manualKey, expected_applied_version: "0".repeat(64), post_id: manualPostId }));
+    const manualResult = await rawPublishSignedRequest("POST", "/newsroom/v1/publications", { keyId: publishKeyId, secret: publishSecret, body: manualBody });
+    assert(manualResult.status === 409 && Number(db(`SELECT COUNT(*) FROM wp_newsroom_publications WHERE publish_key='${manualPublishKey}'`)) === 0, "Manual publish without ledger was not rejected safely.");
+
+    const rollbackProof = async (phase) => {
+      const draftKey = randomUUID();
+      const created = await draftPostCreate(draftKey, `Rollback ${phase}`, "Rollback body", "", [categoryIds.catA]);
+      const postId = JSON.parse(created.text).post_id;
+      const synced = await draftPutSync(draftKey, `Rollback ${phase}`, "Rollback body", "", [categoryIds.catA], null);
+      const applied = JSON.parse(synced.text).applied_version;
+      const key = randomUUID();
+      if (phase === "after_reserve") db(`CREATE TRIGGER newsroom_publication_fail_post BEFORE UPDATE ON wp_posts FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='round7b1_after_reserve'`);
+      else db(`CREATE TRIGGER newsroom_publication_fail_ledger BEFORE UPDATE ON wp_newsroom_publications FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='round7b1_after_status'`);
+      try {
+        const body = Buffer.from(JSON.stringify({ publish_key: key, draft_key: draftKey, expected_applied_version: applied, post_id: postId }));
+        const response = await rawPublishSignedRequest("POST", "/newsroom/v1/publications", { keyId: publishKeyId, secret: publishSecret, body });
+        assert(response.status === (phase === "after_reserve" ? 409 : 503), `${phase} rollback fault returned unexpected status ${response.status}.`);
+      } finally {
+        db(`DROP TRIGGER IF EXISTS ${phase === "after_reserve" ? "newsroom_publication_fail_post" : "newsroom_publication_fail_ledger"}`);
+      }
+      assert(postInfo(postId).status === "draft" && Number(db(`SELECT COUNT(*) FROM wp_newsroom_publications WHERE publish_key='${key}'`)) === 0, `${phase} rollback leaked publication authority.`);
+    };
+    await rollbackProof("after_reserve");
+    await rollbackProof("after_status");
+
+    const enumSqlMode = db("SELECT @@sql_mode");
+    const enumCases = {};
+    for (const [name, value] of [["NULL", "NULL"], ["empty", "''"], ["lower_reserved", "'reserved'"], ["lower_published", "'published'"], ["arbitrary", "'arbitrary-invalid-value'"]]) {
+      const key = randomUUID();
+      const result = compose(["exec", "-T", "cli", "wp", "db", "query", `INSERT INTO wp_newsroom_publications (publish_key,draft_key,post_id,expected_applied_version,status,created_at,updated_at) VALUES ('${key}','${randomUUID()}',${publicationPostId},'${"0".repeat(64)}',${value},UTC_TIMESTAMP(),UTC_TIMESTAMP())`, "--skip-column-names", "--silent"], { allowFailure: true, label: `enum ${name}` });
+      enumCases[name] = { exit: result.status, stored: result.status === 0 ? db(`SELECT status FROM wp_newsroom_publications WHERE publish_key='${key}'`) : null };
+      if (result.status === 0) db(`DELETE FROM wp_newsroom_publications WHERE publish_key='${key}'`);
+    }
+    assert(enumCases.NULL.exit !== 0 && enumCases.empty.exit === 0 && enumCases.empty.stored === "" && enumCases.arbitrary.exit === 0 && enumCases.arbitrary.stored === "" && enumCases.lower_reserved.stored === "RESERVED" && enumCases.lower_published.stored === "PUBLISHED", `ENUM negative/normalization behavior differed from the disposable server contract: ${JSON.stringify(enumCases)}`);
+    const invalidStatusKey = randomUUID();
+    db(`INSERT INTO wp_newsroom_publications (publish_key,draft_key,post_id,expected_applied_version,status,created_at,updated_at) VALUES ('${invalidStatusKey}','${randomUUID()}',${publicationPostId},'${"0".repeat(64)}','arbitrary-invalid-value',UTC_TIMESTAMP(),UTC_TIMESTAMP())`);
+    assert(wpEval("echo is_wp_error( Newsroom_Bridge_Publications_Table::verify() ) ? 'blocked' : 'ready';") === "blocked", "Readiness accepted a row resolving outside the logical status allowlist.");
+    db(`DELETE FROM wp_newsroom_publications WHERE publish_key='${invalidStatusKey}'`);
+    const schemaEvidence = {
+      version: db("SELECT VERSION()"),
+      sql_mode: db("SELECT @@sql_mode"),
+      status_type: db("SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='wp_newsroom_publications' AND COLUMN_NAME='status'"),
+      engine: db("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='wp_newsroom_publications'"),
+    };
+    assert(schemaEvidence.status_type === "enum('RESERVED','PUBLISHED')" && schemaEvidence.engine.toUpperCase() === "INNODB", "Publication schema physical contract mismatch.");
+    assert(wpEval("echo is_wp_error( Newsroom_Bridge_Publications_Table::verify() ) ? 'bad' : 'ready';") === "ready", "Publication readiness verification failed.");
+    assert(userCap(publishUserId, "publish_newsroom_publications") === "1" && userCap(publishUserId, "publish_posts") === "0" && userCap(publishUserId, "edit_others_posts") === "0", "Publisher capability isolation failed.");
+    db("ALTER TABLE wp_newsroom_publications ADD COLUMN unexpected_drift INT NULL");
+    assert(wpEval("echo is_wp_error( Newsroom_Bridge_Publications_Table::verify() ) ? 'blocked' : 'ready';") === "blocked", "Unknown publication schema drift did not fail closed.");
+    db("ALTER TABLE wp_newsroom_publications DROP COLUMN unexpected_drift");
+    assert(wpEval("echo is_wp_error( Newsroom_Bridge_Publications_Table::verify() ) ? 'bad' : 'ready';") === "ready", "Operator-restored publication schema did not become ready.");
+    pass("publication_authority", { post_id: publicationPostId, replay: "stable", ledger_get: "PUBLISHED", manual_publish: "STATE_MISMATCH", transaction_start_failure: "blocked_without_authority", auth_isolation: authIsolationCases.map(([label]) => label), clean_publish_hmac: "succeeded", rollback: ["after_reserve", "after_status"], hooks: "absent", schema_drift: "blocked", enum_sql_mode: enumSqlMode, enum_cases: enumCases, schema: schemaEvidence, publisher_user: publishUserId });
 
     const goodRuntimeEnv = { ...runtimeEnv };
     const configFailures = [];

@@ -495,8 +495,22 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 	}
 
 	private function current_state( $post_id ) {
-		$post = get_post( $post_id );
-		if ( ! $post || 'post' !== $post->post_type || 'draft' !== $post->post_status || (int) $post->post_author !== (int) NEWSROOM_BRIDGE_USER_ID ) {
+		return $this->managed_state( $post_id, 'draft', false );
+	}
+
+	/** Canonical Round-6 managed-state reader. Authoritative mode bypasses post-row cache. */
+	public function managed_state( $post_id, $expected_status, $authoritative = false ) {
+		if ( ! in_array( $expected_status, array( 'draft', 'publish' ), true ) ) {
+			throw new InvalidArgumentException( 'unsupported_expected_status' );
+		}
+		if ( $authoritative ) {
+			global $wpdb;
+			$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d", $post_id ) );
+			$post = $row ? new WP_Post( $row ) : null;
+		} else {
+			$post = get_post( $post_id );
+		}
+		if ( ! $post || 'post' !== $post->post_type || $expected_status !== $post->post_status || (int) $post->post_author !== (int) NEWSROOM_BRIDGE_USER_ID ) {
 			throw new RuntimeException( 'draft_state_unhealthy' );
 		}
 
@@ -721,7 +735,7 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 		return hash( 'sha256', $serialized );
 	}
 
-	private function state_fingerprint( array $state ) {
+	public function canonical_state_fingerprint( array $state ) {
 		$canonical = array(
 			'contract_version'   => self::SYNC_CONTRACT_VERSION,
 			'title'              => $state['title'],
@@ -738,6 +752,10 @@ final class Newsroom_Bridge_Draft_Sync_REST {
 		}
 
 		return hash( 'sha256', $serialized );
+	}
+
+	private function state_fingerprint( array $state ) {
+		return $this->canonical_state_fingerprint( $state );
 	}
 
 	private function editorial_byline_is_valid( $value ) {

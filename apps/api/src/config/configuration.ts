@@ -21,6 +21,8 @@ export interface ApplicationConfiguration {
     requestTimeoutMs: number;
     reconciliationAttempts: number;
     reconciliationDelayMs: number;
+    publishHmacKeyId: string;
+    publishHmacSecret: string;
     mediaHmacKeyId: string;
     mediaHmacSecret: string;
     mediaRequestTimeoutMs: number;
@@ -62,6 +64,8 @@ export default function configuration(): ApplicationConfiguration {
       requestTimeoutMs: environment.WORDPRESS_REQUEST_TIMEOUT_MS,
       reconciliationAttempts: environment.WORDPRESS_RECONCILIATION_ATTEMPTS,
       reconciliationDelayMs: environment.WORDPRESS_RECONCILIATION_DELAY_MS,
+      publishHmacKeyId: environment.WORDPRESS_PUBLISH_HMAC_KEY_ID,
+      publishHmacSecret: environment.WORDPRESS_PUBLISH_HMAC_SECRET,
       mediaHmacKeyId: environment.WORDPRESS_MEDIA_HMAC_KEY_ID,
       mediaHmacSecret: environment.WORDPRESS_MEDIA_HMAC_SECRET,
       mediaRequestTimeoutMs: environment.WORDPRESS_MEDIA_REQUEST_TIMEOUT_MS,
