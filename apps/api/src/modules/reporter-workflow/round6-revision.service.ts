@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Optional } from "@nestjs/common";
 import {
   AuditActorType,
   ConversationState,
@@ -31,7 +31,10 @@ export type ReviseInput = {
 
 @Injectable()
 export class Round6RevisionService {
-  constructor(private readonly conversations: ConversationStateMachineService) {}
+  constructor(
+    private readonly conversations: ConversationStateMachineService,
+    @Optional() private readonly authorityLocked?: () => void,
+  ) {}
 
   async reviseInTransaction(
     tx: Prisma.TransactionClient,
@@ -53,8 +56,18 @@ export class Round6RevisionService {
     await tx.$queryRaw`SELECT "id" FROM "Reporter" WHERE "id"=${input.reporterId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Conversation" WHERE "id"=${input.conversationId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Story" WHERE "id"=${input.storyId}::uuid FOR UPDATE`;
+    await tx.$queryRaw`SELECT ec."id" FROM "EditorialCategory" ec JOIN "StoryCategory" sc ON sc."categoryId"=ec."id" WHERE sc."storyId"=${input.storyId}::uuid ORDER BY ec."id" FOR UPDATE OF ec`;
+    await tx.$queryRaw`SELECT "storyId","categoryId" FROM "StoryCategory" WHERE "storyId"=${input.storyId}::uuid ORDER BY "storyId","categoryId" FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "StoryMedia" WHERE "storyId"=${input.storyId}::uuid ORDER BY "id" FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "DraftPreparation" WHERE "id"=${preparationHint.id}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "OutboundMessage" WHERE "id"=${preparationHint.approvalPromptOutboundMessageId}::uuid FOR UPDATE`;
+    const approvals = await tx.$queryRaw<
+      Array<{ id: string }>
+    >`SELECT "id" FROM "Approval" WHERE "storyId"=${input.storyId}::uuid ORDER BY "id" FOR UPDATE`;
+    const publishAttempts = await tx.$queryRaw<
+      Array<{ id: string }>
+    >`SELECT "id" FROM "PublishAttempt" WHERE "storyId"=${input.storyId}::uuid AND "operation"='PUBLISH'::"PublishOperation" ORDER BY "id" FOR UPDATE`;
+    this.authorityLocked?.();
 
     const event = await tx.inboundEvent.findUnique({
       where: { id: input.inboundEventId },
@@ -73,6 +86,8 @@ export class Round6RevisionService {
     const prompt = preparation?.approvalPromptOutboundMessage;
     const payload = prompt?.payload as Record<string, unknown> | undefined;
     if (
+      approvals.length !== 0 ||
+      publishAttempts.length !== 0 ||
       !event ||
       event.processingStatus !== InboundProcessingStatus.PROCESSING ||
       event.reporterId !== input.reporterId ||
@@ -138,8 +153,7 @@ export class Round6RevisionService {
       storyMutation: { kind: "PRESERVE" },
       inboundEventId: event.id,
     });
-    if (transition.outcome !== "TRANSITIONED")
-      throw new Round6RevisionError();
+    if (transition.outcome !== "TRANSITIONED") throw new Round6RevisionError();
     await tx.inboundEvent.update({
       where: { id: event.id },
       data: {

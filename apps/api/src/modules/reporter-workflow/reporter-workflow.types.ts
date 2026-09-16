@@ -44,6 +44,7 @@ export type EventClaimResult =
 
 export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }
+  | { outcome: "APPROVAL_PENDING"; approvalId: string; publishAttemptId: string; storyId: string }
   | {
       outcome: "IGNORED";
       reason:
@@ -53,7 +54,11 @@ export type EventProcessingResult =
         | "COMPLETENESS_NOT_SATISFIED"
         | "CATEGORY_SELECTION_NO_LONGER_ACTIVE"
         | "STORY_FINALISATION_CONFLICT"
-        | "STORY_REVISION_CONFLICT";
+        | "STORY_REVISION_CONFLICT"
+        | "APPROVAL_AMBIGUOUS"
+        | "APPROVAL_IDENTITY_CONFLICT"
+        | "APPROVAL_PROMPT_NOT_SENT"
+        | "APPROVAL_STATE_MISMATCH";
     }
   | { outcome: "FAILED"; reason: string }
   | { outcome: "RETRY_REQUIRED"; reason: string }

@@ -26,6 +26,11 @@ import type {
   EventClaimResult,
   EventProcessingResult,
 } from "./reporter-workflow.types";
+import {
+  approvalControl,
+  Round7ApprovalError,
+  Round7ApprovalService,
+} from "./round7-approval.service";
 
 type ProcessingPhase =
   | EventProcessingResult
@@ -56,6 +61,7 @@ export class InboundEventProcessingService {
     @Optional() private readonly draftPreparations?: DraftPreparationService,
     @Optional() private readonly round6?: Round6FinalisationService,
     @Optional() private readonly revisions?: Round6RevisionService,
+    @Optional() private readonly approvals?: Round7ApprovalService,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -100,6 +106,8 @@ export class InboundEventProcessingService {
     const claim = await this.claim(eventId);
     if (claim.outcome !== "CLAIMED") {
       if (claim.outcome !== "NOT_CLAIMED") return claim;
+      const approval = await this.approvals?.recover(eventId);
+      if (approval) return approval;
       if (!this.round6) return claim;
       const existing = await this.round6.preparationForProcessingEvent(eventId);
       if (!existing) return claim;
@@ -110,6 +118,50 @@ export class InboundEventProcessingService {
       if (event?.processingStatus !== InboundProcessingStatus.PROCESSING)
         return claim;
       return this.round6.resume(existing.id);
+    }
+    if (this.approvals) {
+      const event = await this.prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: eventId },
+        select: {
+          providerMessageId: true,
+          senderPhone: true,
+          eventType: true,
+          providerOccurredAt: true,
+          rawPayload: true,
+        },
+      });
+      let control = null;
+      try {
+        control = approvalControl(this.storedEvents.parse(event));
+      } catch {
+        // Preserve the established transactional malformed-event handling below.
+      }
+      if (control) {
+        try {
+          return await this.approvals.process(eventId, control);
+        } catch (error) {
+          if (!(error instanceof Round7ApprovalError)) throw error;
+          if (
+            error.code === "CONTROL_NOT_ENABLED" ||
+            error.code === "APPROVAL_AMBIGUOUS" ||
+            error.code === "APPROVAL_IDENTITY_CONFLICT" ||
+            error.code === "APPROVAL_PROMPT_NOT_SENT" ||
+            error.code === "APPROVAL_STATE_MISMATCH"
+          ) {
+            await this.prisma.inboundEvent.update({
+              where: { id: eventId },
+              data: {
+                processingStatus: InboundProcessingStatus.IGNORED,
+                processedAt: new Date(),
+                lastErrorCode: error.code,
+                lastErrorMessage: null,
+              },
+            });
+            return { outcome: "IGNORED", reason: error.code };
+          }
+          return { outcome: "RETRY_REQUIRED", reason: error.code };
+        }
+      }
     }
     const phase = await this.prisma.$transaction<ProcessingPhase>(
       async (tx) => {
