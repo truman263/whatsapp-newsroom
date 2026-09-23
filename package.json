@@ -18,6 +18,7 @@
     "test": "pnpm --filter @newsroom/api test",
     "test:e2e": "pnpm --filter @newsroom/api test:e2e",
     "test:db": "pnpm --filter @newsroom/api test:db",
+    "test:round7-integration": "pnpm --filter @newsroom/api test:round7-integration",
     "reporter": "pnpm --filter @newsroom/api reporter --",
     "prisma:generate": "prisma generate",
     "format": "prettier --write .",

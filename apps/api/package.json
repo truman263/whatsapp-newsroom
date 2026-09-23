@@ -11,6 +11,7 @@
     "test": "jest --config jest.config.ts --runInBand",
     "test:e2e": "jest --config test/jest-e2e.config.ts --runInBand",
     "test:db": "jest --config test/jest-db.config.ts --runInBand",
+    "test:round7-integration": "node test/support/run-round7-integration.mjs",
     "reporter": "ts-node src/commands/reporter-cli.ts"
   },
   "dependencies": {
