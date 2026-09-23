@@ -11,6 +11,7 @@ import { Round6FinalisationService } from "./round6-finalisation.service";
 import { Round6RevisionService } from "./round6-revision.service";
 import { Round7ApprovalService } from "./round7-approval.service";
 import { WordPressDraftModule } from "../wordpress-draft/wordpress-draft.module";
+import { PublishingModule } from "../publishing/publishing.module";
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { WordPressDraftModule } from "../wordpress-draft/wordpress-draft.module"
     DraftPreparationModule,
     WhatsappOutboundModule,
     WordPressDraftModule,
+    PublishingModule,
   ],
   providers: [
     ReporterProvisioningService,

@@ -44,7 +44,13 @@ export type EventClaimResult =
 
 export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }
-  | { outcome: "APPROVAL_PENDING"; approvalId: string; publishAttemptId: string; storyId: string }
+  | { outcome: "PROCESSED"; publishAttemptId: string; storyId: string }
+  | {
+      outcome: "APPROVAL_PENDING";
+      approvalId: string;
+      publishAttemptId: string;
+      storyId: string;
+    }
   | {
       outcome: "IGNORED";
       reason:
@@ -62,5 +68,13 @@ export type EventProcessingResult =
     }
   | { outcome: "FAILED"; reason: string }
   | { outcome: "RETRY_REQUIRED"; reason: string }
+  | {
+      outcome: "PUBLISH_RECONCILIATION_REQUIRED";
+      publishAttemptId: string;
+      reason: string;
+    }
+  | { outcome: "PUBLISH_FAILED"; publishAttemptId: string; reason: string }
+  | { outcome: "PUBLISH_NOT_CLAIMED"; publishAttemptId: string }
+  | { outcome: "ALREADY_SUCCEEDED"; publishAttemptId: string; storyId: string }
   | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };

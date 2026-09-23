@@ -31,6 +31,7 @@ import {
   Round7ApprovalError,
   Round7ApprovalService,
 } from "./round7-approval.service";
+import { Round7PublishSagaService } from "../publishing/round7-publish-saga.service";
 
 type ProcessingPhase =
   | EventProcessingResult
@@ -62,6 +63,7 @@ export class InboundEventProcessingService {
     @Optional() private readonly round6?: Round6FinalisationService,
     @Optional() private readonly revisions?: Round6RevisionService,
     @Optional() private readonly approvals?: Round7ApprovalService,
+    @Optional() private readonly publishing?: Round7PublishSagaService,
   ) {}
 
   async claim(eventId: string): Promise<EventClaimResult> {
@@ -107,7 +109,24 @@ export class InboundEventProcessingService {
     if (claim.outcome !== "CLAIMED") {
       if (claim.outcome !== "NOT_CLAIMED") return claim;
       const approval = await this.approvals?.recover(eventId);
-      if (approval) return approval;
+      if (approval)
+        return this.publishing
+          ? this.publishing.run(approval.publishAttemptId)
+          : approval;
+      if (this.publishing && this.approvals) {
+        const blocked = await this.prisma.approval.findUnique({
+          where: { inboundEventId: eventId },
+          select: {
+            publishAttempt: { select: { id: true, status: true } },
+          },
+        });
+        if (blocked?.publishAttempt?.status === "RECONCILIATION_REQUIRED")
+          return {
+            outcome: "PUBLISH_RECONCILIATION_REQUIRED",
+            publishAttemptId: blocked.publishAttempt.id,
+            reason: "WORDPRESS_PUBLISH_RECONCILIATION_REQUIRED",
+          };
+      }
       if (!this.round6) return claim;
       const existing = await this.round6.preparationForProcessingEvent(eventId);
       if (!existing) return claim;
@@ -138,7 +157,10 @@ export class InboundEventProcessingService {
       }
       if (control) {
         try {
-          return await this.approvals.process(eventId, control);
+          const approval = await this.approvals.process(eventId, control);
+          return this.publishing
+            ? this.publishing.run(approval.publishAttemptId)
+            : approval;
         } catch (error) {
           if (!(error instanceof Round7ApprovalError)) throw error;
           if (
