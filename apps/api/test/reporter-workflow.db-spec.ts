@@ -30,6 +30,7 @@ import {
 import { ConversationProvisioningService } from "../src/modules/reporter-workflow/conversation-provisioning.service";
 import { ConversationStateMachineService } from "../src/modules/reporter-workflow/conversation-state-machine.service";
 import { InboundEventProcessingService } from "../src/modules/reporter-workflow/inbound-event-processing.service";
+import { supportsInboundProcessingContractVersion } from "../src/modules/reporter-workflow/inbound-processing-contract";
 import {
   IGNORED_REASON,
   REPORTER_WORKFLOW_AUDIT,
@@ -62,7 +63,10 @@ class ProofMediaProvider implements MediaProviderClient {
   fetch(authority: MediaAuthority): Promise<DownloadedMedia> {
     const bytes =
       authority.mimeType === "image/png"
-        ? Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.alloc(16)])
+        ? Buffer.concat([
+            Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+            Buffer.alloc(16),
+          ])
         : Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
     return Promise.resolve({
       bytes,
@@ -415,22 +419,129 @@ describe("Round 4B disposable PostgreSQL proof", () => {
       expect(
         results.filter(({ outcome }) => outcome === "CLAIMED"),
       ).toHaveLength(1);
+      expect(results.find(({ outcome }) => outcome === "CLAIMED")).toEqual({
+        outcome: "CLAIMED",
+        processingAttempt: 1,
+        processingContractVersion: 1,
+      });
+      expect(
+        results.filter(({ outcome }) => outcome === "NOT_CLAIMED"),
+      ).toHaveLength(19);
+      const claimedEvent = await prisma.inboundEvent.findUnique({
+        where: { id: event.id },
+        select: {
+          processingStatus: true,
+          processingAttempts: true,
+          processingContractVersion: true,
+          processingStartedAt: true,
+        },
+      });
+      expect(claimedEvent).toMatchObject({
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        processingAttempts: 1,
+        processingContractVersion: 1,
+      });
+      expect(claimedEvent?.processingStartedAt).toBeInstanceOf(Date);
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
+  });
+
+  it("stamps a new ordinary claim and does not claim it twice", async () => {
+    const event = await inbound(phone(), "contract-new");
+    expect(event.processingContractVersion).toBeNull();
+    expect(event.processingAttempts).toBe(0);
+    await expect(processor(prisma).claim(event.id)).resolves.toEqual({
+      outcome: "CLAIMED",
+      processingAttempt: 1,
+      processingContractVersion: 1,
+    });
+    await expect(processor(prisma).claim(event.id)).resolves.toEqual({
+      outcome: "NOT_CLAIMED",
+    });
+    expect(
+      await prisma.inboundEvent.findUnique({
+        where: { id: event.id },
+        select: { processingAttempts: true, processingContractVersion: true },
+      }),
+    ).toEqual({ processingAttempts: 1, processingContractVersion: 1 });
+    expect(supportsInboundProcessingContractVersion(1)).toBe(true);
+    expect(supportsInboundProcessingContractVersion(null)).toBe(false);
+    expect(supportsInboundProcessingContractVersion(999)).toBe(false);
+  });
+
+  it("preserves an existing current contract and returns the one winning later generation", async () => {
+    const event = await inbound(phone(), "contract-existing");
+    await prisma.inboundEvent.update({
+      where: { id: event.id },
+      data: { processingAttempts: 7, processingContractVersion: 1 },
+    });
+    const pool = await clients(20);
+    try {
+      const results = await Promise.all(
+        pool.map((client) => processor(client).claim(event.id)),
+      );
+      expect(results.filter(({ outcome }) => outcome === "CLAIMED")).toEqual([
+        {
+          outcome: "CLAIMED",
+          processingAttempt: 8,
+          processingContractVersion: 1,
+        },
+      ]);
       expect(
         results.filter(({ outcome }) => outcome === "NOT_CLAIMED"),
       ).toHaveLength(19);
       expect(
         await prisma.inboundEvent.findUnique({
           where: { id: event.id },
-          select: { processingStatus: true, processingAttempts: true },
+          select: { processingAttempts: true, processingContractVersion: true },
         }),
-      ).toEqual({
-        processingStatus: InboundProcessingStatus.PROCESSING,
-        processingAttempts: 1,
-      });
+      ).toEqual({ processingAttempts: 8, processingContractVersion: 1 });
     } finally {
       await Promise.all(pool.map((client) => client.$disconnect()));
     }
   });
+
+  it.each([
+    {
+      name: "unsupported",
+      processingAttempts: 0,
+      processingContractVersion: 999,
+    },
+    {
+      name: "integer-max",
+      processingAttempts: 2147483647,
+      processingContractVersion: null,
+    },
+  ])(
+    "fails closed for $name without partial claim",
+    async ({ name, processingAttempts, processingContractVersion }) => {
+      const event = await inbound(phone(), `contract-${name}`);
+      await prisma.inboundEvent.update({
+        where: { id: event.id },
+        data: { processingAttempts, processingContractVersion },
+      });
+      await expect(processor(prisma).claim(event.id)).resolves.toEqual({
+        outcome: "NOT_CLAIMED",
+      });
+      expect(
+        await prisma.inboundEvent.findUnique({
+          where: { id: event.id },
+          select: {
+            processingStatus: true,
+            processingAttempts: true,
+            processingContractVersion: true,
+            processingStartedAt: true,
+          },
+        }),
+      ).toEqual({
+        processingStatus: InboundProcessingStatus.RECEIVED,
+        processingAttempts,
+        processingContractVersion,
+        processingStartedAt: null,
+      });
+    },
+  );
 
   it("converges 20 Conversation provisioners on one ID and one audit", async () => {
     const owner = await reporter();
@@ -1097,6 +1208,8 @@ describe("Round 4B disposable PostgreSQL proof", () => {
     const later = await inbound(sender, `terminal-later-${status}`);
     await expect(processor(prisma).claim(later.id)).resolves.toEqual({
       outcome: "CLAIMED",
+      processingAttempt: 1,
+      processingContractVersion: 1,
     });
   });
 
@@ -1125,6 +1238,8 @@ describe("Round 4B disposable PostgreSQL proof", () => {
     });
     await expect(processor(prisma).claim(later.id)).resolves.toEqual({
       outcome: "CLAIMED",
+      processingAttempt: 1,
+      processingContractVersion: 1,
     });
   });
 
@@ -3210,7 +3325,10 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
   }
 
   class ConflictingHeadStore implements MediaObjectStore {
-    async putIfAbsent(_key: string, _media: DownloadedMedia): Promise<"CREATED" | "EXISTS"> {
+    async putIfAbsent(
+      _key: string,
+      _media: DownloadedMedia,
+    ): Promise<"CREATED" | "EXISTS"> {
       return Promise.resolve("EXISTS");
     }
     async head(_key: string): Promise<StoredObjectHead | null> {
@@ -3385,7 +3503,11 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
         const media = stagedObjects.get(key);
         return Promise.resolve(
           media
-            ? { size: media.size, sha256: media.sha256, mimeType: media.mimeType }
+            ? {
+                size: media.size,
+                sha256: media.sha256,
+                mimeType: media.mimeType,
+              }
             : null,
         );
       },
@@ -3457,7 +3579,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
         sha256: null,
       });
       expect(
-        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        }),
       ).toMatchObject({
         processingStatus: InboundProcessingStatus.PROCESSING,
         processedAt: null,
@@ -3493,7 +3617,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
         sha256: JPEG_SHA,
       });
       expect(
-        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        }),
       ).toMatchObject({
         processingStatus: InboundProcessingStatus.PROCESSED,
         lastErrorCode: null,
@@ -3587,7 +3713,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       }),
       new ProofObjectStore(),
     );
-    await expect(mismatchService.process(mismatchingEvent.id)).resolves.toMatchObject({
+    await expect(
+      mismatchService.process(mismatchingEvent.id),
+    ).resolves.toMatchObject({
       outcome: "RETRY_REQUIRED",
       reason: "MEDIA_PROVIDER_UNAVAILABLE",
     });
@@ -3599,7 +3727,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       bytes: Buffer.from([0x01]),
       mimeType: "image/png",
       size: 1,
-      sha256: createHash("sha256").update(Buffer.from([0x01])).digest("hex"),
+      sha256: createHash("sha256")
+        .update(Buffer.from([0x01]))
+        .digest("hex"),
     });
     const conflictStore = new RecordingStore(new ProofObjectStore());
     const conflicted = await new MediaStagingService(
@@ -3804,11 +3934,7 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
         { image: { id: providerMediaId, mime_type: "image/jpeg" } },
       );
       const thrower = new ThrowingProvider(testCase.error);
-      const service = serviceWith(
-        prisma,
-        thrower,
-        new ProofObjectStore(),
-      );
+      const service = serviceWith(prisma, thrower, new ProofObjectStore());
       await expect(service.process(event.id)).resolves.toMatchObject({
         outcome: "RETRY_REQUIRED",
         reason: testCase.error.code,
@@ -3823,7 +3949,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       const eventRow = await prisma.inboundEvent.findUniqueOrThrow({
         where: { id: event.id },
       });
-      expect(eventRow.processingStatus).toBe(InboundProcessingStatus.PROCESSING);
+      expect(eventRow.processingStatus).toBe(
+        InboundProcessingStatus.PROCESSING,
+      );
       expect(eventRow.processedAt).toBeNull();
       expect(
         (await prisma.story.findUniqueOrThrow({ where: { id: story.id } }))
@@ -3850,7 +3978,11 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
         const media = stagedObjects.get(key);
         return Promise.resolve(
           media
-            ? { size: media.size, sha256: media.sha256, mimeType: media.mimeType }
+            ? {
+                size: media.size,
+                sha256: media.sha256,
+                mimeType: media.mimeType,
+              }
             : null,
         );
       },
@@ -3925,7 +4057,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       expect(provider.calls).toHaveLength(0);
       expect(store.puts).toHaveLength(0);
       expect(
-        await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: event.id },
+        }),
       ).toMatchObject({
         processingStatus: InboundProcessingStatus.IGNORED,
         lastErrorCode: "IMAGE_NOT_ACCEPTED_IN_STATE",
@@ -3972,11 +4106,13 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       await prisma.inboundEvent.findUniqueOrThrow({ where: { id: first.id } }),
     ).toMatchObject({ processingStatus: InboundProcessingStatus.RECEIVED });
     expect(
-      await prisma.storyMedia.count({ where: { providerMediaId: "closure.image.blocked" } }),
+      await prisma.storyMedia.count({
+        where: { providerMediaId: "closure.image.blocked" },
+      }),
     ).toBe(0);
-    expect(
-      await prisma.story.count({ where: { reporterId: owner.id } }),
-    ).toBe(0);
+    expect(await prisma.story.count({ where: { reporterId: owner.id } })).toBe(
+      0,
+    );
     expect(provider.calls).toHaveLength(0);
     expect(store.puts).toHaveLength(0);
     expect(
@@ -4000,7 +4136,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
     const unknownProvider = new RecordingProvider(new ProofMediaProvider());
     const unknownStore = new RecordingStore(new ProofObjectStore());
     const unknownService = serviceWith(prisma, unknownProvider, unknownStore);
-    await expect(unknownService.process(unknownEvent.id)).resolves.toMatchObject({
+    await expect(
+      unknownService.process(unknownEvent.id),
+    ).resolves.toMatchObject({
       outcome: "IGNORED",
       reason: IGNORED_REASON.UNKNOWN,
     });
@@ -4024,8 +4162,14 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
     );
     const inactiveProvider = new RecordingProvider(new ProofMediaProvider());
     const inactiveStore = new RecordingStore(new ProofObjectStore());
-    const inactiveService = serviceWith(prisma, inactiveProvider, inactiveStore);
-    await expect(inactiveService.process(inactiveEvent.id)).resolves.toMatchObject({
+    const inactiveService = serviceWith(
+      prisma,
+      inactiveProvider,
+      inactiveStore,
+    );
+    await expect(
+      inactiveService.process(inactiveEvent.id),
+    ).resolves.toMatchObject({
       outcome: "IGNORED",
       reason: IGNORED_REASON.INACTIVE,
     });
@@ -4042,7 +4186,9 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
     expect(
       await prisma.storyMedia.count({
         where: {
-          providerMediaId: { in: ["closure.image.unknown", "closure.image.inactive"] },
+          providerMediaId: {
+            in: ["closure.image.unknown", "closure.image.inactive"],
+          },
         },
       }),
     ).toBe(0);
@@ -4076,8 +4222,11 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       await prisma.storyMedia.count({ where: { storyId: attackerStory.id } }),
     ).toBe(1);
     expect(
-      (await prisma.story.findUniqueOrThrow({ where: { id: attackerStory.id } }))
-        .version,
+      (
+        await prisma.story.findUniqueOrThrow({
+          where: { id: attackerStory.id },
+        })
+      ).version,
     ).toBe(1);
     const callsBeforeForged = provider.calls.length;
     const putsBeforeForged = store.puts.length;
@@ -4187,12 +4336,12 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       expect(JSON.stringify(audit.metadata)).not.toContain(
         "sensitive-caption-never-audited",
       );
-      expect(JSON.stringify({ ...audit, metadata: audit.metadata })).not.toContain(
-        owner.phoneNumber,
-      );
-      expect(JSON.stringify({ ...audit, metadata: audit.metadata })).not.toContain(
-        "https://",
-      );
+      expect(
+        JSON.stringify({ ...audit, metadata: audit.metadata }),
+      ).not.toContain(owner.phoneNumber);
+      expect(
+        JSON.stringify({ ...audit, metadata: audit.metadata }),
+      ).not.toContain("https://");
     }
     expect(audits[0]).toMatchObject({
       eventType: STORY_COLLECTION_AUDIT.STORY_MEDIA_ASSOCIATED,

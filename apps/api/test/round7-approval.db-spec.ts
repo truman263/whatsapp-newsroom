@@ -646,13 +646,19 @@ describe("Round 7B.2 approval authority", () => {
   });
   it("fails text fallback closed if candidate resolution returns multiple qualifying prompts", async () => {
     const x = await seed("multiple-fallback");
-    const lookup = jest.spyOn(prisma.draftPreparation, "findMany").mockResolvedValueOnce([
-      { id: x.preparation.id },
-      { id: x.preparation.id },
-    ] as never);
+    const lookup = jest
+      .spyOn(prisma.draftPreparation, "findMany")
+      .mockResolvedValueOnce([
+        { id: x.preparation.id },
+        { id: x.preparation.id },
+      ] as never);
     try {
-      await expect(x.service.process(x.event.id, { kind: "TEXT" })).rejects.toMatchObject({ code: "APPROVAL_AMBIGUOUS" });
-      expect(await prisma.approval.count({ where: { storyId: x.story.id } })).toBe(0);
+      await expect(
+        x.service.process(x.event.id, { kind: "TEXT" }),
+      ).rejects.toMatchObject({ code: "APPROVAL_AMBIGUOUS" });
+      expect(
+        await prisma.approval.count({ where: { storyId: x.story.id } }),
+      ).toBe(0);
     } finally {
       lookup.mockRestore();
     }
@@ -1033,6 +1039,8 @@ describe("Round 7B.2 approval authority", () => {
       );
       await expect(service.claim(following.id)).resolves.toEqual({
         outcome: "CLAIMED",
+        processingAttempt: 1,
+        processingContractVersion: 1,
       });
     },
   );

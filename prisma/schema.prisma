@@ -145,28 +145,29 @@ model Conversation {
 }
 
 model InboundEvent {
-  id                   String                  @id @default(uuid()) @db.Uuid
-  provider             Provider
-  providerMessageId    String                  @db.VarChar(191)
-  reporterId           String?                 @db.Uuid
-  senderPhone          String                  @db.VarChar(16)
-  senderIngestSequence BigInt                  @db.BigInt
-  eventType            InboundEventType
-  processingStatus     InboundProcessingStatus @default(RECEIVED)
-  rawPayload           Json
-  providerOccurredAt   DateTime?               @db.Timestamptz(3)
-  receivedAt           DateTime                @default(now()) @db.Timestamptz(3)
-  processingStartedAt  DateTime?               @db.Timestamptz(3)
-  processedAt          DateTime?               @db.Timestamptz(3)
-  processingAttempts   Int                     @default(0)
-  lastErrorCode        String?                 @db.VarChar(100)
-  lastErrorMessage     String?                 @db.Text
-  createdAt            DateTime                @default(now()) @db.Timestamptz(3)
-  updatedAt            DateTime                @updatedAt @db.Timestamptz(3)
-  reporter             Reporter?               @relation(fields: [reporterId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  approval             Approval?
-  draftPreparation     DraftPreparation?
-  auditLogs            AuditLog[]
+  id                        String                  @id @default(uuid()) @db.Uuid
+  provider                  Provider
+  providerMessageId         String                  @db.VarChar(191)
+  reporterId                String?                 @db.Uuid
+  senderPhone               String                  @db.VarChar(16)
+  senderIngestSequence      BigInt                  @db.BigInt
+  eventType                 InboundEventType
+  processingStatus          InboundProcessingStatus @default(RECEIVED)
+  rawPayload                Json
+  providerOccurredAt        DateTime?               @db.Timestamptz(3)
+  receivedAt                DateTime                @default(now()) @db.Timestamptz(3)
+  processingStartedAt       DateTime?               @db.Timestamptz(3)
+  processedAt               DateTime?               @db.Timestamptz(3)
+  processingAttempts        Int                     @default(0)
+  processingContractVersion Int?
+  lastErrorCode             String?                 @db.VarChar(100)
+  lastErrorMessage          String?                 @db.Text
+  createdAt                 DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt                 DateTime                @updatedAt @db.Timestamptz(3)
+  reporter                  Reporter?               @relation(fields: [reporterId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  approval                  Approval?
+  draftPreparation          DraftPreparation?
+  auditLogs                 AuditLog[]
 
   @@unique([provider, providerMessageId])
   @@unique([senderPhone, senderIngestSequence])
@@ -207,6 +208,7 @@ model OutboundMessage {
   draftPreparationApprovalPrompt DraftPreparation?     @relation("DraftPreparationApprovalPrompt")
 
   @@index([status, requestedAt])
+  @@index([status, updatedAt, id])
   @@index([reporterId])
   @@index([storyId])
   @@index([requestedAt])

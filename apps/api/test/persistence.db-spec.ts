@@ -319,6 +319,30 @@ describe("PostgreSQL persistence contract", () => {
       WHERE table_schema = current_schema()
         AND table_name = 'DraftPreparation'
     `;
+    const processingContractColumns = await prisma.$queryRaw<
+      Array<{
+        name: string;
+        data_type: string;
+        nullable: string;
+        default_value: string | null;
+      }>
+    >`
+      SELECT column_name AS name, data_type, is_nullable AS nullable,
+             column_default AS default_value
+      FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'InboundEvent'
+        AND column_name = 'processingContractVersion'
+    `;
+    const outboundRecoveryIndexes = await prisma.$queryRaw<
+      Array<{ indexname: string; indexdef: string }>
+    >`
+      SELECT indexname, indexdef
+      FROM pg_catalog.pg_indexes
+      WHERE schemaname = current_schema()
+        AND tablename = 'OutboundMessage'
+        AND indexname = 'OutboundMessage_status_updatedAt_id_idx'
+    `;
     const approvalColumns = await prisma.$queryRaw<
       Array<{ name: string; data_type: string; nullable: string }>
     >`
@@ -377,7 +401,19 @@ describe("PostgreSQL persistence contract", () => {
     ).toBe(23);
     expect(
       Number(indexes.find(({ unique_index }) => !unique_index)?.count),
-    ).toBe(32);
+    ).toBe(33);
+    expect(processingContractColumns).toEqual([
+      {
+        name: "processingContractVersion",
+        data_type: "integer",
+        nullable: "YES",
+        default_value: null,
+      },
+    ]);
+    expect(outboundRecoveryIndexes).toHaveLength(1);
+    expect(outboundRecoveryIndexes[0]?.indexdef).toContain(
+      '(status, "updatedAt", id)',
+    );
     expect(
       Number(
         columnTypes.find(

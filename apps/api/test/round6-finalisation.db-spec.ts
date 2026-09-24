@@ -538,7 +538,7 @@ describe("Round 6 Phase E", () => {
     const second = await prisma.inboundEvent.create({ data: { provider: Provider.WHATSAPP, providerMessageId: randomUUID(), senderPhone: base.senderPhone, senderIngestSequence: ingest++, eventType: InboundEventType.TEXT, rawPayload: base.rawPayload as Prisma.InputJsonValue, receivedAt: new Date(), providerOccurredAt: base.providerOccurredAt } });
     await expect(runtime.process.process(second.id)).resolves.toEqual({ outcome: "ORDER_BLOCKED" });
     await expect(runtime.process.process(first.eventId)).resolves.toMatchObject({ outcome: "IGNORED" });
-    await expect(runtime.process.claim(second.id)).resolves.toEqual({ outcome: "CLAIMED" });
+    await expect(runtime.process.claim(second.id)).resolves.toEqual({ outcome: "CLAIMED", processingAttempt: 1, processingContractVersion: 1 });
   });
 
   it("deterministically blocks when the selected category deactivates after Phase A commits", async () => {

@@ -38,7 +38,11 @@ export type TransitionResult =
   | { outcome: "NOT_FOUND_OR_NOT_OWNED" };
 
 export type EventClaimResult =
-  | { outcome: "CLAIMED" }
+  | {
+      outcome: "CLAIMED";
+      processingAttempt: number;
+      processingContractVersion: number;
+    }
   | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };
 

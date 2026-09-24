@@ -32,6 +32,7 @@ import {
   Round7ApprovalService,
 } from "./round7-approval.service";
 import { Round7PublishSagaService } from "../publishing/round7-publish-saga.service";
+import { CURRENT_INBOUND_PROCESSING_CONTRACT_VERSION } from "./inbound-processing-contract";
 
 type ProcessingPhase =
   | EventProcessingResult
@@ -68,26 +69,42 @@ export class InboundEventProcessingService {
 
   async claim(eventId: string): Promise<EventClaimResult> {
     const now = new Date();
-    const claimed = await this.prisma.$queryRaw<Array<{ id: string }>>`
+    const claimed = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        processingAttempts: number;
+        processingContractVersion: number;
+      }>
+    >`
       UPDATE "InboundEvent" AS candidate
       SET "processingStatus" = 'PROCESSING'::"InboundProcessingStatus",
           "processingStartedAt" = ${now},
           "processingAttempts" = candidate."processingAttempts" + 1,
+          "processingContractVersion" = COALESCE(candidate."processingContractVersion", ${CURRENT_INBOUND_PROCESSING_CONTRACT_VERSION}),
           "processedAt" = NULL,
           "lastErrorCode" = NULL,
           "lastErrorMessage" = NULL,
           "updatedAt" = ${now}
       WHERE candidate."id" = ${eventId}::uuid
         AND candidate."processingStatus" = 'RECEIVED'::"InboundProcessingStatus"
+        AND candidate."processingAttempts" >= 0
+        AND candidate."processingAttempts" < 2147483647
+        AND (candidate."processingContractVersion" IS NULL OR candidate."processingContractVersion" = ${CURRENT_INBOUND_PROCESSING_CONTRACT_VERSION})
         AND NOT EXISTS (
           SELECT 1 FROM "InboundEvent" AS earlier
           WHERE earlier."senderPhone" = candidate."senderPhone"
             AND earlier."senderIngestSequence" < candidate."senderIngestSequence"
             AND earlier."processingStatus" IN ('RECEIVED'::"InboundProcessingStatus", 'PROCESSING'::"InboundProcessingStatus")
         )
-      RETURNING candidate."id"
+      RETURNING candidate."id", candidate."processingAttempts", candidate."processingContractVersion"
     `;
-    if (claimed.length === 1) return { outcome: "CLAIMED" };
+    const winner = claimed[0];
+    if (winner && claimed.length === 1)
+      return {
+        outcome: "CLAIMED",
+        processingAttempt: winner.processingAttempts,
+        processingContractVersion: winner.processingContractVersion,
+      };
     const blocked = await this.prisma.$queryRaw<Array<{ blocked: boolean }>>`
       SELECT EXISTS (
         SELECT 1 FROM "InboundEvent" AS candidate
