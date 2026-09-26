@@ -30,6 +30,7 @@ import {
 import { ConversationProvisioningService } from "../src/modules/reporter-workflow/conversation-provisioning.service";
 import { ConversationStateMachineService } from "../src/modules/reporter-workflow/conversation-state-machine.service";
 import { InboundEventProcessingService } from "../src/modules/reporter-workflow/inbound-event-processing.service";
+import { InboundEventRecoveryService } from "../src/modules/reporter-workflow/inbound-event-recovery.service";
 import { supportsInboundProcessingContractVersion } from "../src/modules/reporter-workflow/inbound-processing-contract";
 import {
   IGNORED_REASON,
@@ -442,6 +443,273 @@ describe("Round 4B disposable PostgreSQL proof", () => {
         processingContractVersion: 1,
       });
       expect(claimedEvent?.processingStartedAt).toBeInstanceOf(Date);
+    } finally {
+      await Promise.all(pool.map((client) => client.$disconnect()));
+    }
+  });
+
+  it.each([true, false])(
+    "serializes stale reclaim behind an active transaction (commit=%s)",
+    async (commit) => {
+      const event = await inbound(phone(), `active-race-${commit}`);
+      await processor(prisma).claim(event.id);
+      await prisma.inboundEvent.update({
+        where: { id: event.id },
+        data: { processingStartedAt: new Date(0) },
+      });
+      let release!: () => void;
+      let locked!: (pid: number) => void;
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<number>((resolve) => {
+        locked = resolve;
+      });
+      const active = prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT "id" FROM "InboundEvent" WHERE "id"=${event.id}::uuid FOR UPDATE`;
+          const [row] = await tx.$queryRaw<
+            { pid: number }[]
+          >`SELECT pg_backend_pid() AS pid`;
+          locked(row!.pid);
+          await barrier;
+          await tx.inboundEvent.update({
+            where: { id: event.id },
+            data: { processingStatus: InboundProcessingStatus.PROCESSED },
+          });
+          if (!commit) throw new Error("intentional rollback");
+        },
+        { timeout: 30000 },
+      );
+      const activeResult = active.catch((error: unknown) => error);
+      const pid = await ready;
+      const recovery = new InboundEventRecoveryService(
+        prisma,
+        processor(prisma),
+      );
+      const pending = recovery.recoverStale(event.id, new Date(), 5);
+      try {
+        let observed = false;
+        for (let i = 0; i < 200; i++) {
+          const rows = await prisma.$queryRaw<
+            { blocked: boolean }[]
+          >`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ${pid}::int = ANY(pg_blocking_pids(pid))) AS blocked`;
+          if (rows[0]?.blocked) {
+            observed = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(observed).toBe(true);
+        expect(
+          (
+            await prisma.inboundEvent.findUniqueOrThrow({
+              where: { id: event.id },
+            })
+          ).processingAttempts,
+        ).toBe(1);
+      } finally {
+        release();
+      }
+      await activeResult;
+      expect(await pending).toMatchObject({
+        outcome: commit ? "NOT_PROCESSING" : "RECOVERED",
+      });
+      expect(
+        (
+          await prisma.inboundEvent.findUniqueOrThrow({
+            where: { id: event.id },
+          })
+        ).processingAttempts,
+      ).toBe(commit ? 1 : 2);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            inboundEventId: event.id,
+            eventType: "inbound_recovery_claimed",
+          },
+        }),
+      ).toBe(commit ? 0 : 1);
+    },
+  );
+
+  it("holds missing StoryMedia lineage before advancing generation", async () => {
+    const event = await inbound(phone(), "missing-media");
+    await processor(prisma).claim(event.id);
+    await prisma.inboundEvent.update({
+      where: { id: event.id },
+      data: { processingStartedAt: new Date(0) },
+    });
+    await prisma.auditLog.create({
+      data: {
+        eventType: "story_media_associated",
+        actorType: "SYSTEM",
+        inboundEventId: event.id,
+        entityType: "StoryMedia",
+        entityId: randomUUID(),
+      },
+    });
+    const before = await prisma.inboundEvent.findUniqueOrThrow({
+      where: { id: event.id },
+    });
+    const recovery = new InboundEventRecoveryService(prisma, processor(prisma));
+    for (let i = 0; i < 2; i++)
+      await expect(
+        recovery.recoverStale(event.id, new Date(), 5),
+      ).resolves.toEqual({ outcome: "LINEAGE_CONFLICT", operatorHeld: true });
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toEqual(before);
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          inboundEventId: event.id,
+          eventType: "inbound_recovery_operator_hold",
+        },
+      }),
+    ).toBe(1);
+  });
+
+  it("fences an old processing generation after reclaim advances the token", async () => {
+    const event = await inbound(phone(), "old-generation");
+    const service = processor(prisma);
+    const claimed = await service.claim(event.id);
+    if (claimed.outcome !== "CLAIMED") throw new Error("claim failed");
+    await prisma.inboundEvent.update({
+      where: { id: event.id },
+      data: {
+        processingAttempts: { increment: 1 },
+        processingStartedAt: new Date(),
+      },
+    });
+    await expect(
+      service.processClaimed({
+        eventId: event.id,
+        processingAttempt: claimed.processingAttempt,
+        processingContractVersion: claimed.processingContractVersion,
+      }),
+    ).rejects.toMatchObject({ code: "INBOUND_PROCESSING_FENCE_LOST" });
+    expect(
+      await prisma.inboundEvent.findUnique({
+        where: { id: event.id },
+        select: { processingStatus: true, processingAttempts: true },
+      }),
+    ).toEqual({
+      processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 2,
+    });
+  });
+
+  it.each([
+    {
+      version: null,
+      attempts: 1,
+      maxAttempts: 5,
+      outcome: "UNSUPPORTED_PROCESSING_CONTRACT",
+    },
+    {
+      version: 999,
+      attempts: 1,
+      maxAttempts: 5,
+      outcome: "UNSUPPORTED_PROCESSING_CONTRACT",
+    },
+    {
+      version: 1,
+      attempts: 5,
+      maxAttempts: 5,
+      outcome: "RECOVERY_ATTEMPTS_EXHAUSTED",
+    },
+  ])(
+    "holds stale processing safely for $outcome",
+    async ({ version, attempts, maxAttempts, outcome }) => {
+      const event = await inbound(
+        phone(),
+        `hold-${String(version)}-${attempts}`,
+      );
+      const started = new Date(Date.now() - 60_000);
+      await prisma.inboundEvent.update({
+        where: { id: event.id },
+        data: {
+          processingStatus: InboundProcessingStatus.PROCESSING,
+          processingStartedAt: started,
+          processingAttempts: attempts,
+          processingContractVersion: version,
+        },
+      });
+      const recovery = new InboundEventRecoveryService(
+        prisma,
+        processor(prisma),
+      );
+      await expect(
+        recovery.recoverStale(event.id, new Date(), maxAttempts),
+      ).resolves.toMatchObject({ outcome, operatorHeld: true });
+      await recovery.recoverStale(event.id, new Date(), maxAttempts);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            inboundEventId: event.id,
+            eventType: "inbound_recovery_operator_hold",
+          },
+        }),
+      ).toBe(1);
+      expect(
+        await prisma.inboundEvent.findUnique({
+          where: { id: event.id },
+          select: {
+            processingStatus: true,
+            processingAttempts: true,
+            processingContractVersion: true,
+            processingStartedAt: true,
+          },
+        }),
+      ).toEqual({
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        processingAttempts: attempts,
+        processingContractVersion: version,
+        processingStartedAt: started,
+      });
+    },
+  );
+
+  it("awards one new generation under 20-way stale reclaim contention", async () => {
+    const event = await inbound(phone(), "stale-contention");
+    await prisma.inboundEvent.update({
+      where: { id: event.id },
+      data: {
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        processingStartedAt: new Date(Date.now() - 60_000),
+        processingAttempts: 7,
+        processingContractVersion: 1,
+      },
+    });
+    const pool = await clients(20);
+    try {
+      const results = await Promise.all(
+        pool.map((client) =>
+          new InboundEventRecoveryService(
+            client,
+            processor(client),
+          ).recoverStale(event.id, new Date(), 20),
+        ),
+      );
+      expect(
+        results.filter(({ outcome }) => outcome === "RECOVERED"),
+      ).toHaveLength(1);
+      expect(
+        await prisma.auditLog.count({
+          where: {
+            inboundEventId: event.id,
+            eventType: "inbound_recovery_claimed",
+          },
+        }),
+      ).toBe(1);
+      expect(
+        (
+          await prisma.inboundEvent.findUniqueOrThrow({
+            where: { id: event.id },
+          })
+        ).processingAttempts,
+      ).toBe(8);
     } finally {
       await Promise.all(pool.map((client) => client.$disconnect()));
     }
@@ -3357,6 +3625,63 @@ describe("Round 5B.2 PostgreSQL closure proofs", () => {
       new MediaStagingService(client, provider, store),
     );
   }
+
+  it("prevents an old media generation from completing after reclaim", async () => {
+    const { owner, story } = await collectingStory();
+    const providerMediaId = "closure.old-generation";
+    const provider = new RecordingProvider({
+      fetch: async (): Promise<DownloadedMedia> => {
+        const event = await prisma.inboundEvent.findFirstOrThrow({
+          where: { providerMessageId: { contains: "closure-old-generation" } },
+        });
+        await prisma.inboundEvent.update({
+          where: { id: event.id },
+          data: { processingAttempts: 2, processingStartedAt: new Date() },
+        });
+        return {
+          bytes: JPEG,
+          mimeType: "image/jpeg",
+          size: JPEG.length,
+          sha256: JPEG_SHA,
+        };
+      },
+    });
+    const service = serviceWith(prisma, provider, new ProofObjectStore());
+    const event = await storedEvent(
+      owner.phoneNumber,
+      "closure-old-generation",
+      InboundEventType.IMAGE,
+      { image: { id: providerMediaId, mime_type: "image/jpeg" } },
+    );
+    await expect(service.process(event.id)).resolves.toMatchObject({
+      outcome: "RETRY_REQUIRED",
+    });
+    expect(
+      await prisma.storyMedia.findUniqueOrThrow({
+        where: { providerMediaId },
+      }),
+    ).toMatchObject({
+      storyId: story.id,
+      status: MediaProcessingStatus.FETCHING,
+      sha256: null,
+      fileSizeBytes: null,
+    });
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({ where: { id: event.id } }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 2,
+      processedAt: null,
+    });
+    expect(
+      await prisma.auditLog.count({
+        where: {
+          inboundEventId: event.id,
+          eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_STAGED,
+        },
+      }),
+    ).toBe(0);
+  });
 
   it("commits the full staging intent before any external I/O and never re-increments the Story version", async () => {
     const { owner, story } = await collectingStory();

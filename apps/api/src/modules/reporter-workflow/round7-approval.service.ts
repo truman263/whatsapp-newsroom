@@ -18,6 +18,11 @@ import {
 } from "@prisma/client";
 import type { ApplicationConfiguration } from "../../config/configuration";
 import { PrismaService } from "../../database/prisma.service";
+import {
+  readInboundProcessingClaim,
+  requireInboundProcessingClaim,
+  type InboundProcessingClaim,
+} from "./inbound-processing-contract";
 import type { ParsedStoredEvent } from "../story-collection/story-collection.types";
 import { WordPressDraftClient } from "../wordpress-draft/wordpress-draft.client";
 import type { CanonicalDraftState } from "../wordpress-draft/wordpress-draft-state";
@@ -90,9 +95,14 @@ export class Round7ApprovalService {
   ) {}
 
   async process(
-    eventId: string,
+    claimOrEventId: InboundProcessingClaim | string,
     control: ApprovalControl,
   ): Promise<ApprovalHandoff> {
+    const claim =
+      typeof claimOrEventId === "string"
+        ? await readInboundProcessingClaim(this.prisma, claimOrEventId)
+        : claimOrEventId;
+    const eventId = claim.eventId;
     const event = await this.prisma.inboundEvent.findUnique({
       where: { id: eventId },
     });
@@ -115,11 +125,18 @@ export class Round7ApprovalService {
     const candidate = await this.resolveCandidate(reporter.id, control);
     await this.phaseZero(candidate);
     return this.prisma.$transaction((tx) =>
-      this.approve(tx, eventId, reporter.id, candidate),
+      this.approve(tx, claim, reporter.id, candidate),
     );
   }
 
-  async recover(eventId: string): Promise<ApprovalHandoff | null> {
+  async recover(
+    claimOrEventId: InboundProcessingClaim | string,
+  ): Promise<ApprovalHandoff | null> {
+    const claim =
+      typeof claimOrEventId === "string"
+        ? await readInboundProcessingClaim(this.prisma, claimOrEventId)
+        : claimOrEventId;
+    const eventId = claim.eventId;
     const event = await this.prisma.inboundEvent.findUnique({
       where: { id: eventId },
       select: { processingStatus: true, reporterId: true },
@@ -368,13 +385,14 @@ export class Round7ApprovalService {
 
   private async approve(
     tx: Prisma.TransactionClient,
-    eventId: string,
+    claim: InboundProcessingClaim,
     reporterId: string,
     snapshot: NonNullable<Candidate>,
   ): Promise<ApprovalHandoff> {
+    const eventId = claim.eventId;
     const s = snapshot.story,
       p = snapshot.approvalPromptOutboundMessage!;
-    await tx.$queryRaw`SELECT "id" FROM "InboundEvent" WHERE "id"=${eventId}::uuid FOR UPDATE`;
+    await requireInboundProcessingClaim(tx, claim);
     await tx.$queryRaw`SELECT "id" FROM "Reporter" WHERE "id"=${reporterId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Conversation" WHERE "id"=${s.activeInConversation!.id}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Story" WHERE "id"=${s.id}::uuid FOR UPDATE`;

@@ -31,7 +31,7 @@ function processor(
 }
 
 describe("Round 7 publication processing integration", () => {
-  it("routes an exact durable Approval recovery handoff into the same saga", async () => {
+  it("does not opportunistically recover a PROCESSING Approval without a stale claim", async () => {
     const recover = jest.fn().mockResolvedValue({
       outcome: "APPROVAL_PENDING",
       approvalId: "approval",
@@ -43,13 +43,11 @@ describe("Round 7 publication processing integration", () => {
       publishAttemptId: "attempt",
       storyId: "story",
     });
-    await expect(
-      processor(recover, run).process("event"),
-    ).resolves.toMatchObject({
-      outcome: "PROCESSED",
-      publishAttemptId: "attempt",
+    await expect(processor(recover, run).process("event")).resolves.toEqual({
+      outcome: "NOT_CLAIMED",
     });
-    expect(run).toHaveBeenCalledWith("attempt");
+    expect(recover).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
   });
 
   it("does not enter publication when a PROCESSING event has no Approval lineage", async () => {

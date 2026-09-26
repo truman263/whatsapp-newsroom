@@ -20,6 +20,11 @@ import {
 import type { ApplicationConfiguration } from "../../config/configuration";
 import { PrismaService } from "../../database/prisma.service";
 import {
+  readInboundProcessingClaim,
+  requireInboundProcessingClaim,
+  type InboundProcessingClaim,
+} from "../reporter-workflow/inbound-processing-contract";
+import {
   MEDIA_OBJECT_STORE,
   mediaObjectKey,
   type MediaObjectStore,
@@ -233,9 +238,26 @@ export class DraftPreparationService {
     };
   }
 
-  async prepare(preparationId: string): Promise<PreparationOutcome> {
+  async prepare(
+    preparationId: string,
+    claim?: InboundProcessingClaim,
+  ): Promise<PreparationOutcome> {
+    if (!claim) {
+      const row = await this.prisma.draftPreparation.findUniqueOrThrow({
+        where: { id: preparationId },
+      });
+      if (
+        [
+          DraftPreparationStatus.FAILED,
+          DraftPreparationStatus.READY_FOR_APPROVAL,
+          DraftPreparationStatus.SUPERSEDED,
+        ].some((status) => status === row.status)
+      )
+        return { preparationId, outcome: "TERMINAL" };
+      claim = await readInboundProcessingClaim(this.prisma, row.inboundEventId);
+    }
     try {
-      let aggregate = await this.revalidate(preparationId, true);
+      let aggregate = await this.revalidate(preparationId, true, false, claim);
       if (
         aggregate.preparation.status === DraftPreparationStatus.FAILED ||
         aggregate.preparation.status ===
@@ -249,6 +271,7 @@ export class DraftPreparationService {
             tx,
             aggregate.story.id,
             preparationId,
+            claim,
           );
           await tx.story.updateMany({
             where: {
@@ -267,12 +290,12 @@ export class DraftPreparationService {
           });
         });
       }
-      aggregate = await this.revalidate(preparationId, true);
+      aggregate = await this.revalidate(preparationId, true, false, claim);
       for (const item of aggregate.story.media)
-        await this.reconcileMedia(aggregate.preparation, item);
-      aggregate = await this.revalidate(preparationId, true);
-      const postId = await this.reconcileDraftIdentity(aggregate);
-      aggregate = await this.revalidate(preparationId, true);
+        await this.reconcileMedia(aggregate.preparation, item, claim);
+      aggregate = await this.revalidate(preparationId, true, false, claim);
+      const postId = await this.reconcileDraftIdentity(aggregate, claim);
+      aggregate = await this.revalidate(preparationId, true, false, claim);
       const desired = this.desiredState(aggregate.story);
       await this.reconcileDraftState(
         aggregate.preparation,
@@ -280,20 +303,30 @@ export class DraftPreparationService {
         aggregate.story.wordpressDraftKey,
         postId,
         desired,
+        claim,
       );
       return { preparationId, outcome: "PREPARED" };
     } catch (error) {
       if (error instanceof DraftPreparationError)
-        return this.persistFailure(preparationId, error.code);
+        return this.persistFailure(preparationId, error.code, claim);
       return this.persistFailure(
         preparationId,
         "WORDPRESS_DRAFT_RECONCILIATION_REQUIRED",
+        claim,
       );
     }
   }
 
-  recoverPreparation(preparationId: string): Promise<PreparationOutcome> {
-    return this.prepare(preparationId);
+  async recoverPreparation(preparationId: string): Promise<PreparationOutcome> {
+    const row = await this.prisma.draftPreparation.findUniqueOrThrow({
+      where: { id: preparationId },
+      select: { inboundEventId: true },
+    });
+    const claim = await readInboundProcessingClaim(
+      this.prisma,
+      row.inboundEventId,
+    );
+    return this.prepare(preparationId, claim);
   }
 
   async recoverUnfinished(limit: number): Promise<PreparationOutcome[]> {
@@ -313,14 +346,28 @@ export class DraftPreparationService {
       select: { id: true },
     });
     const results: PreparationOutcome[] = [];
-    for (const row of rows) results.push(await this.prepare(row.id));
+    for (const row of rows) results.push(await this.recoverPreparation(row.id));
     return results;
   }
 
   async verifyPreparedAuthority(
     preparationId: string,
+    claim?: InboundProcessingClaim,
   ): Promise<PreparedAuthority> {
-    const aggregate = await this.revalidate(preparationId, false, true);
+    if (!claim) {
+      const row = await this.prisma.draftPreparation.findUniqueOrThrow({
+        where: { id: preparationId },
+        include: { inboundEvent: true },
+      });
+      if (
+        row.inboundEvent.processingStatus === InboundProcessingStatus.PROCESSING
+      )
+        claim = await readInboundProcessingClaim(
+          this.prisma,
+          row.inboundEventId,
+        );
+    }
+    const aggregate = await this.revalidate(preparationId, false, true, claim);
     const prep = aggregate.preparation;
     if (
       !new Set<DraftPreparationStatus>([
@@ -355,7 +402,11 @@ export class DraftPreparationService {
       )
         throw new Error("mismatch");
     } catch {
-      await this.persistFailure(preparationId, "WORDPRESS_STATE_MISMATCH");
+      await this.persistFailure(
+        preparationId,
+        "WORDPRESS_STATE_MISMATCH",
+        claim,
+      );
       throw new DraftPreparationError("WORDPRESS_STATE_MISMATCH");
     }
     return {
@@ -373,6 +424,7 @@ export class DraftPreparationService {
     preparationId: string,
     retryBlocked: boolean,
     allowPhaseE = false,
+    claim?: InboundProcessingClaim,
   ): Promise<{ preparation: DraftPreparation; story: Aggregate }> {
     return this.prisma.$transaction(async (tx) => {
       const prepRow = await tx.draftPreparation.findUnique({
@@ -381,6 +433,7 @@ export class DraftPreparationService {
       });
       if (!prepRow)
         throw new DraftPreparationError("STORY_FINALISATION_CONFLICT");
+      if (claim) await requireInboundProcessingClaim(tx, claim);
       await this.lockWorkerAggregate(tx, preparationId, prepRow.storyId);
       const preparation = await tx.draftPreparation.findUniqueOrThrow({
         where: { id: preparationId },
@@ -452,6 +505,7 @@ export class DraftPreparationService {
   private async reconcileMedia(
     preparation: DraftPreparation,
     item: StoryMedia,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
     if (this.objects instanceof UnconfiguredMediaObjectStore)
       throw new DraftPreparationError("MEDIA_OBJECT_STORE_UNCONFIGURED");
@@ -480,7 +534,7 @@ export class DraftPreparationService {
     if (item.status === MediaProcessingStatus.UPLOADING) {
       try {
         const remote = await this.mediaClient.getMediaByKey(item.id);
-        await this.persistMedia(preparation, item, remote.attachmentId);
+        await this.persistMedia(preparation, item, remote.attachmentId, claim);
         return;
       } catch (error) {
         if (error instanceof WordPressMediaError && error.code === "NOT_FOUND")
@@ -493,7 +547,12 @@ export class DraftPreparationService {
     const bytes = await this.verifiedBytes(item);
     if (item.status === MediaProcessingStatus.FETCHED)
       await this.prisma.$transaction(async (tx) => {
-        await this.lockStoryPreparation(tx, item.storyId, preparation.id);
+        await this.lockStoryPreparation(
+          tx,
+          item.storyId,
+          preparation.id,
+          claim,
+        );
         await tx.storyMedia.updateMany({
           where: {
             id: item.id,
@@ -510,7 +569,7 @@ export class DraftPreparationService {
         mimeType: item.mimeType,
         body: bytes,
       });
-      await this.persistMedia(preparation, item, result.attachmentId);
+      await this.persistMedia(preparation, item, result.attachmentId, claim);
     } catch (error) {
       throw mapMediaError(error, false);
     }
@@ -545,9 +604,10 @@ export class DraftPreparationService {
     preparation: DraftPreparation,
     item: StoryMedia,
     attachmentId: number,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
-      await this.lockStoryPreparation(tx, item.storyId, preparation.id);
+      await this.lockStoryPreparation(tx, item.storyId, preparation.id, claim);
       await tx.storyMedia.update({
         where: { id: item.id },
         data: {
@@ -569,10 +629,13 @@ export class DraftPreparationService {
     });
   }
 
-  private async reconcileDraftIdentity(aggregate: {
-    preparation: DraftPreparation;
-    story: Aggregate;
-  }): Promise<number> {
+  private async reconcileDraftIdentity(
+    aggregate: {
+      preparation: DraftPreparation;
+      story: Aggregate;
+    },
+    claim?: InboundProcessingClaim,
+  ): Promise<number> {
     const { preparation, story } = aggregate;
     if (story.wordpressPostId) {
       if (
@@ -592,6 +655,7 @@ export class DraftPreparationService {
           story.id,
           remote.wordpressPostId,
           existingAttempt?.id ?? null,
+          claim,
         );
         return remote.wordpressPostId;
       } catch (error) {
@@ -602,6 +666,7 @@ export class DraftPreparationService {
       preparation,
       PublishOperation.CREATE_DRAFT,
       `draft-create:${preparation.id}`,
+      claim,
     );
     let result;
     try {
@@ -620,7 +685,11 @@ export class DraftPreparationService {
         else throw error;
       }
     } catch (error) {
-      await this.updateAttempt(attempt.id, mapDraftError(error, false).code);
+      await this.updateAttempt(
+        attempt.id,
+        mapDraftError(error, false).code,
+        claim,
+      );
       throw mapDraftError(error, false);
     }
     await this.persistDraftIdentity(
@@ -628,6 +697,7 @@ export class DraftPreparationService {
       story.id,
       result.wordpressPostId,
       attempt.id,
+      claim,
     );
     return result.wordpressPostId;
   }
@@ -637,9 +707,10 @@ export class DraftPreparationService {
     storyId: string,
     postId: number,
     attemptId: string | null,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
-      await this.lockStoryPreparation(tx, storyId, preparation.id);
+      await this.lockStoryPreparation(tx, storyId, preparation.id, claim);
       const story = await tx.story.findUniqueOrThrow({
         where: { id: storyId },
       });
@@ -692,11 +763,13 @@ export class DraftPreparationService {
     key: string,
     postId: number,
     desired: CanonicalDraftState,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
     const attempt = await this.claimAttempt(
       preparation,
       PublishOperation.SYNC_DRAFT,
       `draft-sync:${preparation.id}:${preparation.storyVersion}`,
+      claim,
     );
     try {
       let current = await this.drafts.getDraftState(key);
@@ -748,6 +821,7 @@ export class DraftPreparationService {
           storyId,
           preparation.id,
           attempt.id,
+          claim,
         );
         await tx.draftPreparation.update({
           where: { id: preparation.id },
@@ -784,7 +858,7 @@ export class DraftPreparationService {
         error instanceof DraftPreparationError
           ? error
           : mapDraftError(error, false);
-      await this.updateAttempt(attempt.id, mapped.code);
+      await this.updateAttempt(attempt.id, mapped.code, claim);
       throw mapped;
     }
   }
@@ -811,9 +885,15 @@ export class DraftPreparationService {
     preparation: DraftPreparation,
     operation: PublishOperation,
     idempotencyKey: string,
+    claim?: InboundProcessingClaim,
   ): Promise<PublishAttempt> {
     return this.prisma.$transaction(async (tx) => {
-      await this.lockStoryPreparation(tx, preparation.storyId, preparation.id);
+      await this.lockStoryPreparation(
+        tx,
+        preparation.storyId,
+        preparation.id,
+        claim,
+      );
       let attempt = await tx.publishAttempt.findUnique({
         where: { idempotencyKey },
       });
@@ -850,23 +930,28 @@ export class DraftPreparationService {
   private async updateAttempt(
     id: string,
     code: DraftPreparationCode,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
-    await this.prisma.publishAttempt.update({
-      where: { id },
-      data: {
-        status:
-          statusFor(code) === DraftPreparationStatus.RECONCILIATION_REQUIRED
-            ? PublishAttemptStatus.RECONCILIATION_REQUIRED
-            : PublishAttemptStatus.FAILED,
-        errorCode: code,
-        errorMessage: null,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      if (claim) await requireInboundProcessingClaim(tx, claim);
+      await tx.publishAttempt.update({
+        where: { id },
+        data: {
+          status:
+            statusFor(code) === DraftPreparationStatus.RECONCILIATION_REQUIRED
+              ? PublishAttemptStatus.RECONCILIATION_REQUIRED
+              : PublishAttemptStatus.FAILED,
+          errorCode: code,
+          errorMessage: null,
+        },
+      });
     });
   }
 
   private async persistFailure(
     preparationId: string,
     code: DraftPreparationCode,
+    claim?: InboundProcessingClaim,
   ): Promise<PreparationOutcome> {
     const status = statusFor(code);
     const existing = await this.prisma.draftPreparation.findUnique({
@@ -875,7 +960,12 @@ export class DraftPreparationService {
     });
     if (existing)
       await this.prisma.$transaction(async (tx) => {
-        await this.lockStoryPreparation(tx, existing.storyId, preparationId);
+        await this.lockStoryPreparation(
+          tx,
+          existing.storyId,
+          preparationId,
+          claim,
+        );
         await tx.draftPreparation.update({
           where: { id: preparationId },
           data: {
@@ -969,7 +1059,9 @@ export class DraftPreparationService {
     tx: Prisma.TransactionClient,
     storyId: string,
     preparationId: string,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
+    if (claim) await requireInboundProcessingClaim(tx, claim);
     await tx.$queryRaw`SELECT "id" FROM "Story" WHERE "id"=${storyId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "DraftPreparation" WHERE "id"=${preparationId}::uuid FOR UPDATE`;
   }
@@ -978,8 +1070,9 @@ export class DraftPreparationService {
     storyId: string,
     preparationId: string,
     attemptId: string,
+    claim?: InboundProcessingClaim,
   ): Promise<void> {
-    await this.lockStoryPreparation(tx, storyId, preparationId);
+    await this.lockStoryPreparation(tx, storyId, preparationId, claim);
     await tx.$queryRaw`SELECT "id" FROM "PublishAttempt" WHERE "id"=${attemptId}::uuid FOR UPDATE`;
   }
 

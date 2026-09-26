@@ -1,5 +1,6 @@
 import type { ConversationState } from "@prisma/client";
 import type { StoryIgnoredReason } from "../story-collection/story-collection.types";
+import type { InboundProcessingClaim } from "./inbound-processing-contract";
 
 export type ProvisionReporterInput = {
   phoneNumber: string;
@@ -45,6 +46,21 @@ export type EventClaimResult =
     }
   | { outcome: "ORDER_BLOCKED" }
   | { outcome: "NOT_CLAIMED" };
+
+export type InboundRecoveryRoute =
+  "APPROVAL_PUBLISH" | "DRAFT_PREPARATION" | "STORY_MEDIA" | "NO_LINEAGE";
+
+export type InboundRecoveryResult =
+  | {
+      outcome: "RECOVERED";
+      route: InboundRecoveryRoute;
+      claim: InboundProcessingClaim;
+    }
+  | { outcome: "NOT_STALE" | "NOT_PROCESSING" | "ORDER_BLOCKED" }
+  | { outcome: "UNSUPPORTED_PROCESSING_CONTRACT"; operatorHeld: true }
+  | { outcome: "RECOVERY_ATTEMPTS_EXHAUSTED"; operatorHeld: true }
+  | { outcome: "LINEAGE_CONFLICT"; operatorHeld: true }
+  | { outcome: "FENCE_LOST" };
 
 export type EventProcessingResult =
   | { outcome: "PROCESSED"; reporterId: string; conversationId: string }

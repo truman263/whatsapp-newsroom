@@ -199,6 +199,9 @@ async function seed(
       senderIngestSequence: 2n,
       eventType: InboundEventType.TEXT,
       processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 1,
+      processingContractVersion: 1,
+      processingStartedAt: receivedAt,
       receivedAt,
       rawPayload: { message: {} },
     },
@@ -259,6 +262,58 @@ async function seed(
 }
 
 describe("Round 7B.2 approval authority", () => {
+  it("fences approval after Phase 0 loses its event generation", async () => {
+    const x = await seed("old-generation");
+    x.draft.beforeGet = async () => {
+      await prisma.inboundEvent.update({
+        where: { id: x.event.id },
+        data: { processingAttempts: 2 },
+      });
+    };
+    await expect(
+      x.service.process(x.event.id, { kind: "TEXT" }),
+    ).rejects.toMatchObject({ code: "INBOUND_PROCESSING_FENCE_LOST" });
+    expect(
+      await prisma.approval.count({ where: { inboundEventId: x.event.id } }),
+    ).toBe(0);
+    expect(
+      await prisma.publishAttempt.count({
+        where: { storyId: x.story.id, operation: PublishOperation.PUBLISH },
+      }),
+    ).toBe(0);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: x.story.id } }),
+    ).toEqual(x.story);
+  });
+
+  it.each([null, 999])(
+    "rejects direct approval entries for contract %s before Phase 0",
+    async (version) => {
+      const x = await seed(`unsupported-${version}`);
+      await prisma.inboundEvent.update({
+        where: { id: x.event.id },
+        data: { processingContractVersion: version },
+      });
+      const before = await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: x.event.id },
+      });
+      await expect(
+        x.service.process(x.event.id, { kind: "TEXT" }),
+      ).rejects.toMatchObject({ code: "INBOUND_PROCESSING_FENCE_LOST" });
+      await expect(x.service.recover(x.event.id)).rejects.toMatchObject({
+        code: "INBOUND_PROCESSING_FENCE_LOST",
+      });
+      expect(x.draft.calls).toBe(0);
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: x.event.id },
+        }),
+      ).toEqual(before);
+      expect(
+        await prisma.approval.count({ where: { inboundEventId: x.event.id } }),
+      ).toBe(0);
+    },
+  );
   beforeAll(() => prisma.$connect());
   afterAll(() => prisma.$disconnect());
   it.each([OutboundMessageStatus.SENT, OutboundMessageStatus.DELIVERED])(

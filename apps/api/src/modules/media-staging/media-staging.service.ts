@@ -6,6 +6,11 @@ import {
   MediaProcessingStatus,
 } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
+import {
+  readInboundProcessingClaim,
+  requireInboundProcessingClaim,
+  type InboundProcessingClaim,
+} from "../reporter-workflow/inbound-processing-contract";
 import { MEDIA_STAGING_AUDIT } from "./media-staging.audit";
 import { MediaStagingError } from "./media-staging.errors";
 import {
@@ -33,14 +38,21 @@ export class MediaStagingService {
 
   async stage(
     mediaId: string,
-    eventId: string,
+    claimOrEventId: InboundProcessingClaim | string,
     authority: MediaAuthority,
   ): Promise<MediaStageResult> {
-    const claimed = await this.prisma.storyMedia.updateMany({
-      where: { id: mediaId, status: MediaProcessingStatus.RECEIVED },
-      data: { status: MediaProcessingStatus.FETCHING },
+    const claim =
+      typeof claimOrEventId === "string"
+        ? await readInboundProcessingClaim(this.prisma, claimOrEventId)
+        : claimOrEventId;
+    const claimed = await this.prisma.$transaction(async (tx) => {
+      await requireInboundProcessingClaim(tx, claim);
+      return tx.storyMedia.updateMany({
+        where: { id: mediaId, status: MediaProcessingStatus.RECEIVED },
+        data: { status: MediaProcessingStatus.FETCHING },
+      });
     });
-    if (claimed.count !== 1) return this.reconcile(mediaId, eventId);
+    if (claimed.count !== 1) return this.reconcile(mediaId, claim);
     try {
       const downloaded = await this.provider.fetch(authority);
       const key = mediaObjectKey(mediaId);
@@ -51,7 +63,7 @@ export class MediaStagingService {
       const verified = await this.verify(key, downloaded.mimeType);
       if (!matches(verified, downloaded))
         throw new MediaStagingError("MEDIA_OBJECT_CONFLICT", true);
-      return await this.complete(mediaId, eventId, verified);
+      return await this.complete(mediaId, claim, verified);
     } catch (error: unknown) {
       const failure =
         error instanceof MediaStagingError
@@ -59,17 +71,38 @@ export class MediaStagingService {
           : new MediaStagingError("MEDIA_OBJECT_UNAVAILABLE", false);
       if (!failure.definitive)
         return { outcome: "RETRY_REQUIRED", reason: failure.code };
-      await this.fail(mediaId, eventId, failure.code);
+      await this.fail(mediaId, claim, failure.code);
       return { outcome: "FAILED", reason: failure.code };
     }
   }
 
-  async reconcile(mediaId: string, eventId: string): Promise<MediaStageResult> {
+  async reconcile(
+    mediaId: string,
+    claimOrEventId: InboundProcessingClaim | string,
+  ): Promise<MediaStageResult> {
+    if (typeof claimOrEventId === "string") {
+      const terminal = await this.prisma.storyMedia.findUnique({
+        where: { id: mediaId },
+        select: { status: true },
+      });
+      if (terminal?.status === MediaProcessingStatus.FETCHED) {
+        const event = await this.prisma.inboundEvent.findUnique({
+          where: { id: claimOrEventId },
+          select: { processingStatus: true },
+        });
+        if (event?.processingStatus === InboundProcessingStatus.PROCESSED)
+          return { outcome: "PROCESSED" };
+      }
+    }
+    const claim =
+      typeof claimOrEventId === "string"
+        ? await readInboundProcessingClaim(this.prisma, claimOrEventId)
+        : claimOrEventId;
     const media = await this.prisma.storyMedia.findUniqueOrThrow({
       where: { id: mediaId },
     });
     if (media.status === MediaProcessingStatus.FETCHED) {
-      await this.ensureEventProcessed(eventId);
+      await this.ensureEventProcessed(claim);
       return { outcome: "PROCESSED" };
     }
     if (media.status === MediaProcessingStatus.FAILED)
@@ -81,7 +114,7 @@ export class MediaStagingService {
         mediaObjectKey(media.id),
         media.mimeType,
       );
-      return await this.complete(media.id, eventId, verified);
+      return await this.complete(media.id, claim, verified);
     } catch (error: unknown) {
       const failure =
         error instanceof MediaStagingError
@@ -100,10 +133,11 @@ export class MediaStagingService {
 
   private async complete(
     mediaId: string,
-    eventId: string,
+    claim: InboundProcessingClaim,
     verified: { size: number; sha256: string; mimeType: string },
   ): Promise<MediaStageResult> {
     return this.prisma.$transaction(async (tx) => {
+      await requireInboundProcessingClaim(tx, claim);
       await tx.$queryRaw`SELECT "id" FROM "StoryMedia" WHERE "id" = ${mediaId}::uuid FOR UPDATE`;
       const media = await tx.storyMedia.findUniqueOrThrow({
         where: { id: mediaId },
@@ -126,7 +160,7 @@ export class MediaStagingService {
       });
       const association = await tx.auditLog.findFirstOrThrow({
         where: {
-          inboundEventId: eventId,
+          inboundEventId: claim.eventId,
           eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_ASSOCIATED,
         },
       });
@@ -136,7 +170,7 @@ export class MediaStagingService {
           actorType: AuditActorType.REPORTER,
           reporterId: association.reporterId,
           storyId: media.storyId,
-          inboundEventId: eventId,
+          inboundEventId: claim.eventId,
           entityType: "StoryMedia",
           entityId: media.id,
           metadata: {
@@ -148,8 +182,10 @@ export class MediaStagingService {
       });
       await tx.inboundEvent.updateMany({
         where: {
-          id: eventId,
+          id: claim.eventId,
           processingStatus: InboundProcessingStatus.PROCESSING,
+          processingAttempts: claim.processingAttempt,
+          processingContractVersion: claim.processingContractVersion,
         },
         data: {
           processingStatus: InboundProcessingStatus.PROCESSED,
@@ -164,17 +200,18 @@ export class MediaStagingService {
 
   private async fail(
     mediaId: string,
-    eventId: string,
+    claim: InboundProcessingClaim,
     code: string,
   ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
+      await requireInboundProcessingClaim(tx, claim);
       const media = await tx.storyMedia.update({
         where: { id: mediaId },
         data: { status: MediaProcessingStatus.FAILED },
       });
       const association = await tx.auditLog.findFirstOrThrow({
         where: {
-          inboundEventId: eventId,
+          inboundEventId: claim.eventId,
           eventType: MEDIA_STAGING_AUDIT.STORY_MEDIA_ASSOCIATED,
         },
       });
@@ -184,14 +221,14 @@ export class MediaStagingService {
           actorType: AuditActorType.REPORTER,
           reporterId: association.reporterId,
           storyId: media.storyId,
-          inboundEventId: eventId,
+          inboundEventId: claim.eventId,
           entityType: "StoryMedia",
           entityId: media.id,
           metadata: { code },
         },
       });
       await tx.inboundEvent.update({
-        where: { id: eventId },
+        where: { id: claim.eventId },
         data: {
           processingStatus: InboundProcessingStatus.FAILED,
           processedAt: new Date(),
@@ -202,18 +239,20 @@ export class MediaStagingService {
     });
   }
 
-  private async ensureEventProcessed(eventId: string): Promise<void> {
-    await this.prisma.inboundEvent.updateMany({
-      where: {
-        id: eventId,
-        processingStatus: InboundProcessingStatus.PROCESSING,
-      },
-      data: {
-        processingStatus: InboundProcessingStatus.PROCESSED,
-        processedAt: new Date(),
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
+  private async ensureEventProcessed(
+    claim: InboundProcessingClaim,
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await requireInboundProcessingClaim(tx, claim);
+      await tx.inboundEvent.update({
+        where: { id: claim.eventId },
+        data: {
+          processingStatus: InboundProcessingStatus.PROCESSED,
+          processedAt: new Date(),
+          lastErrorCode: null,
+          lastErrorMessage: null,
+        },
+      });
     });
   }
 }

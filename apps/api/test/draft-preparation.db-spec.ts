@@ -76,6 +76,7 @@ class DraftAuthority {
   calls: string[] = [];
   posts = new Map<string, { postId: number; state?: CanonicalDraftState }>();
   createError?: WordPressDraftError;
+  beforeCreate?: () => Promise<void>;
   syncError?: WordPressDraftError;
   getDraftByKey(key: string): Promise<{
     wordpressDraftKey: string;
@@ -94,13 +95,14 @@ class DraftAuthority {
       status: "draft",
     });
   }
-  createDraft(input: { wordpressDraftKey: string }): Promise<{
+  async createDraft(input: { wordpressDraftKey: string }): Promise<{
     wordpressDraftKey: string;
     wordpressPostId: number;
     status: "draft";
     outcome: "CREATED";
   }> {
     this.calls.push(`create:${input.wordpressDraftKey}`);
+    await this.beforeCreate?.();
     if (this.createError) return Promise.reject(this.createError);
     const postId = nextPostId++;
     this.posts.set(input.wordpressDraftKey, { postId });
@@ -258,6 +260,8 @@ async function seed(
       senderIngestSequence: nextIngestSequence++,
       eventType: InboundEventType.TEXT,
       processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 1,
+      processingContractVersion: 1,
       rawPayload: {},
       processingStartedAt: new Date(),
     },
@@ -353,6 +357,147 @@ function finalize(
 }
 
 describe("DraftPreparation durable saga", () => {
+  it("fences CREATE_DRAFT failure persistence after generation advances", async () => {
+    const value = await seed();
+    const runtime = service();
+    const result = await finalize(runtime.service, value);
+    const preparationBefore = await prisma.draftPreparation.findUniqueOrThrow({
+      where: { id: result.preparationId },
+      select: {
+        id: true,
+        storyId: true,
+        inboundEventId: true,
+        storyVersion: true,
+        status: true,
+        wordpressPostId: true,
+        wordpressAppliedVersion: true,
+        lastErrorCode: true,
+      },
+    });
+    runtime.draft.createError = new WordPressDraftError(
+      "WORDPRESS_UNAVAILABLE",
+      "safe",
+      503,
+    );
+    runtime.draft.beforeCreate = async (): Promise<void> => {
+      await prisma.inboundEvent.update({
+        where: { id: value.eventId },
+        data: { processingAttempts: 2, processingStartedAt: new Date() },
+      });
+    };
+    await expect(
+      runtime.service.prepare(result.preparationId, {
+        eventId: value.eventId,
+        processingAttempt: 1,
+        processingContractVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: "INBOUND_PROCESSING_FENCE_LOST" });
+    const attempt = await prisma.publishAttempt.findUniqueOrThrow({
+      where: { idempotencyKey: `draft-create:${result.preparationId}` },
+    });
+    expect(attempt).toMatchObject({
+      status: PublishAttemptStatus.IN_PROGRESS,
+      errorCode: null,
+      errorMessage: null,
+      completedAt: null,
+    });
+    expect(
+      await prisma.draftPreparation.findUniqueOrThrow({
+        where: { id: result.preparationId },
+        select: {
+          id: true,
+          storyId: true,
+          inboundEventId: true,
+          storyVersion: true,
+          status: true,
+          wordpressPostId: true,
+          wordpressAppliedVersion: true,
+          lastErrorCode: true,
+        },
+      }),
+    ).toEqual(preparationBefore);
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: value.eventId },
+      }),
+    ).toMatchObject({
+      processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 2,
+      processingContractVersion: 1,
+    });
+    expect(await prisma.draftPreparation.count({
+      where: { inboundEventId: value.eventId },
+    })).toBe(1);
+  });
+
+  it("fences old Round 6 persistence on the same preparation after generation advances", async () => {
+    const value = await seed();
+    const runtime = service();
+    const result = await finalize(runtime.service, value);
+    const before = await prisma.draftPreparation.findUniqueOrThrow({
+      where: { id: result.preparationId },
+    });
+    const story = await prisma.story.findUniqueOrThrow({
+      where: { id: value.storyId },
+    });
+    await prisma.inboundEvent.update({
+      where: { id: value.eventId },
+      data: { processingAttempts: 2 },
+    });
+    await expect(
+      runtime.service.prepare(result.preparationId, {
+        eventId: value.eventId,
+        processingAttempt: 1,
+        processingContractVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: "INBOUND_PROCESSING_FENCE_LOST" });
+    expect(
+      await prisma.draftPreparation.findUniqueOrThrow({
+        where: { id: result.preparationId },
+      }),
+    ).toEqual(before);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: value.storyId } }),
+    ).toEqual(story);
+    expect(
+      await prisma.draftPreparation.count({
+        where: { inboundEventId: value.eventId },
+      }),
+    ).toBe(1);
+    expect(runtime.draft.calls).toEqual([]);
+  });
+
+  it("rejects unsupported direct preparation recovery before external mutation", async () => {
+    const value = await seed();
+    const runtime = service();
+    const result = await finalize(runtime.service, value);
+    await prisma.inboundEvent.update({
+      where: { id: value.eventId },
+      data: { processingContractVersion: 999 },
+    });
+    const before = await prisma.draftPreparation.findUniqueOrThrow({
+      where: { id: result.preparationId },
+    });
+    for (const action of [
+      (): ReturnType<DraftPreparationService["recoverPreparation"]> =>
+        runtime.service.recoverPreparation(result.preparationId),
+      (): ReturnType<DraftPreparationService["prepare"]> =>
+        runtime.service.prepare(result.preparationId),
+      (): ReturnType<DraftPreparationService["verifyPreparedAuthority"]> =>
+        runtime.service.verifyPreparedAuthority(result.preparationId),
+    ])
+      await expect(action()).rejects.toMatchObject({
+        code: "INBOUND_PROCESSING_FENCE_LOST",
+      });
+    expect(
+      await prisma.draftPreparation.findUniqueOrThrow({
+        where: { id: result.preparationId },
+      }),
+    ).toEqual(before);
+    expect(runtime.draft.calls).toEqual([]);
+    expect(runtime.media.calls).toEqual([]);
+    expect(runtime.store.calls).toEqual([]);
+  });
   afterAll(async () => prisma.$disconnect());
 
   it("serializes 20 Phase-A contenders into exactly one epoch and performs no external I/O", async () => {

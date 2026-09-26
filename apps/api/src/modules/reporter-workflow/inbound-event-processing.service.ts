@@ -32,7 +32,11 @@ import {
   Round7ApprovalService,
 } from "./round7-approval.service";
 import { Round7PublishSagaService } from "../publishing/round7-publish-saga.service";
-import { CURRENT_INBOUND_PROCESSING_CONTRACT_VERSION } from "./inbound-processing-contract";
+import {
+  CURRENT_INBOUND_PROCESSING_CONTRACT_VERSION,
+  requireInboundProcessingClaim,
+  type InboundProcessingClaim,
+} from "./inbound-processing-contract";
 
 type ProcessingPhase =
   | EventProcessingResult
@@ -123,38 +127,18 @@ export class InboundEventProcessingService {
 
   async process(eventId: string): Promise<EventProcessingResult> {
     const claim = await this.claim(eventId);
-    if (claim.outcome !== "CLAIMED") {
-      if (claim.outcome !== "NOT_CLAIMED") return claim;
-      const approval = await this.approvals?.recover(eventId);
-      if (approval)
-        return this.publishing
-          ? this.publishing.run(approval.publishAttemptId)
-          : approval;
-      if (this.publishing && this.approvals) {
-        const blocked = await this.prisma.approval.findUnique({
-          where: { inboundEventId: eventId },
-          select: {
-            publishAttempt: { select: { id: true, status: true } },
-          },
-        });
-        if (blocked?.publishAttempt?.status === "RECONCILIATION_REQUIRED")
-          return {
-            outcome: "PUBLISH_RECONCILIATION_REQUIRED",
-            publishAttemptId: blocked.publishAttempt.id,
-            reason: "WORDPRESS_PUBLISH_RECONCILIATION_REQUIRED",
-          };
-      }
-      if (!this.round6) return claim;
-      const existing = await this.round6.preparationForProcessingEvent(eventId);
-      if (!existing) return claim;
-      const event = await this.prisma.inboundEvent.findUnique({
-        where: { id: eventId },
-        select: { processingStatus: true },
-      });
-      if (event?.processingStatus !== InboundProcessingStatus.PROCESSING)
-        return claim;
-      return this.round6.resume(existing.id);
-    }
+    if (claim.outcome !== "CLAIMED") return claim;
+    return this.processClaimed({
+      eventId,
+      processingAttempt: claim.processingAttempt,
+      processingContractVersion: claim.processingContractVersion,
+    });
+  }
+
+  async processClaimed(
+    claim: InboundProcessingClaim,
+  ): Promise<EventProcessingResult> {
+    const eventId = claim.eventId;
     if (this.approvals) {
       const event = await this.prisma.inboundEvent.findUniqueOrThrow({
         where: { id: eventId },
@@ -174,9 +158,9 @@ export class InboundEventProcessingService {
       }
       if (control) {
         try {
-          const approval = await this.approvals.process(eventId, control);
+          const approval = await this.approvals.process(claim, control);
           return this.publishing
-            ? this.publishing.run(approval.publishAttemptId)
+            ? this.publishing.run(approval.publishAttemptId, claim)
             : approval;
         } catch (error) {
           if (!(error instanceof Round7ApprovalError)) throw error;
@@ -187,14 +171,17 @@ export class InboundEventProcessingService {
             error.code === "APPROVAL_PROMPT_NOT_SENT" ||
             error.code === "APPROVAL_STATE_MISMATCH"
           ) {
-            await this.prisma.inboundEvent.update({
-              where: { id: eventId },
-              data: {
-                processingStatus: InboundProcessingStatus.IGNORED,
-                processedAt: new Date(),
-                lastErrorCode: error.code,
-                lastErrorMessage: null,
-              },
+            await this.prisma.$transaction(async (tx) => {
+              await requireInboundProcessingClaim(tx, claim);
+              await tx.inboundEvent.update({
+                where: { id: eventId },
+                data: {
+                  processingStatus: InboundProcessingStatus.IGNORED,
+                  processedAt: new Date(),
+                  lastErrorCode: error.code,
+                  lastErrorMessage: null,
+                },
+              });
             });
             return { outcome: "IGNORED", reason: error.code };
           }
@@ -204,11 +191,7 @@ export class InboundEventProcessingService {
     }
     const phase = await this.prisma.$transaction<ProcessingPhase>(
       async (tx) => {
-        const locked = await tx.$queryRaw<Array<{ id: string }>>`
-        SELECT "id" FROM "InboundEvent" WHERE "id" = ${eventId}::uuid FOR UPDATE
-      `;
-        if (!locked[0])
-          throw new ReporterWorkflowError("INBOUND_EVENT_STATE_CONFLICT");
+        await requireInboundProcessingClaim(tx, claim);
         const event = await tx.inboundEvent.findUniqueOrThrow({
           where: { id: eventId },
           select: {
@@ -455,7 +438,7 @@ export class InboundEventProcessingService {
     );
     if (phase.outcome === "FINALISATION_INTENT")
       return this.round6
-        ? this.round6.resume(phase.preparationId)
+        ? this.round6.resume(phase.preparationId, claim)
         : {
             outcome: "RETRY_REQUIRED",
             reason: "DRAFT_PREPARATION_UNAVAILABLE",
@@ -465,7 +448,7 @@ export class InboundEventProcessingService {
       return { outcome: "RETRY_REQUIRED", reason: "MEDIA_STAGING_UNAVAILABLE" };
     const staged = await this.mediaStaging.stage(
       phase.mediaId,
-      eventId,
+      claim,
       phase.authority,
     );
     if (staged.outcome !== "PROCESSED") return staged;

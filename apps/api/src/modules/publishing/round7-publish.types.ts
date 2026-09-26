@@ -15,6 +15,8 @@ export type PublishAuthority = {
   attemptId: string;
   approvalId: string;
   eventId: string;
+  processingAttempt: number;
+  processingContractVersion: number;
   reporterId: string;
   conversationId: string;
   storyId: string;

@@ -19,6 +19,11 @@ import { ApprovalPromptService } from "../whatsapp-outbound/approval-prompt.serv
 import { WhatsappOutboundDispatcher } from "../whatsapp-outbound/whatsapp-outbound.dispatcher";
 import { ConversationStateMachineService } from "./conversation-state-machine.service";
 import type { EventProcessingResult } from "./reporter-workflow.types";
+import {
+  readInboundProcessingClaim,
+  requireInboundProcessingClaim,
+  type InboundProcessingClaim,
+} from "./inbound-processing-contract";
 
 @Injectable()
 export class Round6FinalisationService {
@@ -30,8 +35,11 @@ export class Round6FinalisationService {
     private readonly conversations: ConversationStateMachineService,
   ) {}
 
-  async resume(preparationId: string): Promise<EventProcessingResult> {
-    const prepared = await this.preparations.prepare(preparationId);
+  async resume(
+    preparationId: string,
+    claim: InboundProcessingClaim,
+  ): Promise<EventProcessingResult> {
+    const prepared = await this.preparations.prepare(preparationId, claim);
     if (
       prepared.outcome === "BLOCKED" ||
       prepared.outcome === "RECONCILIATION_REQUIRED"
@@ -47,8 +55,10 @@ export class Round6FinalisationService {
       };
     let authority: PreparedAuthority;
     try {
-      authority =
-        await this.preparations.verifyPreparedAuthority(preparationId);
+      authority = await this.preparations.verifyPreparedAuthority(
+        preparationId,
+        claim,
+      );
     } catch (error) {
       const reason =
         error instanceof DraftPreparationError
@@ -57,7 +67,7 @@ export class Round6FinalisationService {
       return { outcome: "RETRY_REQUIRED", reason };
     }
     const completed = await this.prisma.$transaction((tx) =>
-      this.completeApprovalPostureInTransaction(tx, authority),
+      this.completeApprovalPostureInTransaction(tx, authority, claim),
     );
     await this.dispatcher.dispatchOne(completed.promptId);
     return {
@@ -70,6 +80,7 @@ export class Round6FinalisationService {
   async completeApprovalPostureInTransaction(
     tx: Prisma.TransactionClient,
     authority: PreparedAuthority,
+    expectedClaim?: InboundProcessingClaim,
   ): Promise<{ promptId: string; reporterId: string; conversationId: string }> {
     const prepHint = await tx.draftPreparation.findUnique({
       where: { id: authority.preparationId },
@@ -77,6 +88,14 @@ export class Round6FinalisationService {
     });
     if (!prepHint || prepHint.storyId !== authority.storyId)
       throw new DraftPreparationError("STORY_FINALISATION_CONFLICT");
+    await tx.$queryRaw`SELECT "id" FROM "InboundEvent" WHERE "id"=${prepHint.inboundEventId}::uuid FOR UPDATE`;
+    if (!expectedClaim) {
+      const event = await tx.inboundEvent.findUniqueOrThrow({
+        where: { id: prepHint.inboundEventId },
+      });
+      if (event.processingStatus === InboundProcessingStatus.PROCESSING)
+        expectedClaim = await readInboundProcessingClaim(tx, event.id);
+    }
     const storyHint = await tx.story.findUnique({
       where: { id: authority.storyId },
       select: { reporterId: true },
@@ -89,7 +108,9 @@ export class Round6FinalisationService {
     });
     if (!conversationHint)
       throw new DraftPreparationError("STORY_FINALISATION_CONFLICT");
-    await tx.$queryRaw`SELECT "id" FROM "InboundEvent" WHERE "id"=${prepHint.inboundEventId}::uuid FOR UPDATE`;
+    if (expectedClaim && prepHint.inboundEventId !== expectedClaim.eventId)
+      throw new DraftPreparationError("STORY_FINALISATION_CONFLICT");
+    if (expectedClaim) await requireInboundProcessingClaim(tx, expectedClaim);
     await tx.$queryRaw`SELECT "id" FROM "Reporter" WHERE "id"=${storyHint.reporterId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Conversation" WHERE "id"=${conversationHint.id}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "Story" WHERE "id"=${authority.storyId}::uuid FOR UPDATE`;
@@ -139,6 +160,11 @@ export class Round6FinalisationService {
       preparation.wordpressPostId !== BigInt(authority.wordpressPostId) ||
       preparation.inboundEvent.processingStatus !==
         InboundProcessingStatus.PROCESSING ||
+      (expectedClaim &&
+        (preparation.inboundEvent.processingAttempts !==
+          expectedClaim.processingAttempt ||
+          preparation.inboundEvent.processingContractVersion !==
+            expectedClaim.processingContractVersion)) ||
       preparation.inboundEvent.reporterId !== story.reporterId ||
       story.reporter.status !== ReporterStatus.ACTIVE ||
       story.status !== StoryStatus.DRAFT_CREATED ||

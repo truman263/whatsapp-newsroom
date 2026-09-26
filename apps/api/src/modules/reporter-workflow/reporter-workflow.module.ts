@@ -5,6 +5,8 @@ import { WhatsappOutboundModule } from "../whatsapp-outbound/whatsapp-outbound.m
 import { ConversationProvisioningService } from "./conversation-provisioning.service";
 import { ConversationStateMachineService } from "./conversation-state-machine.service";
 import { InboundEventProcessingService } from "./inbound-event-processing.service";
+import { InboundEventRecoveryService } from "./inbound-event-recovery.service";
+import { InboundEventDriverService } from "./inbound-event-driver.service";
 import { ReporterAuthorizationService } from "./reporter-authorization.service";
 import { ReporterProvisioningService } from "./reporter-provisioning.service";
 import { Round6FinalisationService } from "./round6-finalisation.service";
@@ -27,6 +29,8 @@ import { PublishingModule } from "../publishing/publishing.module";
     ConversationProvisioningService,
     ConversationStateMachineService,
     InboundEventProcessingService,
+    InboundEventRecoveryService,
+    InboundEventDriverService,
     Round6FinalisationService,
     Round6RevisionService,
     Round7ApprovalService,
@@ -35,6 +39,8 @@ import { PublishingModule } from "../publishing/publishing.module";
     ReporterProvisioningService,
     ConversationStateMachineService,
     InboundEventProcessingService,
+    InboundEventRecoveryService,
+    InboundEventDriverService,
   ],
 })
 export class ReporterWorkflowModule {}

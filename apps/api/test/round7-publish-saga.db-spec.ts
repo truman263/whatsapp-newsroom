@@ -163,6 +163,9 @@ async function seed(name: string) {
       senderIngestSequence: 2n,
       eventType: InboundEventType.TEXT,
       processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 1,
+      processingContractVersion: 1,
+      processingStartedAt: new Date(),
       rawPayload: { message: {} },
     },
   });
@@ -224,6 +227,85 @@ function ledger(
 }
 
 describe("Round 7B.3 durable publication saga", () => {
+  it("fences old publication completion and reconciles the same ledger with the new generation", async () => {
+    const x = await seed("old-generation");
+    const original = x.wordpress.publish.bind(x.wordpress);
+    let afterReclaim: unknown;
+    x.wordpress.publish = async (intent) => {
+      const result = await original(intent);
+      x.wordpress.getResult = ledger(x, "PUBLISHED");
+      await prisma.inboundEvent.update({
+        where: { id: x.event.id },
+        data: { processingAttempts: 2 },
+      });
+      afterReclaim = await prisma.publishAttempt.findUniqueOrThrow({
+        where: { id: x.attempt.id },
+      });
+      return result;
+    };
+    await x.saga.run(x.attempt.id);
+    expect(
+      await prisma.publishAttempt.findUniqueOrThrow({
+        where: { id: x.attempt.id },
+      }),
+    ).toEqual(afterReclaim);
+    expect(
+      await prisma.story.findUniqueOrThrow({ where: { id: x.story.id } }),
+    ).toMatchObject({ status: StoryStatus.PUBLISHING, publishedAt: null });
+    expect(
+      await prisma.inboundEvent.findUniqueOrThrow({
+        where: { id: x.event.id },
+      }),
+    ).toMatchObject({
+      processingAttempts: 2,
+      processingStatus: InboundProcessingStatus.PROCESSING,
+    });
+    await expect(x.saga.run(x.attempt.id)).resolves.toMatchObject({
+      outcome: "PROCESSED",
+    });
+    expect(x.wordpress.calls).toEqual([
+      `GET:${x.attempt.id}`,
+      `POST:${x.attempt.id}`,
+      `GET:${x.attempt.id}`,
+    ]);
+    expect(
+      await prisma.publishAttempt.count({
+        where: { storyId: x.story.id, operation: PublishOperation.PUBLISH },
+      }),
+    ).toBe(1);
+  });
+
+  it.each([null, 999])(
+    "rejects independent publication authority with contract %s",
+    async (version) => {
+      const x = await seed(`unsupported-${version}`);
+      await prisma.inboundEvent.update({
+        where: { id: x.event.id },
+        data: { processingContractVersion: version },
+      });
+      await expect(x.saga.run(x.attempt.id)).resolves.toMatchObject({
+        outcome: "PUBLISH_NOT_CLAIMED",
+      });
+      expect(x.wordpress.calls).toEqual([]);
+      expect(
+        await prisma.story.findUniqueOrThrow({ where: { id: x.story.id } }),
+      ).toEqual(x.story);
+      expect(
+        await prisma.publishAttempt.findUniqueOrThrow({
+          where: { id: x.attempt.id },
+        }),
+      ).toEqual(x.attempt);
+      expect(
+        await prisma.inboundEvent.findUniqueOrThrow({
+          where: { id: x.event.id },
+        }),
+      ).toMatchObject({
+        processingAttempts: 1,
+        processingContractVersion: version,
+        processingStatus: InboundProcessingStatus.PROCESSING,
+      });
+    },
+  );
   beforeAll(() => prisma.$connect());
   afterAll(() => prisma.$disconnect());
 

@@ -13,6 +13,13 @@ import {
 } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
 import { ConversationStateMachineService } from "../reporter-workflow/conversation-state-machine.service";
+import {
+  readInboundProcessingClaim,
+  requireInboundProcessingClaim,
+  InboundProcessingFenceError,
+  supportsInboundProcessingContractVersion,
+  type InboundProcessingClaim,
+} from "../reporter-workflow/inbound-processing-contract";
 import { draftStateFingerprint } from "../wordpress-draft/wordpress-draft-state";
 import {
   WordPressPublicationClient,
@@ -41,7 +48,10 @@ export class Round7PublishSagaService {
     private readonly conversations: ConversationStateMachineService,
   ) {}
 
-  async run(publishAttemptId: string): Promise<PublishSagaResult> {
+  async run(
+    publishAttemptId: string,
+    expectedClaim?: InboundProcessingClaim,
+  ): Promise<PublishSagaResult> {
     const current = await this.prisma.publishAttempt.findUnique({
       where: { id: publishAttemptId },
       select: { status: true, storyId: true },
@@ -67,14 +77,39 @@ export class Round7PublishSagaService {
       };
 
     let authority: PublishAuthority | null;
-    if (current.status === PublishAttemptStatus.PENDING) {
+    if (!expectedClaim) {
+      const binding = await this.prisma.publishAttempt.findUnique({
+        where: { id: publishAttemptId },
+        select: { approval: { select: { inboundEventId: true } } },
+      });
+      if (!binding?.approval)
+        return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId };
       try {
-        authority = await this.prisma.$transaction(
-          (tx) => this.claim(tx, publishAttemptId),
-          TX_OPTIONS,
+        expectedClaim = await readInboundProcessingClaim(
+          this.prisma,
+          binding.approval.inboundEventId,
         );
       } catch (error) {
-        return this.handleLocalFailure(publishAttemptId, error);
+        if (!(error instanceof InboundProcessingFenceError)) throw error;
+        return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId };
+      }
+    }
+    if (current.status === PublishAttemptStatus.PENDING) {
+      try {
+        authority = await this.prisma.$transaction(async (tx) => {
+          if (expectedClaim)
+            await requireInboundProcessingClaim(tx, expectedClaim);
+          const claimed = await this.claim(tx, publishAttemptId);
+          if (
+            expectedClaim &&
+            claimed &&
+            claimed.eventId !== expectedClaim.eventId
+          )
+            throw new InboundProcessingFenceError();
+          return claimed;
+        }, TX_OPTIONS);
+      } catch (error) {
+        return this.handleLocalFailure(publishAttemptId, error, expectedClaim);
       }
       if (!authority)
         return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId };
@@ -90,12 +125,20 @@ export class Round7PublishSagaService {
           TX_OPTIONS,
         );
       } catch (error) {
-        return this.handleLocalFailure(publishAttemptId, error);
+        return this.handleLocalFailure(publishAttemptId, error, expectedClaim);
       }
     } else {
       return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId };
     }
 
+    if (
+      expectedClaim &&
+      (authority.eventId !== expectedClaim.eventId ||
+        authority.processingAttempt !== expectedClaim.processingAttempt ||
+        authority.processingContractVersion !==
+          expectedClaim.processingContractVersion)
+    )
+      return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId };
     return this.publish(authority);
   }
 
@@ -349,7 +392,7 @@ export class Round7PublishSagaService {
     } catch (error) {
       const terminal = await this.alreadySucceeded(authority.attemptId);
       if (terminal) return terminal;
-      return this.handleLocalFailure(authority.attemptId, error);
+      return this.handleLocalFailure(authority.attemptId, error, authority);
     }
   }
 
@@ -434,32 +477,46 @@ export class Round7PublishSagaService {
         reason: code,
       };
     } catch (error) {
-      return this.handleLocalFailure(authority.attemptId, error);
+      return this.handleLocalFailure(authority.attemptId, error, authority);
     }
   }
 
   private async handleLocalFailure(
     attemptId: string,
     error: unknown,
+    claim?: InboundProcessingClaim,
   ): Promise<PublishSagaResult> {
+    if (error instanceof InboundProcessingFenceError)
+      return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId: attemptId };
     if (!(error instanceof Round7PublishError)) throw error;
     const terminal = await this.alreadySucceeded(attemptId);
     if (terminal) return terminal;
-    await this.prisma.publishAttempt.updateMany({
-      where: {
-        id: attemptId,
-        operation: PublishOperation.PUBLISH,
-        status: {
-          in: [PublishAttemptStatus.PENDING, PublishAttemptStatus.IN_PROGRESS],
-        },
-      },
-      data: {
-        status: PublishAttemptStatus.FAILED,
-        errorCode: error.code,
-        errorMessage: null,
-        completedAt: new Date(),
-      },
-    });
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        if (claim) await requireInboundProcessingClaim(tx, claim);
+        await tx.publishAttempt.updateMany({
+          where: {
+            id: attemptId,
+            operation: PublishOperation.PUBLISH,
+            status: {
+              in: [
+                PublishAttemptStatus.PENDING,
+                PublishAttemptStatus.IN_PROGRESS,
+              ],
+            },
+          },
+          data: {
+            status: PublishAttemptStatus.FAILED,
+            errorCode: error.code,
+            errorMessage: null,
+            completedAt: new Date(),
+          },
+        });
+      }, TX_OPTIONS);
+    } catch (failure) {
+      if (!(failure instanceof InboundProcessingFenceError)) throw failure;
+      return { outcome: "PUBLISH_NOT_CLAIMED", publishAttemptId: attemptId };
+    }
     return {
       outcome: "PUBLISH_FAILED",
       publishAttemptId: attemptId,
@@ -598,6 +655,11 @@ function validateAuthority(
     approval.wordpressAppliedVersion !== preparation.wordpressAppliedVersion ||
     !SHA.test(approval.wordpressAppliedVersion) ||
     event.processingStatus !== InboundProcessingStatus.PROCESSING ||
+    event.processingAttempts < 1 ||
+    event.processingContractVersion === null ||
+    !supportsInboundProcessingContractVersion(
+      event.processingContractVersion,
+    ) ||
     event.reporterId !== reporter.id ||
     event.senderPhone !== reporter.phoneNumber ||
     story.reporterId !== reporter.id ||
@@ -633,6 +695,8 @@ function validateAuthority(
     attemptId: row.id,
     approvalId: approval.id,
     eventId: event.id,
+    processingAttempt: event.processingAttempts,
+    processingContractVersion: event.processingContractVersion,
     reporterId: reporter.id,
     conversationId: conversation.id,
     storyId: story.id,

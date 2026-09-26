@@ -175,7 +175,7 @@ describe("Round 7 combined authenticated approval to WordPress publication", () 
     expect(await processor.process(event.id)).toMatchObject({ outcome: "PUBLISH_RECONCILIATION_REQUIRED" });
     const attempt = await prisma.publishAttempt.findFirstOrThrow({ where: { storyId: x.story.id, operation: PublishOperation.PUBLISH } });
     expect(attempt.status).toBe(PublishAttemptStatus.RECONCILIATION_REQUIRED);
-    expect(await processor.process(event.id)).toMatchObject({ outcome: "PUBLISH_RECONCILIATION_REQUIRED" });
+    expect(await processor.process(event.id)).toMatchObject({ outcome: "NOT_CLAIMED" });
     expect(await prisma.publishAttempt.count({ where: { storyId: x.story.id, operation: PublishOperation.PUBLISH } })).toBe(1);
     expect(wpRead(`SELECT post_status FROM wp_posts WHERE ID=${x.state.post_id}`)).toBe("draft");
   });

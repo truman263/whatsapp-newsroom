@@ -28,6 +28,7 @@ import { mediaObjectKey, type DownloadedMedia, type MediaObjectStore, type Store
 import { ConversationProvisioningService } from "../src/modules/reporter-workflow/conversation-provisioning.service";
 import { ConversationStateMachineService } from "../src/modules/reporter-workflow/conversation-state-machine.service";
 import { InboundEventProcessingService } from "../src/modules/reporter-workflow/inbound-event-processing.service";
+import { InboundEventRecoveryService } from "../src/modules/reporter-workflow/inbound-event-recovery.service";
 import { ReporterAuthorizationService } from "../src/modules/reporter-workflow/reporter-authorization.service";
 import { Round6FinalisationService } from "../src/modules/reporter-workflow/round6-finalisation.service";
 import { Round6RevisionService } from "../src/modules/reporter-workflow/round6-revision.service";
@@ -296,6 +297,9 @@ async function seed(): Promise<PreparedAuthority> {
       senderIngestSequence: BigInt(Date.now()),
       eventType: InboundEventType.TEXT,
       processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 1,
+      processingContractVersion: 1,
+      processingStartedAt: new Date(),
       rawPayload: {},
       receivedAt: new Date(),
     },
@@ -482,9 +486,10 @@ describe("Round 6 Phase E", () => {
 
   it("resumes a stranded PROCESSING event only through its matching preparation FK", async () => {
     const runtime = integrated(new Date(0)); const value = await inboundSeed(new Date(), new Date());
-    await prisma.inboundEvent.update({ where: { id: value.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: value.reporterId } });
+    await prisma.inboundEvent.update({ where: { id: value.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: value.reporterId, processingAttempts: 1, processingContractVersion: 1, processingStartedAt: new Date(0) } });
     const phaseA = await prisma.$transaction((tx) => runtime.preparation.finalizeInTransaction(tx, { inboundEventId: value.eventId, reporterId: value.reporterId, conversationId: value.conversationId, storyId: value.storyId, expectedStoryVersion: 2 }));
-    await expect(runtime.process.process(value.eventId)).resolves.toMatchObject({ outcome: "PROCESSED" });
+    const recovery = new InboundEventRecoveryService(prisma, runtime.process, undefined, runtime.round6);
+    await expect(recovery.recoverStale(value.eventId, new Date(), 5)).resolves.toMatchObject({ outcome: "RECOVERED", route: "DRAFT_PREPARATION" });
     expect((await prisma.story.findUniqueOrThrow({ where: { id: value.storyId } })).version).toBe(3);
     expect(await prisma.draftPreparation.count({ where: { inboundEventId: value.eventId } })).toBe(1);
 
@@ -571,12 +576,13 @@ describe("Round 6 Phase E", () => {
 
   it("recovers partial media authority through the public process entry without duplicating remote identities", async () => {
     const runtime = integrated(new Date(0)); const seeded = await inboundSeed(new Date(), new Date(), 2); await loadMedia(runtime, seeded.storyId);
-    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId } });
+    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId, processingAttempts: 1, processingContractVersion: 1, processingStartedAt: new Date(0) } });
     const phaseA = await prisma.$transaction((tx) => runtime.preparation.finalizeInTransaction(tx, { inboundEventId: seeded.eventId, reporterId: seeded.reporterId, conversationId: seeded.conversationId, storyId: seeded.storyId, expectedStoryVersion: 2 }));
     const rows = await prisma.storyMedia.findMany({ where: { storyId: seeded.storyId }, orderBy: { position: "asc" } });
     runtime.media.attachments.set(rows[0]!.id, 12050);
     await prisma.storyMedia.update({ where: { id: rows[0]!.id }, data: { status: MediaProcessingStatus.UPLOADED, wordpressMediaId: 12050n } });
-    await expect(runtime.process.process(seeded.eventId)).resolves.toMatchObject({ outcome: "PROCESSED" });
+    const recovery = new InboundEventRecoveryService(prisma, runtime.process, undefined, runtime.round6);
+    await expect(recovery.recoverStale(seeded.eventId, new Date(), 5)).resolves.toMatchObject({ outcome: "RECOVERED", route: "DRAFT_PREPARATION" });
     expect(await prisma.draftPreparation.count({ where: { id: phaseA.preparationId } })).toBe(1);
     expect((await prisma.story.findUniqueOrThrow({ where: { id: seeded.storyId } })).version).toBe(3);
     expect(runtime.media.calls.filter((call) => call === `get:${rows[0]!.id}`)).toHaveLength(1);
@@ -587,11 +593,12 @@ describe("Round 6 Phase E", () => {
 
   it("recovers an applied WordPress version through public process and performs Phase E once", async () => {
     const runtime = integrated(new Date(0)); const seeded = await inboundSeed(new Date(), new Date());
-    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId } });
+    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId, processingAttempts: 1, processingContractVersion: 1, processingStartedAt: new Date(0) } });
     const phaseA = await prisma.$transaction((tx) => runtime.preparation.finalizeInTransaction(tx, { inboundEventId: seeded.eventId, reporterId: seeded.reporterId, conversationId: seeded.conversationId, storyId: seeded.storyId, expectedStoryVersion: 2 }));
     await expect(runtime.preparation.prepare(phaseA.preparationId)).resolves.toMatchObject({ outcome: "PREPARED" });
     const callsBefore = runtime.draft.calls.filter((call) => call.startsWith("create:")).length;
-    await expect(runtime.process.process(seeded.eventId)).resolves.toMatchObject({ outcome: "PROCESSED" });
+    const recovery = new InboundEventRecoveryService(prisma, runtime.process, undefined, runtime.round6);
+    await expect(recovery.recoverStale(seeded.eventId, new Date(), 5)).resolves.toMatchObject({ outcome: "RECOVERED", route: "DRAFT_PREPARATION" });
     const story = await prisma.story.findUniqueOrThrow({ where: { id: seeded.storyId }, include: { draftPreparations: true, outboundMessages: true } });
     expect(story).toMatchObject({ status: StoryStatus.AWAITING_APPROVAL, version: 3 });
     expect(story.draftPreparations).toHaveLength(1); expect(story.draftPreparations[0]).toMatchObject({ id: phaseA.preparationId, status: DraftPreparationStatus.READY_FOR_APPROVAL });
@@ -600,7 +607,7 @@ describe("Round 6 Phase E", () => {
 
   it("dispatches a post-Phase-E PENDING prompt explicitly without replaying /done", async () => {
     const runtime = integratedMeta({ status: 200, body: { messages: [{ id: "wamid.recovery-d" }] } }); const seeded = await inboundSeed(new Date(), new Date());
-    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId } });
+    await prisma.inboundEvent.update({ where: { id: seeded.eventId }, data: { processingStatus: InboundProcessingStatus.PROCESSING, reporterId: seeded.reporterId, processingAttempts: 1, processingContractVersion: 1, processingStartedAt: new Date() } });
     const phaseA = await prisma.$transaction((tx) => runtime.preparation.finalizeInTransaction(tx, { inboundEventId: seeded.eventId, reporterId: seeded.reporterId, conversationId: seeded.conversationId, storyId: seeded.storyId, expectedStoryVersion: 2 }));
     await runtime.preparation.prepare(phaseA.preparationId); const authority = await runtime.preparation.verifyPreparedAuthority(phaseA.preparationId);
     const completed = await prisma.$transaction((tx) => runtime.round6.completeApprovalPostureInTransaction(tx, authority));
