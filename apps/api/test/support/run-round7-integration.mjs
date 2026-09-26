@@ -10,6 +10,7 @@ const composeFile = resolve(root, "wordpress/runtime/draft-sync-implementation/c
 const temp = mkdtempSync(resolve(tmpdir(), "newsroom-r7-integration-"));
 const project = `newsroom-r7-${randomUUID().slice(0, 8)}`;
 const pgName = `${project}-pg`;
+const s3Name = `${project}-s3`;
 const envFile = resolve(temp, "compose.env");
 const repoEnv = resolve(root, ".env");
 const isolatedEnv = resolve(root, `.env.round7-isolated-${randomUUID()}`);
@@ -17,6 +18,7 @@ const secret = () => randomBytes(32).toString("base64url");
 let movedEnv = false;
 let composeStarted = false;
 let pgStarted = false;
+let s3Started = false;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -66,6 +68,7 @@ try {
   }
   const wpPort = await freePort();
   const pgPort = await freePort();
+  const s3Port = await freePort();
   const pgPassword = secret();
   const draftSecret = secret();
   const mediaSecret = secret();
@@ -111,13 +114,32 @@ try {
     ROUND7_TEST_WORDPRESS_PORT: String(wpPort),
     ROUND7_TEST_COMPOSE_PROJECT: project,
     ROUND7_TEST_COMPOSE_ENV_FILE: envFile,
+    ROUND8B2_S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
+    NEWSROOM_MEDIA_OBJECT_STORE_DRIVER: "s3",
+    NEWSROOM_MEDIA_S3_BUCKET: "proof-media",
+    NEWSROOM_MEDIA_S3_REGION: "us-east-1",
+    NEWSROOM_MEDIA_S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
+    NEWSROOM_MEDIA_S3_FORCE_PATH_STYLE: "true",
+    NEWSROOM_MEDIA_S3_ACCESS_KEY_ID: "proof",
+    NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY: "proof-secret",
   };
   run("docker", ["run", "-d", "--name", pgName, "-e", "POSTGRES_USER=newsroom", "-e", `POSTGRES_PASSWORD=${pgPassword}`, "-e", "POSTGRES_DB=newsroom_test", "-p", `127.0.0.1:${pgPort}:5432`, "postgres:16-alpine"], { sensitive: true, label: "PostgreSQL startup" });
   pgStarted = true;
+  run("docker", ["run", "-d", "--name", s3Name, "-p", `127.0.0.1:${s3Port}:4566`, "-e", "SERVICES=s3", "localstack/localstack:4.8.1"], { label: "LocalStack startup" });
+  s3Started = true;
   for (let i = 0; i < 60; i++) {
     const ready = spawnSync("docker", ["exec", pgName, "pg_isready", "-U", "newsroom", "-d", "newsroom_test"], { windowsHide: true });
     if (ready.status === 0) break;
     if (i === 59) throw new Error("Disposable PostgreSQL did not start");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
+  }
+  for (let i = 0; i < 60; i++) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${s3Port}/_localstack/health`);
+      const health = await response.json();
+      if (["available", "running"].includes(health.services?.s3)) break;
+    } catch {}
+    if (i === 59) throw new Error("Disposable LocalStack did not start");
     await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
   }
   composeStarted = true;
@@ -164,6 +186,10 @@ try {
   if (pgStarted) {
     spawnSync("docker", ["stop", pgName], { windowsHide: true });
     spawnSync("docker", ["rm", pgName], { windowsHide: true });
+  }
+  if (s3Started) {
+    spawnSync("docker", ["stop", s3Name], { windowsHide: true });
+    spawnSync("docker", ["rm", s3Name], { windowsHide: true });
   }
   if (movedEnv) renameSync(isolatedEnv, repoEnv);
   rmSync(temp, { recursive: true, force: true });

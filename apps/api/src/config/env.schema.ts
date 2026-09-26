@@ -31,6 +31,14 @@ export interface Environment {
   WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: number;
   ROUND6_CONTROL_CUTOVER_AT: Date;
   ROUND7_CONTROL_CUTOVER_AT: Date;
+  NEWSROOM_MEDIA_OBJECT_STORE_DRIVER: "unconfigured" | "s3";
+  NEWSROOM_MEDIA_S3_BUCKET: string;
+  NEWSROOM_MEDIA_S3_REGION: string;
+  NEWSROOM_MEDIA_S3_ENDPOINT?: string;
+  NEWSROOM_MEDIA_S3_FORCE_PATH_STYLE: boolean;
+  NEWSROOM_MEDIA_S3_ACCESS_KEY_ID?: string;
+  NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY?: string;
+  NEWSROOM_MEDIA_S3_SESSION_TOKEN?: string;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -138,14 +146,27 @@ export const environmentSchema = Joi.object<Environment>({
     .default(100),
   WORDPRESS_PUBLISH_HMAC_KEY_ID: Joi.string()
     .pattern(/^[a-z0-9][a-z0-9._-]{0,63}$/)
-    .when("NODE_ENV", { is: "test", then: Joi.optional().default("test-publish-key"), otherwise: Joi.required() }),
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default("test-publish-key"),
+      otherwise: Joi.required(),
+    }),
   WORDPRESS_PUBLISH_HMAC_SECRET: Joi.string()
     .custom((value: string, helpers) => {
-      if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return helpers.error("any.invalid");
+      if (!/^[A-Za-z0-9_-]{43}$/.test(value))
+        return helpers.error("any.invalid");
       const decoded = Buffer.from(value, "base64url");
-      return decoded.length === 32 && decoded.toString("base64url") === value ? value : helpers.error("any.invalid");
+      return decoded.length === 32 && decoded.toString("base64url") === value
+        ? value
+        : helpers.error("any.invalid");
     })
-    .when("NODE_ENV", { is: "test", then: Joi.optional().default("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), otherwise: Joi.required() }),
+    .when("NODE_ENV", {
+      is: "test",
+      then: Joi.optional().default(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      ),
+      otherwise: Joi.required(),
+    }),
   WORDPRESS_MEDIA_HMAC_KEY_ID: Joi.string()
     .pattern(/^[a-z0-9][a-z0-9._-]{0,63}$/)
     .when("NODE_ENV", {
@@ -283,6 +304,66 @@ export const environmentSchema = Joi.object<Environment>({
       then: Joi.optional().default("9999-12-31T23:59:59.999Z"),
       otherwise: Joi.required(),
     }),
+  NEWSROOM_MEDIA_OBJECT_STORE_DRIVER: Joi.string()
+    .valid("unconfigured", "s3")
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.valid("s3").required(),
+      otherwise: Joi.optional().default("unconfigured"),
+    }),
+  NEWSROOM_MEDIA_S3_BUCKET: Joi.string()
+    .allow("")
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.string().min(3).required(),
+      otherwise: Joi.optional().default(""),
+    }),
+  NEWSROOM_MEDIA_S3_REGION: Joi.string()
+    .pattern(/^[a-z0-9-]+$/)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.required(),
+      otherwise: Joi.optional().default("us-east-1"),
+    }),
+  NEWSROOM_MEDIA_S3_ENDPOINT: Joi.string()
+    .custom((value: string, helpers) => {
+      try {
+        const url = new URL(value);
+        if (
+          !["http:", "https:"].includes(url.protocol) ||
+          url.username ||
+          url.password ||
+          url.search ||
+          url.hash ||
+          (url.pathname !== "/" && url.pathname !== "")
+        )
+          return helpers.error("any.invalid");
+        return value;
+      } catch {
+        return helpers.error("any.invalid");
+      }
+    })
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.required(),
+      otherwise: Joi.optional(),
+    }),
+  NEWSROOM_MEDIA_S3_FORCE_PATH_STYLE: Joi.boolean().default(false),
+  NEWSROOM_MEDIA_S3_ACCESS_KEY_ID: Joi.string()
+    .min(1)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.required(),
+      otherwise: Joi.optional(),
+    }),
+  NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY: Joi.string()
+    .min(1)
+    .when("NODE_ENV", {
+      is: "production",
+      then: Joi.required(),
+      otherwise: Joi.optional(),
+    }),
+  NEWSROOM_MEDIA_S3_SESSION_TOKEN: Joi.string().min(1).optional(),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
@@ -304,6 +385,25 @@ export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
   ) {
     throw new Error(
       "Environment validation failed: NEWSROOM_MEDIA_STAGING_MAX_BYTES must not exceed WORDPRESS_MEDIA_MAX_BYTES",
+    );
+  }
+
+  if (validation.value.NODE_ENV === "production") {
+    if (
+      !String(validation.value.NEWSROOM_MEDIA_S3_ENDPOINT).startsWith(
+        "https://",
+      )
+    )
+      throw new Error(
+        "Environment validation failed: production S3 endpoint must use HTTPS",
+      );
+  } else if (
+    validation.value.NEWSROOM_MEDIA_OBJECT_STORE_DRIVER === "s3" &&
+    (!validation.value.NEWSROOM_MEDIA_S3_ACCESS_KEY_ID ||
+      !validation.value.NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY)
+  ) {
+    throw new Error(
+      "Environment validation failed: explicit S3 credentials required",
     );
   }
 

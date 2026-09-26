@@ -14,7 +14,8 @@ function completeNonTestEnvironment(
     WORDPRESS_DRAFT_HMAC_KEY_ID: "test-draft-key",
     WORDPRESS_DRAFT_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     WORDPRESS_PUBLISH_HMAC_KEY_ID: "test-publish-key",
-    WORDPRESS_PUBLISH_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    WORDPRESS_PUBLISH_HMAC_SECRET:
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     WORDPRESS_MEDIA_HMAC_KEY_ID: "test-media-key",
     WORDPRESS_MEDIA_HMAC_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     NEWSROOM_PREVIEW_PUBLIC_ORIGIN: "https://newsroom.test",
@@ -22,6 +23,12 @@ function completeNonTestEnvironment(
     WHATSAPP_GRAPH_API_VERSION: "v0.0",
     ROUND6_CONTROL_CUTOVER_AT: "2026-09-13T16:00:00.000Z",
     ROUND7_CONTROL_CUTOVER_AT: "2026-09-13T17:00:00.000Z",
+    NEWSROOM_MEDIA_OBJECT_STORE_DRIVER: "s3",
+    NEWSROOM_MEDIA_S3_ENDPOINT: "https://s3.example.test",
+    NEWSROOM_MEDIA_S3_REGION: "us-east-1",
+    NEWSROOM_MEDIA_S3_BUCKET: "newsroom-media",
+    NEWSROOM_MEDIA_S3_ACCESS_KEY_ID: "test-access-key",
+    NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY: "test-secret-key",
   };
 }
 
@@ -30,6 +37,55 @@ describe("environment validation", () => {
     expect(() => validateEnvironment({ NODE_ENV: "production" })).toThrow(
       "Environment validation failed",
     );
+  });
+
+  it("fails closed for incomplete or insecure production S3 configuration", () => {
+    const complete = completeNonTestEnvironment("production");
+    expect(
+      validateEnvironment(complete).NEWSROOM_MEDIA_OBJECT_STORE_DRIVER,
+    ).toBe("s3");
+    for (const field of [
+      "NEWSROOM_MEDIA_OBJECT_STORE_DRIVER",
+      "NEWSROOM_MEDIA_S3_ENDPOINT",
+      "NEWSROOM_MEDIA_S3_REGION",
+      "NEWSROOM_MEDIA_S3_BUCKET",
+      "NEWSROOM_MEDIA_S3_ACCESS_KEY_ID",
+      "NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY",
+    ] as const) {
+      const missing = { ...complete };
+      delete missing[field];
+      expect(() => validateEnvironment(missing)).toThrow(
+        "Environment validation failed",
+      );
+    }
+    expect(() =>
+      validateEnvironment({
+        ...complete,
+        NEWSROOM_MEDIA_S3_ENDPOINT: "http://s3.example.test",
+      }),
+    ).toThrow("production S3 endpoint must use HTTPS");
+    for (const endpoint of [
+      "https://user@s3.example.test",
+      "https://s3.example.test/path",
+      "https://s3.example.test?x=1",
+      "not-a-url",
+    ])
+      expect(() =>
+        validateEnvironment({
+          ...complete,
+          NEWSROOM_MEDIA_S3_ENDPOINT: endpoint,
+        }),
+      ).toThrow("Environment validation failed");
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        NEWSROOM_MEDIA_OBJECT_STORE_DRIVER: "s3",
+        NEWSROOM_MEDIA_S3_ENDPOINT: "http://127.0.0.1:4566",
+        NEWSROOM_MEDIA_S3_BUCKET: "test-media",
+        NEWSROOM_MEDIA_S3_ACCESS_KEY_ID: "test",
+        NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY: "test",
+      }).NEWSROOM_MEDIA_S3_ENDPOINT,
+    ).toBe("http://127.0.0.1:4566");
   });
 
   it("uses non-secret local defaults for external systems during tests", () => {

@@ -12,9 +12,33 @@ import {
 import { UnconfiguredMediaObjectStore } from "./unconfigured-media-object-store";
 import { MediaStagingModule } from "./media-staging.module";
 import { MediaStagingError } from "./media-staging.errors";
+import { S3MediaObjectStore } from "./s3-media-object-store";
+
+type ObjectStoreProvider = {
+  provide: symbol;
+  useFactory: (config: {
+    get: (key: string) => Record<string, unknown> | number;
+  }) => unknown;
+};
+
+function objectStoreProvider(): ObjectStoreProvider {
+  const providers = Reflect.getMetadata(
+    "providers",
+    MediaStagingModule,
+  ) as Array<unknown>;
+  const registrations = providers.filter(
+    (provider): provider is ObjectStoreProvider =>
+      !!provider &&
+      typeof provider === "object" &&
+      "provide" in provider &&
+      provider.provide === MEDIA_OBJECT_STORE,
+  );
+  expect(registrations).toHaveLength(1);
+  return registrations[0]!;
+}
 
 describe("MediaStagingModule wiring", () => {
-  it("never selects the test-only filesystem store in the production module", () => {
+  it("registers one configuration-driven object store provider and fails closed", () => {
     const providers = Reflect.getMetadata(
       "providers",
       MediaStagingModule,
@@ -23,10 +47,41 @@ describe("MediaStagingModule wiring", () => {
     expect(providers).toContain(UnconfiguredMediaObjectStore);
     expect(providers).toEqual(
       expect.arrayContaining([
-        { provide: MEDIA_OBJECT_STORE, useExisting: UnconfiguredMediaObjectStore },
         { provide: MEDIA_PROVIDER_CLIENT, useExisting: MetaMediaClient },
       ]),
     );
+    const registration = objectStoreProvider();
+    const config = (
+      mediaObjectStore: Record<string, unknown>,
+    ): { get: (key: string) => Record<string, unknown> | number } => ({
+      get: (key: string): Record<string, unknown> | number =>
+        key === "mediaObjectStore" ? mediaObjectStore : 1024,
+    });
+    expect(
+      registration.useFactory(config({ driver: "unconfigured" })),
+    ).toBeInstanceOf(UnconfiguredMediaObjectStore);
+    expect(
+      registration.useFactory(
+        config({
+          driver: "s3",
+          bucket: "proof-media",
+          region: "us-east-1",
+          forcePathStyle: true,
+          accessKeyId: "proof",
+          secretAccessKey: "proof-secret",
+        }),
+      ),
+    ).toBeInstanceOf(S3MediaObjectStore);
+    expect(() =>
+      registration.useFactory(
+        config({
+          driver: "s3",
+          bucket: "proof-media",
+          region: "us-east-1",
+          forcePathStyle: true,
+        }),
+      ),
+    ).toThrow("MEDIA_OBJECT_STORE_NOT_CONFIGURED");
   });
 
   it("wires the pinned network primitives and explicit provider client", () => {

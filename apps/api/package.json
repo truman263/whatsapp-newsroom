@@ -12,9 +12,13 @@
     "test:e2e": "jest --config test/jest-e2e.config.ts --runInBand",
     "test:db": "jest --config test/jest-db.config.ts --runInBand",
     "test:round7-integration": "node test/support/run-round7-integration.mjs",
+    "test:round8b2-s3": "node test/support/run-round8b2-s3.mjs",
+    "test:round8b2-pg-s3": "node test/support/run-round8b2-pg-s3.mjs",
+    "test:round8b2-recovery": "node test/support/run-round8b2-recovery.mjs",
     "reporter": "ts-node src/commands/reporter-cli.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1141.0",
     "@nestjs/common": "^11.1.6",
     "@nestjs/config": "^4.0.2",
     "@nestjs/core": "^11.1.6",

@@ -34,6 +34,16 @@ export interface ApplicationConfiguration {
     maxBytes: number;
     requestTimeoutMs: number;
   };
+  mediaObjectStore: {
+    driver: Environment["NEWSROOM_MEDIA_OBJECT_STORE_DRIVER"];
+    bucket: string;
+    region: string;
+    endpoint?: string;
+    forcePathStyle: boolean;
+    accessKeyId?: string;
+    secretAccessKey?: string;
+    sessionToken?: string;
+  };
   preview: { ttlSeconds: number; publicOrigin: string; hmacSecret: string };
   round6: { controlCutoverAt: Date };
   round7: { controlCutoverAt: Date };
@@ -78,6 +88,16 @@ export default function configuration(): ApplicationConfiguration {
     mediaStaging: {
       maxBytes: environment.NEWSROOM_MEDIA_STAGING_MAX_BYTES,
       requestTimeoutMs: environment.WHATSAPP_MEDIA_REQUEST_TIMEOUT_MS,
+    },
+    mediaObjectStore: {
+      driver: environment.NEWSROOM_MEDIA_OBJECT_STORE_DRIVER,
+      bucket: environment.NEWSROOM_MEDIA_S3_BUCKET,
+      region: environment.NEWSROOM_MEDIA_S3_REGION,
+      endpoint: environment.NEWSROOM_MEDIA_S3_ENDPOINT,
+      forcePathStyle: environment.NEWSROOM_MEDIA_S3_FORCE_PATH_STYLE,
+      accessKeyId: environment.NEWSROOM_MEDIA_S3_ACCESS_KEY_ID,
+      secretAccessKey: environment.NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY,
+      sessionToken: environment.NEWSROOM_MEDIA_S3_SESSION_TOKEN,
     },
     preview: {
       ttlSeconds: environment.NEWSROOM_PREVIEW_TTL_SECONDS,
