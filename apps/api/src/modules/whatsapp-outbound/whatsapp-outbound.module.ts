@@ -1,5 +1,5 @@
 import { Module } from "@nestjs/common";
-import { NewsroomPreviewModule } from "../newsroom-preview/newsroom-preview.module";
+import { NewsroomPreviewTokenModule } from "../newsroom-preview/newsroom-preview-token.module";
 import { ApprovalPromptService } from "./approval-prompt.service";
 import {
   HttpsMetaOutboundTransport,
@@ -10,7 +10,7 @@ import { WhatsappOutboundStatusService } from "./whatsapp-outbound-status.servic
 import { META_OUTBOUND_TRANSPORT } from "./whatsapp-outbound.types";
 
 @Module({
-  imports: [NewsroomPreviewModule],
+  imports: [NewsroomPreviewTokenModule],
   providers: [
     HttpsMetaOutboundTransport,
     {

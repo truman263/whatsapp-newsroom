@@ -3,12 +3,16 @@ import { DraftPreparationModule } from "../draft-preparation/draft-preparation.m
 import { MediaStagingModule } from "../media-staging/media-staging.module";
 import { NewsroomPreviewController } from "./newsroom-preview.controller";
 import { NewsroomPreviewService } from "./newsroom-preview.service";
-import { PreviewTokenService } from "./newsroom-preview-token.service";
+import { NewsroomPreviewTokenModule } from "./newsroom-preview-token.module";
 
 @Module({
-  imports: [DraftPreparationModule, MediaStagingModule],
+  imports: [
+    NewsroomPreviewTokenModule,
+    DraftPreparationModule,
+    MediaStagingModule,
+  ],
   controllers: [NewsroomPreviewController],
-  providers: [PreviewTokenService, NewsroomPreviewService],
-  exports: [PreviewTokenService],
+  providers: [NewsroomPreviewService],
+  exports: [NewsroomPreviewTokenModule],
 })
 export class NewsroomPreviewModule {}

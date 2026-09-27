@@ -6,6 +6,7 @@
     "dev": "nest start --watch",
     "build": "nest build",
     "start": "node dist/main.js",
+    "start:worker": "node dist/worker.js",
     "lint": "eslint \"{src,test}/**/*.ts\" --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "test": "jest --config jest.config.ts --runInBand",
@@ -16,6 +17,7 @@
     "test:round8b2-pg-s3": "node test/support/run-round8b2-pg-s3.mjs",
     "test:round8b2-recovery": "node test/support/run-round8b2-recovery.mjs",
     "test:round8b3-outbound": "node test/support/run-round8b3-outbound.mjs",
+    "test:round8b4-worker": "node test/support/run-round8b4-worker.mjs",
     "reporter": "ts-node src/commands/reporter-cli.ts"
   },
   "dependencies": {

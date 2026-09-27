@@ -1,5 +1,15 @@
 import Joi from "joi";
 
+const workerInteger = (
+  minimum: number,
+  maximum: number,
+  fallback: number,
+): Joi.NumberSchema =>
+  Joi.number().integer().min(minimum).max(maximum).default(fallback);
+
+const strictWorkerInteger = (minimum: number, maximum: number): Joi.NumberSchema =>
+  Joi.number().integer().min(minimum).max(maximum).required();
+
 export interface Environment {
   NODE_ENV: "development" | "test" | "production";
   PORT: number;
@@ -39,6 +49,22 @@ export interface Environment {
   NEWSROOM_MEDIA_S3_ACCESS_KEY_ID?: string;
   NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY?: string;
   NEWSROOM_MEDIA_S3_SESSION_TOKEN?: string;
+  WORKER_PORT: number;
+  WORKER_BATCH_SIZE: number;
+  WORKER_INBOUND_CADENCE_MS: number;
+  WORKER_STALE_INBOUND_CADENCE_MS: number;
+  WORKER_MEDIA_CADENCE_MS: number;
+  WORKER_DRAFT_CADENCE_MS: number;
+  WORKER_OUTBOUND_CADENCE_MS: number;
+  WORKER_STALE_OUTBOUND_CADENCE_MS: number;
+  WORKER_PUBLISH_CADENCE_MS: number;
+  WORKER_STALE_INBOUND_MS: number;
+  WORKER_STALE_OUTBOUND_MS: number;
+  WORKER_INBOUND_MAX_ATTEMPTS: number;
+  WORKER_BACKOFF_MAX_MS: number;
+  WORKER_JITTER_PERCENT: number;
+  WORKER_SHUTDOWN_GRACE_MS: number;
+  WORKER_READINESS_SILENCE_MS: number;
 }
 
 export const environmentSchema = Joi.object<Environment>({
@@ -364,6 +390,41 @@ export const environmentSchema = Joi.object<Environment>({
       otherwise: Joi.optional(),
     }),
   NEWSROOM_MEDIA_S3_SESSION_TOKEN: Joi.string().min(1).optional(),
+  WORKER_PORT: Joi.number().port().default(3001),
+  WORKER_BATCH_SIZE: workerInteger(1, 100, 25),
+  WORKER_INBOUND_CADENCE_MS: workerInteger(100, 300000, 1000),
+  WORKER_STALE_INBOUND_CADENCE_MS: workerInteger(100, 300000, 5000),
+  WORKER_MEDIA_CADENCE_MS: workerInteger(100, 300000, 2000),
+  WORKER_DRAFT_CADENCE_MS: workerInteger(100, 300000, 2000),
+  WORKER_OUTBOUND_CADENCE_MS: workerInteger(100, 300000, 1000),
+  WORKER_STALE_OUTBOUND_CADENCE_MS: workerInteger(100, 300000, 5000),
+  WORKER_PUBLISH_CADENCE_MS: workerInteger(100, 300000, 2000),
+  WORKER_STALE_INBOUND_MS: workerInteger(1000, 86400000, 300000),
+  WORKER_STALE_OUTBOUND_MS: workerInteger(1000, 86400000, 300000),
+  WORKER_INBOUND_MAX_ATTEMPTS: workerInteger(2, 100, 5),
+  WORKER_BACKOFF_MAX_MS: workerInteger(100, 300000, 30000),
+  WORKER_JITTER_PERCENT: workerInteger(0, 50, 10),
+  WORKER_SHUTDOWN_GRACE_MS: workerInteger(100, 120000, 10000),
+  WORKER_READINESS_SILENCE_MS: workerInteger(1000, 600000, 60000),
+}).unknown(true);
+
+const productionWorkerSchema = Joi.object({
+  WORKER_PORT: Joi.number().port().required(),
+  WORKER_BATCH_SIZE: strictWorkerInteger(1, 100),
+  WORKER_INBOUND_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_STALE_INBOUND_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_MEDIA_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_DRAFT_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_OUTBOUND_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_STALE_OUTBOUND_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_PUBLISH_CADENCE_MS: strictWorkerInteger(100, 300000),
+  WORKER_STALE_INBOUND_MS: strictWorkerInteger(1000, 86400000),
+  WORKER_STALE_OUTBOUND_MS: strictWorkerInteger(1000, 86400000),
+  WORKER_INBOUND_MAX_ATTEMPTS: strictWorkerInteger(2, 100),
+  WORKER_BACKOFF_MAX_MS: strictWorkerInteger(100, 300000),
+  WORKER_JITTER_PERCENT: strictWorkerInteger(0, 50),
+  WORKER_SHUTDOWN_GRACE_MS: strictWorkerInteger(100, 120000),
+  WORKER_READINESS_SILENCE_MS: strictWorkerInteger(1000, 600000),
 }).unknown(true);
 
 export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
@@ -426,4 +487,34 @@ export function validateEnvironment(source: NodeJS.ProcessEnv): Environment {
         ? round7Cutover
         : new Date(String(round7Cutover)),
   };
+}
+
+export function validateWorkerEnvironment(source: NodeJS.ProcessEnv): Environment {
+  const environment = validateEnvironment(source);
+  if (environment.NODE_ENV === "production") {
+    const strict = productionWorkerSchema.validate(source, {
+      abortEarly: false,
+      allowUnknown: true,
+      convert: true,
+    });
+    if (strict.error)
+      throw new Error(`Worker environment validation failed: ${strict.error.message}`);
+  }
+  const cadences = [
+    environment.WORKER_INBOUND_CADENCE_MS,
+    environment.WORKER_STALE_INBOUND_CADENCE_MS,
+    environment.WORKER_MEDIA_CADENCE_MS,
+    environment.WORKER_DRAFT_CADENCE_MS,
+    environment.WORKER_OUTBOUND_CADENCE_MS,
+    environment.WORKER_STALE_OUTBOUND_CADENCE_MS,
+    environment.WORKER_PUBLISH_CADENCE_MS,
+  ];
+  const longestSuccessfulDelay = Math.ceil(
+    Math.max(...cadences) * (1 + environment.WORKER_JITTER_PERCENT / 100),
+  );
+  if (environment.WORKER_READINESS_SILENCE_MS < longestSuccessfulDelay)
+    throw new Error(
+      "Worker environment validation failed: WORKER_READINESS_SILENCE_MS is shorter than the maximum successful loop delay",
+    );
+  return environment;
 }

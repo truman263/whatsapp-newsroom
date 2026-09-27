@@ -1,4 +1,4 @@
-import { validateEnvironment } from "./env.schema";
+import { validateEnvironment, validateWorkerEnvironment } from "./env.schema";
 
 function completeNonTestEnvironment(
   nodeEnvironment: "development" | "production",
@@ -29,6 +29,22 @@ function completeNonTestEnvironment(
     NEWSROOM_MEDIA_S3_BUCKET: "newsroom-media",
     NEWSROOM_MEDIA_S3_ACCESS_KEY_ID: "test-access-key",
     NEWSROOM_MEDIA_S3_SECRET_ACCESS_KEY: "test-secret-key",
+    WORKER_PORT: "3001",
+    WORKER_BATCH_SIZE: "25",
+    WORKER_INBOUND_CADENCE_MS: "1000",
+    WORKER_STALE_INBOUND_CADENCE_MS: "5000",
+    WORKER_MEDIA_CADENCE_MS: "2000",
+    WORKER_DRAFT_CADENCE_MS: "2000",
+    WORKER_OUTBOUND_CADENCE_MS: "1000",
+    WORKER_STALE_OUTBOUND_CADENCE_MS: "5000",
+    WORKER_PUBLISH_CADENCE_MS: "2000",
+    WORKER_STALE_INBOUND_MS: "300000",
+    WORKER_STALE_OUTBOUND_MS: "300000",
+    WORKER_INBOUND_MAX_ATTEMPTS: "5",
+    WORKER_BACKOFF_MAX_MS: "30000",
+    WORKER_JITTER_PERCENT: "10",
+    WORKER_SHUTDOWN_GRACE_MS: "10000",
+    WORKER_READINESS_SILENCE_MS: "60000",
   };
 }
 
@@ -106,9 +122,81 @@ describe("environment validation", () => {
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
       WHATSAPP_GRAPH_API_VERSION: "v0.0",
       WHATSAPP_OUTBOUND_REQUEST_TIMEOUT_MS: 5000,
+      WORKER_PORT: 3001,
+      WORKER_BATCH_SIZE: 25,
       ROUND6_CONTROL_CUTOVER_AT: new Date("9999-12-31T23:59:59.999Z"),
       ROUND7_CONTROL_CUTOVER_AT: new Date("9999-12-31T23:59:59.999Z"),
     });
+  });
+
+  it("requires at least two inbound recovery attempts", () => {
+    expect(() =>
+      validateEnvironment({
+        NODE_ENV: "test",
+        WORKER_INBOUND_MAX_ATTEMPTS: "1",
+      }),
+    ).toThrow("Environment validation failed");
+    expect(
+      validateEnvironment({
+        NODE_ENV: "test",
+        WORKER_INBOUND_MAX_ATTEMPTS: "2",
+      }).WORKER_INBOUND_MAX_ATTEMPTS,
+    ).toBe(2);
+    const production = completeNonTestEnvironment("production");
+    delete production.WORKER_INBOUND_MAX_ATTEMPTS;
+    expect(() => validateWorkerEnvironment(production)).toThrow(
+      "WORKER_INBOUND_MAX_ATTEMPTS",
+    );
+  });
+
+  it("separates production API and strict worker configuration", () => {
+    const complete = completeNonTestEnvironment("production");
+    const withoutWorker = Object.fromEntries(
+      Object.entries(complete).filter(([name]) => !name.startsWith("WORKER_")),
+    );
+    expect(validateEnvironment(withoutWorker)).toMatchObject({
+      NODE_ENV: "production",
+      WORKER_PORT: 3001,
+    });
+    expect(() => validateWorkerEnvironment(withoutWorker)).toThrow(
+      "Worker environment validation failed",
+    );
+    expect(validateWorkerEnvironment(complete)).toMatchObject({
+      WORKER_INBOUND_MAX_ATTEMPTS: 5,
+      WORKER_READINESS_SILENCE_MS: 60000,
+    });
+    expect(() =>
+      validateWorkerEnvironment({
+        ...complete,
+        WORKER_INBOUND_MAX_ATTEMPTS: "1",
+      }),
+    ).toThrow("WORKER_INBOUND_MAX_ATTEMPTS");
+    expect(() =>
+      validateWorkerEnvironment({
+        ...complete,
+        WORKER_INBOUND_CADENCE_MS: "99",
+      }),
+    ).toThrow("WORKER_INBOUND_CADENCE_MS");
+  });
+
+  it("requires readiness silence to cover cadence plus successful jitter", () => {
+    const complete = completeNonTestEnvironment("production");
+    expect(() =>
+      validateWorkerEnvironment({
+        ...complete,
+        WORKER_STALE_INBOUND_CADENCE_MS: "5000",
+        WORKER_JITTER_PERCENT: "10",
+        WORKER_READINESS_SILENCE_MS: "5499",
+      }),
+    ).toThrow("maximum successful loop delay");
+    expect(
+      validateWorkerEnvironment({
+        ...complete,
+        WORKER_STALE_INBOUND_CADENCE_MS: "5000",
+        WORKER_JITTER_PERCENT: "10",
+        WORKER_READINESS_SILENCE_MS: "5500",
+      }).WORKER_READINESS_SILENCE_MS,
+    ).toBe(5500);
   });
 
   it("requires a canonical Round 6 cutover outside test", () => {

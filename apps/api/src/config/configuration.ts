@@ -47,6 +47,18 @@ export interface ApplicationConfiguration {
   preview: { ttlSeconds: number; publicOrigin: string; hmacSecret: string };
   round6: { controlCutoverAt: Date };
   round7: { controlCutoverAt: Date };
+  worker: {
+    port: number;
+    batchSize: number;
+    cadencesMs: Record<string, number>;
+    staleInboundMs: number;
+    staleOutboundMs: number;
+    inboundMaxAttempts: number;
+    backoffMaxMs: number;
+    jitterPercent: number;
+    shutdownGraceMs: number;
+    readinessSilenceMs: number;
+  };
 }
 
 export default function configuration(): ApplicationConfiguration {
@@ -106,5 +118,25 @@ export default function configuration(): ApplicationConfiguration {
     },
     round6: { controlCutoverAt: environment.ROUND6_CONTROL_CUTOVER_AT },
     round7: { controlCutoverAt: environment.ROUND7_CONTROL_CUTOVER_AT },
+    worker: {
+      port: environment.WORKER_PORT,
+      batchSize: environment.WORKER_BATCH_SIZE,
+      cadencesMs: {
+        inbound: environment.WORKER_INBOUND_CADENCE_MS,
+        staleInbound: environment.WORKER_STALE_INBOUND_CADENCE_MS,
+        media: environment.WORKER_MEDIA_CADENCE_MS,
+        draft: environment.WORKER_DRAFT_CADENCE_MS,
+        outbound: environment.WORKER_OUTBOUND_CADENCE_MS,
+        staleOutbound: environment.WORKER_STALE_OUTBOUND_CADENCE_MS,
+        publish: environment.WORKER_PUBLISH_CADENCE_MS,
+      },
+      staleInboundMs: environment.WORKER_STALE_INBOUND_MS,
+      staleOutboundMs: environment.WORKER_STALE_OUTBOUND_MS,
+      inboundMaxAttempts: environment.WORKER_INBOUND_MAX_ATTEMPTS,
+      backoffMaxMs: environment.WORKER_BACKOFF_MAX_MS,
+      jitterPercent: environment.WORKER_JITTER_PERCENT,
+      shutdownGraceMs: environment.WORKER_SHUTDOWN_GRACE_MS,
+      readinessSilenceMs: environment.WORKER_READINESS_SILENCE_MS,
+    },
   };
 }
