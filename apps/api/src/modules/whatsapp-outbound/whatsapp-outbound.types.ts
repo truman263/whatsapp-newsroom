@@ -25,6 +25,11 @@ export type DispatchResult =
   | "NOT_CLAIMED"
   | "MANUAL_RECONCILIATION_REQUIRED";
 
+export type StaleSendingRecoveryResult = {
+  messageId: string;
+  result: "MANUAL_RECONCILIATION_REQUIRED" | "NOT_CLAIMED";
+};
+
 export type ProviderStatusInput = {
   providerMessageId: string;
   status: "sent" | "delivered" | "read" | "failed";

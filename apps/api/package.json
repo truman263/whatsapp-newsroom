@@ -15,6 +15,7 @@
     "test:round8b2-s3": "node test/support/run-round8b2-s3.mjs",
     "test:round8b2-pg-s3": "node test/support/run-round8b2-pg-s3.mjs",
     "test:round8b2-recovery": "node test/support/run-round8b2-recovery.mjs",
+    "test:round8b3-outbound": "node test/support/run-round8b3-outbound.mjs",
     "reporter": "ts-node src/commands/reporter-cli.ts"
   },
   "dependencies": {

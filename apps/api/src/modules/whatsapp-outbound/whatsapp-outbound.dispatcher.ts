@@ -18,7 +18,10 @@ import {
 import type {
   ApprovalPromptPayload,
   DispatchResult,
+  StaleSendingRecoveryResult,
 } from "./whatsapp-outbound.types";
+
+const UNCERTAIN_CODE = "WHATSAPP_SEND_OUTCOME_UNCERTAIN" as const;
 
 @Injectable()
 export class WhatsappOutboundDispatcher {
@@ -106,10 +109,10 @@ export class WhatsappOutboundDispatcher {
           ? error
           : new WhatsappOutboundError("WHATSAPP_SEND_OUTCOME_UNCERTAIN", true);
       if (failure.uncertain) {
-        await this.finishFailure(messageId, failure.code, true);
+        await this.holdUncertainSend(messageId);
         return "OUTCOME_UNCERTAIN";
       }
-      await this.finishFailure(messageId, failure.code, false);
+      await this.finishFailure(messageId, failure.code);
       return "FAILED";
     }
     await this.prisma.$transaction(async (tx) => {
@@ -164,12 +167,37 @@ export class WhatsappOutboundDispatcher {
   }
 
   async recoverUncertainSend(messageId: string): Promise<DispatchResult> {
-    const row = await this.prisma.outboundMessage.findUnique({
-      where: { id: messageId },
+    return this.holdUncertainSend(messageId);
+  }
+
+  async recoverStaleSending(
+    staleBefore: Date,
+    limit: number,
+  ): Promise<StaleSendingRecoveryResult[]> {
+    if (
+      !(staleBefore instanceof Date) ||
+      Number.isNaN(staleBefore.getTime()) ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    )
+      throw new Error("INVALID_RECOVERY_SCAN");
+    const rows = await this.prisma.outboundMessage.findMany({
+      where: {
+        status: OutboundMessageStatus.SENDING,
+        updatedAt: { lt: staleBefore },
+      },
+      orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+      take: limit,
+      select: { id: true },
     });
-    return row?.status === OutboundMessageStatus.SENDING
-      ? "MANUAL_RECONCILIATION_REQUIRED"
-      : "NOT_CLAIMED";
+    const results: StaleSendingRecoveryResult[] = [];
+    for (const row of rows)
+      results.push({
+        messageId: row.id,
+        result: await this.holdUncertainSend(row.id, staleBefore),
+      });
+    return results;
   }
 
   private async failPending(
@@ -191,46 +219,86 @@ export class WhatsappOutboundDispatcher {
   private async finishFailure(
     messageId: string,
     code: WhatsappOutboundCode,
-    uncertain: boolean,
   ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT "id" FROM "OutboundMessage" WHERE "id"=${messageId}::uuid FOR UPDATE`;
       const row = await tx.outboundMessage.findUniqueOrThrow({
         where: { id: messageId },
       });
+      if (row.status !== OutboundMessageStatus.SENDING) return;
       await tx.outboundMessage.update({
         where: { id: messageId },
-        data: uncertain
-          ? {
-              status: OutboundMessageStatus.SENDING,
-              lastErrorCode: code,
-              lastErrorMessage: null,
-              failedAt: null,
-            }
-          : {
-              status: OutboundMessageStatus.FAILED,
-              failedAt: new Date(),
-              lastErrorCode: code,
-              lastErrorMessage: null,
-            },
+        data: {
+          status: OutboundMessageStatus.FAILED,
+          failedAt: new Date(),
+          lastErrorCode: code,
+          lastErrorMessage: null,
+        },
       });
       await tx.auditLog.create({
         data: {
-          eventType: uncertain
-            ? "approval_prompt_send_uncertain"
-            : "approval_prompt_failed",
+          eventType: "approval_prompt_failed",
           actorType: AuditActorType.SYSTEM,
           reporterId: row.reporterId,
           storyId: row.storyId,
           entityType: "OutboundMessage",
           entityId: row.id,
           metadata: {
-            status: uncertain ? "SENDING" : "FAILED",
+            status: "FAILED",
             sendAttempts: row.sendAttempts,
             errorCode: code,
           },
         },
       });
+    });
+  }
+
+  private async holdUncertainSend(
+    messageId: string,
+    staleBefore?: Date,
+  ): Promise<"MANUAL_RECONCILIATION_REQUIRED" | "NOT_CLAIMED"> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "OutboundMessage" WHERE "id"=${messageId}::uuid FOR UPDATE`;
+      const row = await tx.outboundMessage.findUnique({
+        where: { id: messageId },
+      });
+      if (
+        !row ||
+        row.status !== OutboundMessageStatus.SENDING ||
+        (staleBefore && row.updatedAt >= staleBefore)
+      )
+        return "NOT_CLAIMED";
+      if (
+        row.lastErrorCode === UNCERTAIN_CODE &&
+        row.lastErrorMessage === null &&
+        row.failedAt === null
+      )
+        return "MANUAL_RECONCILIATION_REQUIRED";
+      await tx.outboundMessage.update({
+        where: { id: row.id },
+        data: {
+          status: OutboundMessageStatus.SENDING,
+          lastErrorCode: UNCERTAIN_CODE,
+          lastErrorMessage: null,
+          failedAt: null,
+        },
+      });
+      await tx.auditLog.create({
+        data: {
+          eventType: "approval_prompt_send_uncertain",
+          actorType: AuditActorType.SYSTEM,
+          reporterId: row.reporterId,
+          storyId: row.storyId,
+          entityType: "OutboundMessage",
+          entityId: row.id,
+          metadata: {
+            status: "SENDING",
+            errorCode: UNCERTAIN_CODE,
+            sendAttempts: row.sendAttempts,
+          },
+        },
+      });
+      return "MANUAL_RECONCILIATION_REQUIRED";
     });
   }
 }
