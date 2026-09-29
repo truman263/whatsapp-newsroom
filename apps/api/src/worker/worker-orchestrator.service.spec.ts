@@ -65,12 +65,39 @@ describe("WorkerOrchestratorService", () => {
     expect(text).not.toMatch(/phone|storyId|token|headline|providerMessageId/);
   });
 
+  it("counts a handled retry as degradation without counting it as a loop exception", async () => {
+    jest.useFakeTimers();
+    const metrics = new WorkerMetricsService();
+    const service = new WorkerOrchestratorService(
+      { processReceived: jest.fn().mockResolvedValue([]), recoverStaleProcessing: jest.fn().mockResolvedValue([]) } as never,
+      { recoverPending: jest.fn().mockResolvedValue([{ outcome: "RETRY_REQUIRED", reason: "MEDIA_OBJECT_UNAVAILABLE" }]) } as never,
+      { recover: jest.fn().mockResolvedValue([]) } as never,
+      { dispatchPending: jest.fn().mockResolvedValue([]), recoverStaleSending: jest.fn().mockResolvedValue([]) } as never,
+      { runOnce: jest.fn().mockResolvedValue([]) } as never,
+      { $queryRaw: jest.fn().mockResolvedValue([{ one: 1 }]) } as never,
+      metrics,
+      config as never,
+    );
+    try {
+      service.start();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(metrics.render()).toContain('newsroom_worker_dependency_degradation_total{loop="media"} 1');
+      expect(metrics.render()).toContain('newsroom_worker_loop_errors_total{loop="media"} 0');
+    } finally {
+      service.stop();
+      jest.useRealTimers();
+    }
+  });
+
   it("calculates bounded failure backoff and resets after success", () => {
-    expect(workerDelay(100, 1, 1000, 0, 0.5)).toBe(100);
-    expect(workerDelay(100, 2, 1000, 0, 0.5)).toBe(200);
-    expect(workerDelay(100, Number.MAX_SAFE_INTEGER, 1000, 0, 0.5)).toBe(1000);
+    expect(workerDelay(100, 2, 1000, 10, 0)).toBe(0);
+    expect(workerDelay(100, 2, 1000, 10, 0.5)).toBe(100);
+    expect(workerDelay(100, 2, 1000, 10, 1)).toBe(200);
+    expect(workerDelay(100, Number.MAX_SAFE_INTEGER, 1000, 10, 1)).toBe(1000);
     expect(workerDelay(900, 2, 1000, 50, 1)).toBe(1000);
     expect(workerDelay(100, 0, 1000, 0, 0.5)).toBe(100);
+    expect(workerDelay(100, 0, 1000, 10, 0)).toBe(90);
+    expect(workerDelay(100, 0, 1000, 10, 1)).toBe(110);
   });
 
   it("isolates an actual scheduled failure and keeps other loops scheduling", async () => {

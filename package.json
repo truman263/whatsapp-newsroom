@@ -25,6 +25,7 @@
     "test:round8b2-recovery": "pnpm --filter @newsroom/api test:round8b2-recovery",
     "test:round8b3-outbound": "pnpm --filter @newsroom/api test:round8b3-outbound",
     "test:round8b4-worker": "pnpm --filter @newsroom/api test:round8b4-worker",
+    "test:round8b5-hardening": "pnpm --filter @newsroom/api test:round8b5-hardening",
     "reporter": "pnpm --filter @newsroom/api reporter --",
     "prisma:generate": "prisma generate",
     "format": "prettier --write .",

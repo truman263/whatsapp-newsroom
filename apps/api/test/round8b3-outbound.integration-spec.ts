@@ -228,6 +228,39 @@ describe("Round 8B.3 outbound authority", () => {
     expect(await prisma.outboundMessage.count()).toBe(1);
   });
 
+  it.each([
+    ["connection refusal", { kind: "network" }, "OUTCOME_UNCERTAIN", OutboundMessageStatus.SENDING],
+    ["timeout", { kind: "timeout" }, "OUTCOME_UNCERTAIN", OutboundMessageStatus.SENDING],
+    ["HTTP 5xx", { kind: "response", response: { status: 503, body: { error: "private provider text" } } }, "OUTCOME_UNCERTAIN", OutboundMessageStatus.SENDING],
+    ["HTTP 429", { kind: "response", response: { status: 429, body: {} } }, "OUTCOME_UNCERTAIN", OutboundMessageStatus.SENDING],
+    ["malformed HTTP 200", { kind: "response", response: { status: 200, body: { messages: [] } } }, "OUTCOME_UNCERTAIN", OutboundMessageStatus.SENDING],
+    ["definitive HTTP 400", { kind: "response", response: { status: 400, body: {} } }, "FAILED", OutboundMessageStatus.FAILED],
+    ["authentication HTTP 401", { kind: "response", response: { status: 401, body: {} } }, "FAILED", OutboundMessageStatus.FAILED],
+  ] as const)("classifies %s without automatic resend", async (_label, mode, result, status) => {
+    const { message } = await fixture();
+    const transport = new ControlledMetaTransport(mode);
+    const first = dispatcher(transport);
+    expect(await first.dispatchOne(message.id)).toBe(result);
+    const restarted = new PrismaService();
+    await restarted.$connect();
+    try {
+      const second = dispatcher(transport, restarted);
+      expect(await second.dispatchPending(10)).toEqual([]);
+      expect(await second.recoverStaleSending(new Date(Date.now() + 1000), 10))
+        .toHaveLength(status === OutboundMessageStatus.SENDING ? 1 : 0);
+    } finally {
+      await restarted.$disconnect();
+    }
+    expect(transport.calls).toBe(1);
+    const row = await prisma.outboundMessage.findUniqueOrThrow({ where: { id: message.id } });
+    expect(row.status).toBe(status);
+    expect(row.sendAttempts).toBe(1);
+    expect(row.lastErrorMessage).toBeNull();
+    expect(await prisma.auditLog.count({
+      where: { entityId: message.id, eventType: "approval_prompt_send_uncertain" },
+    })).toBe(status === OutboundMessageStatus.SENDING ? 1 : 0);
+  });
+
   it("holds a stale SENDING while an unresolved external send is in flight without recovery resend", async () => {
     const { message } = await fixture();
     let entered!: () => void;

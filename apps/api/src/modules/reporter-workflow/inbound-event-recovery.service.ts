@@ -6,7 +6,9 @@ import {
 } from "@prisma/client";
 import { PrismaService } from "../../database/prisma.service";
 import { MediaStagingService } from "../media-staging/media-staging.service";
+import type { MediaAuthority } from "../media-staging/media-staging.types";
 import { Round7PublishSagaService } from "../publishing/round7-publish-saga.service";
+import { StoredWhatsappEventParser } from "../story-collection/stored-whatsapp-event.parser";
 import { supportsInboundProcessingContractVersion } from "./inbound-processing-contract";
 import { InboundEventProcessingService } from "./inbound-event-processing.service";
 import type {
@@ -20,6 +22,7 @@ const INTEGER_MAX = 2_147_483_647;
 
 @Injectable()
 export class InboundEventRecoveryService {
+  private readonly storedEvents = new StoredWhatsappEventParser();
   constructor(
     private readonly prisma: PrismaService,
     private readonly processing: InboundEventProcessingService,
@@ -59,6 +62,10 @@ export class InboundEventRecoveryService {
           processingContractVersion: true,
           senderPhone: true,
           senderIngestSequence: true,
+          providerMessageId: true,
+          eventType: true,
+          providerOccurredAt: true,
+          rawPayload: true,
         },
       });
       if (
@@ -144,6 +151,7 @@ export class InboundEventRecoveryService {
       });
       let route: InboundRecoveryRoute;
       let lineageId: string | null = null;
+      let mediaAuthority: MediaAuthority | null = null;
       if (approval) {
         if (!approval.publishAttempt) {
           await this.auditHold(
@@ -168,22 +176,44 @@ export class InboundEventRecoveryService {
               select: {
                 id: true,
                 storyId: true,
+                providerMediaId: true,
+                mimeType: true,
                 story: { select: { reporterId: true } },
               },
             })
           : null;
+        const allMediaAudits = media
+          ? await tx.auditLog.findMany({
+              where: {
+                entityType: "StoryMedia",
+                entityId: media.id,
+                eventType: "story_media_associated",
+              },
+              take: 2,
+              select: { inboundEventId: true },
+            })
+          : [];
+        let parsed: ReturnType<StoredWhatsappEventParser["parse"]> | null = null;
+        try {
+          parsed = this.storedEvents.parse(event);
+        } catch {
+          // Malformed durable provider evidence cannot authorise a refetch.
+        }
         if (
           mediaAudits.length !== 1 ||
+          allMediaAudits.length !== 1 ||
+          allMediaAudits[0]?.inboundEventId !== event.id ||
           !audit ||
           !media ||
           audit.entityType !== "StoryMedia" ||
           audit.inboundEventId !== event.id ||
           !audit.storyId ||
           media.storyId !== audit.storyId ||
-          (event.reporterId !== null &&
-            event.reporterId !== media.story.reporterId) ||
-          (audit.reporterId !== null &&
-            audit.reporterId !== media.story.reporterId)
+          event.reporterId !== media.story.reporterId ||
+          audit.reporterId !== media.story.reporterId ||
+          parsed?.kind !== "IMAGE" ||
+          parsed.providerMediaId !== media.providerMediaId ||
+          parsed.mimeType !== media.mimeType
         ) {
           await this.auditHold(
             tx,
@@ -196,6 +226,7 @@ export class InboundEventRecoveryService {
         }
         route = "STORY_MEDIA";
         lineageId = audit.entityId;
+        mediaAuthority = parsed;
       } else route = "NO_LINEAGE";
 
       const before = event.processingAttempts;
@@ -236,7 +267,7 @@ export class InboundEventRecoveryService {
           },
         },
       });
-      return { outcome: "CLAIMED", route, lineageId, claim } as const;
+      return { outcome: "CLAIMED", route, lineageId, claim, mediaAuthority } as const;
     });
 
     if (reclaimed.outcome !== "CLAIMED") return reclaimed;
@@ -250,9 +281,13 @@ export class InboundEventRecoveryService {
         return { outcome: "LINEAGE_CONFLICT", operatorHeld: true };
       await this.round6.resume(reclaimed.lineageId, reclaimed.claim);
     } else if (reclaimed.route === "STORY_MEDIA") {
-      if (!this.media || !reclaimed.lineageId)
+      if (!this.media || !reclaimed.lineageId || !reclaimed.mediaAuthority)
         return { outcome: "LINEAGE_CONFLICT", operatorHeld: true };
-      await this.media.reconcile(reclaimed.lineageId, reclaimed.claim);
+      await this.media.recoverStaleAbsentObject(
+        reclaimed.lineageId,
+        reclaimed.claim,
+        reclaimed.mediaAuthority,
+      );
     } else await this.processing.processClaimed(reclaimed.claim);
     return {
       outcome: "RECOVERED",

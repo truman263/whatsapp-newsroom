@@ -19,6 +19,10 @@ let movedEnv = false;
 let composeStarted = false;
 let pgStarted = false;
 let s3Started = false;
+const disposableSecrets = [];
+const redact = (value) => disposableSecrets.reduce(
+  (result, secretValue) => result.replaceAll(secretValue, "[REDACTED]"), value,
+);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -28,7 +32,7 @@ function run(command, args, options = {}) {
     windowsHide: true,
   });
   if (result.error || result.status !== 0) {
-    const message = options.sensitive ? "sensitive command failed" : (result.stderr || result.stdout || result.error?.message || "command failed").trim().slice(0, 1200);
+    const message = options.sensitive ? "sensitive command failed" : (result.stderr || result.stdout || result.error?.message || "command failed").trim().slice(0, options.label === "Round 7 combined integration" ? 8000 : 1200);
     throw new Error(`${options.label ?? command}: ${message}`);
   }
   return ((result.stdout ?? "") + (options.includeStderr ? result.stderr ?? "" : "")).trim();
@@ -49,16 +53,34 @@ async function freePort() {
   return address.port;
 }
 
+async function distinctPorts(count) {
+  const ports = new Set();
+  for (let attempt = 0; ports.size < count && attempt < 30; attempt++)
+    ports.add(await freePort());
+  if (ports.size !== count) throw new Error("Could not allocate distinct disposable ports");
+  return [...ports];
+}
+
 async function waitFor(url) {
-  for (let i = 0; i < 90; i++) {
+  let lastFailure = "no response";
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
     try {
-      await fetch(url, { signal: AbortSignal.timeout(2000) });
-      return;
-    } catch {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
+      const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (response.status >= 200 && response.status < 400) return;
+      lastFailure = `HTTP ${response.status}`;
+    } catch (error) {
+      lastFailure = error instanceof Error ? error.name : "request failed";
     }
+    const running = compose(["ps", "--status", "running", "--services"]);
+    if (!running.split(/\r?\n/u).includes("wordpress")) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
   }
-  throw new Error("Disposable WordPress did not start");
+  let status = "unavailable";
+  let logs = "unavailable";
+  try { status = compose(["ps", "--all", "--format", "json"]); } catch {}
+  try { logs = compose(["logs", "--no-color", "--tail", "30", "db", "wordpress"], { includeStderr: true }); } catch {}
+  throw new Error(`Disposable WordPress did not start at ${url}; last HTTP: ${lastFailure}; container status: ${redact(status.slice(-3000))}; container logs: ${redact(logs.slice(-5000))}`);
 }
 
 try {
@@ -66,9 +88,7 @@ try {
     renameSync(repoEnv, isolatedEnv);
     movedEnv = true;
   }
-  const wpPort = await freePort();
-  const pgPort = await freePort();
-  const s3Port = await freePort();
+  const [wpPort, pgPort, s3Port] = await distinctPorts(3);
   const pgPassword = secret();
   const draftSecret = secret();
   const mediaSecret = secret();
@@ -93,6 +113,7 @@ try {
     NEWSROOM_BRIDGE_PUBLISH_HMAC_KEYS_JSON: JSON.stringify([{ id: "round7-publish", secret: publishSecret }]),
     NEWSROOM_BRIDGE_PUBLISHER_USERS_JSON: JSON.stringify({ "round7-publish": 5 }),
   };
+  disposableSecrets.push(pgPassword, draftSecret, mediaSecret, publishSecret, appSecret, adminPassword, runtime.RUNTIME_DB_PASSWORD, runtime.RUNTIME_DB_ROOT_PASSWORD);
   writeFileSync(envFile, Object.entries(runtime).map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   const dbUrl = `postgresql://newsroom:${pgPassword}@127.0.0.1:${pgPort}/newsroom_test`;
   const testEnv = {
@@ -172,7 +193,7 @@ try {
   runPnpm(["exec", "prisma", "migrate", "status"], { env: testEnv, label: "migration status" });
   const drift = runPnpm(["exec", "prisma", "migrate", "diff", "--from-url", dbUrl, "--to-schema-datamodel", "prisma/schema.prisma", "--exit-code"], { env: testEnv, sensitive: true, label: "schema drift" });
   if (!drift.includes("No difference detected")) throw new Error("Schema drift detected");
-  const result = runPnpm(["--filter", "@newsroom/api", "exec", "jest", "--config", "test/jest-round7-integration.config.ts", "--runInBand"], { env: testEnv, label: "Round 7 combined integration", includeStderr: true });
+  const result = runPnpm(["--filter", "@newsroom/api", "exec", "jest", "--config", "test/jest-round7-integration.config.ts", "--runInBand", ...(process.env.ROUND7_TEST_NAME_PATTERN ? ["--testNamePattern", process.env.ROUND7_TEST_NAME_PATTERN] : [])], { env: testEnv, label: "Round 7 combined integration", includeStderr: true });
   process.stdout.write(`${result}\n`);
   process.stdout.write(`Disposable PostgreSQL ${pgVersion} / WordPress ${wpVersion} / PHP ${phpVersion} / MariaDB ${mariaVersion} integration passed.\n`);
 } catch (error) {

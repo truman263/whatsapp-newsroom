@@ -23,10 +23,12 @@ export function workerDelay(
 ): number {
   const exponent = Math.min(Math.max(failures - 1, 0), 52);
   const failureBase = Math.min(backoffMaxMs, cadenceMs * 2 ** exponent);
-  const base = failures > 0 ? failureBase : cadenceMs;
+  if (failures > 0)
+    return Math.round(Math.max(0, Math.min(1, random)) * failureBase);
+  const base = cadenceMs;
   const spread = base * jitterPercent / 100;
   const jittered = Math.max(0, Math.round(base - spread + random * spread * 2));
-  return failures > 0 ? Math.min(backoffMaxMs, jittered) : jittered;
+  return jittered;
 }
 
 @Injectable()
@@ -35,6 +37,7 @@ export class WorkerOrchestratorService implements BeforeApplicationShutdown {
   private started = false;
   private readonly timers = new Map<LoopName, NodeJS.Timeout>();
   private readonly failures = new Map<LoopName, number>();
+  private readonly degraded = new Set<LoopName>();
   private readonly active = new Set<Promise<void>>();
   private readonly worker: ApplicationConfiguration["worker"];
 
@@ -60,14 +63,22 @@ export class WorkerOrchestratorService implements BeforeApplicationShutdown {
   async runOnce(loop: LoopName): Promise<number> {
     const batch = this.worker.batchSize;
     switch (loop) {
-      case "inbound": return (await this.inbound.processReceived(batch)).length;
-      case "staleInbound": return (await this.inbound.recoverStaleProcessing({ limit: batch, staleBefore: new Date(Date.now() - this.worker.staleInboundMs), maxAttempts: this.worker.inboundMaxAttempts })).length;
-      case "media": return (await this.media.recoverPending(batch)).length;
-      case "draft": return (await this.drafts.recover(batch)).length;
-      case "outbound": return (await this.outbound.dispatchPending(batch)).length;
-      case "staleOutbound": return (await this.outbound.recoverStaleSending(new Date(Date.now() - this.worker.staleOutboundMs), batch)).length;
-      case "publish": return (await this.publish.runOnce(batch)).length;
+      case "inbound": return this.count(loop, await this.inbound.processReceived(batch));
+      case "staleInbound": return this.count(loop, await this.inbound.recoverStaleProcessing({ limit: batch, staleBefore: new Date(Date.now() - this.worker.staleInboundMs), maxAttempts: this.worker.inboundMaxAttempts }));
+      case "media": return this.count(loop, await this.media.recoverPending(batch));
+      case "draft": return this.count(loop, await this.drafts.recover(batch));
+      case "outbound": return this.count(loop, await this.outbound.dispatchPending(batch));
+      case "staleOutbound": return this.count(loop, await this.outbound.recoverStaleSending(new Date(Date.now() - this.worker.staleOutboundMs), batch));
+      case "publish": return this.count(loop, await this.publish.runOnce(batch));
     }
+  }
+
+  private count(loop: LoopName, results: ReadonlyArray<unknown>): number {
+    if (results.some((result) =>
+      result !== null && typeof result === "object" && "outcome" in result &&
+      result.outcome === "RETRY_REQUIRED"))
+      this.degraded.add(loop);
+    return results.length;
   }
 
   stop(): void {
@@ -108,6 +119,7 @@ export class WorkerOrchestratorService implements BeforeApplicationShutdown {
   private async cycle(loop: LoopName): Promise<void> {
     if (this.stopping) return;
     const started = Date.now();
+    this.degraded.delete(loop);
     let results = 0;
     let failed = false;
     try {
@@ -117,7 +129,7 @@ export class WorkerOrchestratorService implements BeforeApplicationShutdown {
       failed = true;
       this.failures.set(loop, (this.failures.get(loop) ?? 0) + 1);
     } finally {
-      this.metrics.record(loop, Date.now() - started, results, failed);
+      this.metrics.record(loop, Date.now() - started, results, failed, this.degraded.delete(loop));
       const cadence = this.worker.cadencesMs[loop]!;
       const delay = workerDelay(
         cadence,

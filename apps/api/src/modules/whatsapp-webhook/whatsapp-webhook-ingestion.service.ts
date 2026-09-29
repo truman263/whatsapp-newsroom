@@ -88,14 +88,12 @@ export class WhatsappWebhookIngestionService {
           skipDuplicates: true,
         });
       });
-      this.logger.log({
-        event:
-          result.count === 0
-            ? "inbound_batch_duplicate"
-            : "inbound_batch_persisted",
-        candidates: batch.events.length,
-        inserted: result.count,
-      });
+      if (result.count > 0)
+        this.logger.log({
+          event: "inbound_batch_persisted",
+          candidates: batch.events.length,
+          inserted: result.count,
+        });
       return { inserted: result.count };
     } catch {
       this.logger.error({

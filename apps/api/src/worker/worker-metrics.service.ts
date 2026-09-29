@@ -13,7 +13,7 @@ export class WorkerMetricsService {
   private readonly loops = new Map<string, LoopMetric>();
   private readonly degradation = new Map<string, number>();
 
-  record(loop: string, durationMs: number, results: number, error = false): void {
+  record(loop: string, durationMs: number, results: number, error = false, degraded = false): void {
     const metric = this.loops.get(loop) ?? {
       runs: 0,
       errors: 0,
@@ -27,7 +27,7 @@ export class WorkerMetricsService {
     metric.durationSeconds += durationMs / 1000;
     metric.lastCycleSeconds = Date.now() / 1000;
     this.loops.set(loop, metric);
-    if (error)
+    if (error || degraded)
       this.degradation.set(loop, (this.degradation.get(loop) ?? 0) + 1);
   }
 

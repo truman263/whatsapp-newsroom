@@ -53,6 +53,56 @@ export class MediaStagingService {
       });
     });
     if (claimed.count !== 1) return this.reconcile(mediaId, claim);
+    return this.fetchAndStore(mediaId, claim, authority);
+  }
+
+  /** Only a freshly reclaimed stale inbound generation may call this path. */
+  async recoverStaleAbsentObject(
+    mediaId: string,
+    claim: InboundProcessingClaim,
+    authority: MediaAuthority,
+  ): Promise<MediaStageResult> {
+    const media = await this.prisma.$transaction(async (tx) => {
+      await requireInboundProcessingClaim(tx, claim);
+      return tx.storyMedia.findUnique({
+        where: { id: mediaId },
+        select: { status: true, providerMediaId: true, mimeType: true },
+      });
+    });
+    if (
+      !media ||
+      (media.status !== MediaProcessingStatus.RECEIVED &&
+        media.status !== MediaProcessingStatus.FETCHING) ||
+      media.providerMediaId !== authority.providerMediaId ||
+      media.mimeType !== authority.mimeType
+    )
+      return { outcome: "RETRY_REQUIRED", reason: "MEDIA_COMPLETION_CONFLICT" };
+    const key = mediaObjectKey(mediaId);
+    let existing;
+    try {
+      existing = await this.store.head(key);
+    } catch {
+      return { outcome: "RETRY_REQUIRED", reason: "MEDIA_OBJECT_UNAVAILABLE" };
+    }
+    if (existing) return this.reconcile(mediaId, claim);
+    if (media.status === MediaProcessingStatus.RECEIVED) {
+      const changed = await this.prisma.$transaction(async (tx) => {
+        await requireInboundProcessingClaim(tx, claim);
+        return tx.storyMedia.updateMany({
+          where: { id: mediaId, status: MediaProcessingStatus.RECEIVED },
+          data: { status: MediaProcessingStatus.FETCHING },
+        });
+      });
+      if (changed.count !== 1) return this.reconcile(mediaId, claim);
+    }
+    return this.fetchAndStore(mediaId, claim, authority);
+  }
+
+  private async fetchAndStore(
+    mediaId: string,
+    claim: InboundProcessingClaim,
+    authority: MediaAuthority,
+  ): Promise<MediaStageResult> {
     try {
       const downloaded = await this.provider.fetch(authority);
       const key = mediaObjectKey(mediaId);

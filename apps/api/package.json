@@ -18,6 +18,7 @@
     "test:round8b2-recovery": "node test/support/run-round8b2-recovery.mjs",
     "test:round8b3-outbound": "node test/support/run-round8b3-outbound.mjs",
     "test:round8b4-worker": "node test/support/run-round8b4-worker.mjs",
+    "test:round8b5-hardening": "node test/support/run-round8b5-hardening.mjs",
     "reporter": "ts-node src/commands/reporter-cli.ts"
   },
   "dependencies": {

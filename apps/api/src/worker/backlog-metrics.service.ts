@@ -9,11 +9,12 @@ export class BacklogMetricsService {
 
   async render(): Promise<string> {
     const rows = await this.prisma.$queryRaw<BacklogRow[]>`
-      SELECT 'inbound' subsystem, "processingStatus"::text status, COUNT(*)::bigint count, MIN("receivedAt") oldest
-      FROM "InboundEvent" WHERE "processingStatus" IN ('RECEIVED','PROCESSING') GROUP BY "processingStatus"
+      SELECT 'inbound' subsystem, "processingStatus"::text status, COUNT(*)::bigint count,
+        MIN(CASE WHEN "processingStatus"='PROCESSING' THEN COALESCE("processingStartedAt", "receivedAt") ELSE "receivedAt" END) oldest
+      FROM "InboundEvent" WHERE "processingStatus" IN ('RECEIVED','PROCESSING','FAILED','IGNORED') GROUP BY "processingStatus"
       UNION ALL
       SELECT 'media', "status"::text, COUNT(*)::bigint, MIN("updatedAt") FROM "StoryMedia"
-      WHERE "status" IN ('RECEIVED','FETCHING') GROUP BY "status"
+      WHERE "status" IN ('RECEIVED','FETCHING','UPLOADING','FAILED') GROUP BY "status"
       UNION ALL
       SELECT 'draft', "status"::text, COUNT(*)::bigint, MIN("updatedAt") FROM "DraftPreparation"
       WHERE "status" IN ('ACTIVE','RECONCILIATION_REQUIRED','BLOCKED','FAILED') GROUP BY "status"

@@ -39,8 +39,7 @@ const logger = new ConsoleLogger('newsroom-api', {
   logLevels: logLevelsFor(process.env.NODE_ENV),
 });
 
-void bootstrap(logger).catch((error: unknown) => {
-  const stack = error instanceof Error ? error.stack : undefined;
-  logger.error('Application failed to start', stack, 'Bootstrap');
+void bootstrap(logger).catch(() => {
+  logger.error('Application failed to start', undefined, 'Bootstrap');
   process.exitCode = 1;
 });

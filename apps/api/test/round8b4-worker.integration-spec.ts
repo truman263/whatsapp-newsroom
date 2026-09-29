@@ -113,8 +113,148 @@ function receivedEvent(senderPhone: string, sequence: bigint) {
 
 describe("Round 8B.4 worker topology", () => {
   beforeAll(async () => Promise.all([prisma.$connect(), replicaPrisma.$connect()]));
-  beforeEach(async () => prisma.$executeRawUnsafe('TRUNCATE TABLE "Reporter" CASCADE'));
+  beforeEach(async () => prisma.$executeRawUnsafe('TRUNCATE TABLE "Reporter" CASCADE'), 30000);
   afterAll(async () => Promise.all([prisma.$disconnect(), replicaPrisma.$disconnect()]));
+
+  if (process.env.ROUND8B5A_CONTENTION_PROOF === "1") {
+  it("recreates a worker context after an active cycle and recovers durable inbound work", async () => {
+    const pending = await receivedEvent("+263771199991", 1n);
+    const claimed = await receivedEvent("+263771199992", 1n);
+    await prisma.inboundEvent.update({ where: { id: claimed.id }, data: {
+      processingStatus: InboundProcessingStatus.PROCESSING,
+      processingAttempts: 1, processingContractVersion: 1,
+      processingStartedAt: new Date(Date.now() - 60000),
+    } });
+    const first = await NestFactory.create(WorkerModule, { logger: false });
+    await first.init();
+    let entered!: () => void;
+    let release!: () => void;
+    const cycleEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const heldCycle = new Promise<void>((resolve) => { release = resolve; });
+    const firstDriver = first.get(InboundEventDriverService);
+    jest.spyOn(firstDriver, "processReceived").mockImplementationOnce(async () => {
+      entered();
+      await heldCycle;
+      return [];
+    });
+    const firstScheduler = first.get(WorkerOrchestratorService);
+    firstScheduler.start();
+    await cycleEntered;
+    expect((await prisma.inboundEvent.findUniqueOrThrow({ where: { id: pending.id } })).processingStatus)
+      .toBe(InboundProcessingStatus.RECEIVED);
+    const closing = first.close();
+    release();
+    await closing;
+    const second = await NestFactory.create(WorkerModule, { logger: false });
+    try {
+      await second.init();
+      const secondScheduler = second.get(WorkerOrchestratorService);
+      secondScheduler.start();
+      await second.get(InboundEventDriverService).recoverStaleProcessing({
+        limit: 1, staleBefore: new Date(Date.now() - 1000), maxAttempts: 2,
+      });
+      let settled = false;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const row = await prisma.inboundEvent.findUniqueOrThrow({ where: { id: pending.id } });
+        if (row.processingStatus === InboundProcessingStatus.IGNORED) {
+          settled = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(settled).toBe(true);
+      expect((await prisma.inboundEvent.findUniqueOrThrow({ where: { id: pending.id } })).processingAttempts)
+        .toBe(1);
+      expect(second.get(WorkerMetricsService).lastCycle("inbound")).toBeGreaterThan(0);
+      const recovered = await prisma.inboundEvent.findUniqueOrThrow({ where: { id: claimed.id } });
+      expect(recovered.processingAttempts).toBe(2);
+      expect(recovered.processingStatus).toBe(InboundProcessingStatus.IGNORED);
+    } finally {
+      await second.close();
+    }
+  }, 30000);
+
+  it("schedules four complete worker replicas across all seven production loops", async () => {
+    const first = await receivedEvent("+263771100001", 1n);
+    const second = await receivedEvent("+263771100002", 1n);
+    const stale = await receivedEvent("+263771100003", 1n);
+    await prisma.inboundEvent.update({
+      where: { id: stale.id },
+      data: {
+        processingStatus: InboundProcessingStatus.PROCESSING,
+        processingAttempts: 1,
+        processingContractVersion: 1,
+        processingStartedAt: new Date(Date.now() - 60000),
+      },
+    });
+    const { message } = await seed();
+    await prisma.outboundMessage.update({
+      where: { id: message.id },
+      data: { status: OutboundMessageStatus.SENDING, sendAttempts: 1 },
+    });
+    await prisma.$executeRaw`UPDATE "OutboundMessage" SET "updatedAt"=${new Date(Date.now() - 60000)} WHERE "id"=${message.id}::uuid`;
+    const settings = Object.fromEntries(
+      [
+        "WORKER_INBOUND_CADENCE_MS", "WORKER_STALE_INBOUND_CADENCE_MS",
+        "WORKER_MEDIA_CADENCE_MS", "WORKER_DRAFT_CADENCE_MS",
+        "WORKER_OUTBOUND_CADENCE_MS", "WORKER_STALE_OUTBOUND_CADENCE_MS",
+        "WORKER_PUBLISH_CADENCE_MS",
+      ].map((key) => [key, process.env[key]]),
+    );
+    for (const key of Object.keys(settings)) process.env[key] = "100";
+    const staleInboundSetting = process.env.WORKER_STALE_INBOUND_MS;
+    const staleOutboundSetting = process.env.WORKER_STALE_OUTBOUND_MS;
+    process.env.WORKER_STALE_INBOUND_MS = "1000";
+    process.env.WORKER_STALE_OUTBOUND_MS = "1000";
+    const apps: Array<Awaited<ReturnType<typeof NestFactory.create>>> = [];
+    try {
+      for (let index = 0; index < 4; index++) {
+        const app = await NestFactory.create(WorkerModule, { logger: false });
+        await app.init();
+        apps.push(app);
+      }
+      const injected = apps[0]!.get(InboundEventDriverService);
+      const original = injected.processReceived.bind(injected);
+      jest.spyOn(injected, "processReceived")
+        .mockRejectedValueOnce(new Error("controlled-loop-failure"))
+        .mockImplementation(original);
+      for (const app of apps) app.get(WorkerOrchestratorService).start();
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      for (const app of apps) {
+        const metrics = app.get(WorkerMetricsService);
+        for (const loop of WORKER_LOOPS)
+          expect(metrics.lastCycle(loop)).toBeGreaterThan(0);
+        const exposition = metrics.render();
+        for (const loop of WORKER_LOOPS) {
+          const match = exposition.match(new RegExp(`newsroom_worker_loop_runs_total\\{loop="${loop}"\\} (\\d+)`));
+          expect(Number(match?.[1])).toBeGreaterThanOrEqual(1);
+          expect(Number(match?.[1])).toBeLessThan(100);
+        }
+        console.info(JSON.stringify({ proof: "round8b5a_scheduled_replica", loops: 7, metrics: exposition }));
+      }
+      expect((await prisma.inboundEvent.findUniqueOrThrow({ where: { id: first.id } })).processingStatus)
+        .toBe(InboundProcessingStatus.IGNORED);
+      expect((await prisma.inboundEvent.findUniqueOrThrow({ where: { id: second.id } })).processingStatus)
+        .toBe(InboundProcessingStatus.IGNORED);
+      expect((await prisma.inboundEvent.findUniqueOrThrow({ where: { id: stale.id } })).processingAttempts)
+        .toBe(2);
+      expect(await prisma.auditLog.count({ where: { entityId: message.id, eventType: "approval_prompt_send_uncertain" } }))
+        .toBe(1);
+      expect((await prisma.outboundMessage.findUniqueOrThrow({ where: { id: message.id } })).status)
+        .toBe(OutboundMessageStatus.SENDING);
+    } finally {
+      await Promise.all(apps.map((app) => app.close()));
+      for (const [key, value] of Object.entries(settings)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      if (staleInboundSetting === undefined) delete process.env.WORKER_STALE_INBOUND_MS;
+      else process.env.WORKER_STALE_INBOUND_MS = staleInboundSetting;
+      if (staleOutboundSetting === undefined) delete process.env.WORKER_STALE_OUTBOUND_MS;
+      else process.env.WORKER_STALE_OUTBOUND_MS = staleOutboundSetting;
+    }
+  }, 30000);
+  }
 
   it("boots a real worker HTTP application with operational routes only", async () => {
     const apiImports = Reflect.getMetadata("imports", AppModule) as unknown[];

@@ -22,10 +22,14 @@ export class InboundEventDriverService {
       FROM "InboundEvent" candidate
       WHERE candidate."processingStatus" = 'RECEIVED'::"InboundProcessingStatus"
         AND NOT EXISTS (
-          SELECT 1 FROM "InboundEvent" earlier
-          WHERE earlier."senderPhone" = candidate."senderPhone"
-            AND earlier."senderIngestSequence" < candidate."senderIngestSequence"
-            AND earlier."processingStatus" IN ('RECEIVED'::"InboundProcessingStatus", 'PROCESSING'::"InboundProcessingStatus")
+          SELECT 1 FROM LATERAL (
+            SELECT earlier."id"
+            FROM "InboundEvent" earlier
+            WHERE earlier."senderPhone" = candidate."senderPhone"
+              AND earlier."senderIngestSequence" < candidate."senderIngestSequence"
+              AND earlier."processingStatus" IN ('RECEIVED'::"InboundProcessingStatus", 'PROCESSING'::"InboundProcessingStatus")
+            LIMIT 1
+          ) predecessor
         )
       ORDER BY candidate."receivedAt", candidate."id"
       LIMIT ${limit}
