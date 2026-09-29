@@ -844,6 +844,7 @@ describe("Round 8B.5 security and load hardening", () => {
 
   it("schedules all seven loops in two overlapping worker instances and drains after failure", async () => {
     jest.useFakeTimers();
+    const random = jest.spyOn(Math, "random").mockReturnValue(1);
     const config = new ConfigService({
       worker: {
         batchSize: 5,
@@ -904,6 +905,7 @@ describe("Round 8B.5 security and load hardening", () => {
       expect(jest.getTimerCount()).toBe(0);
     } finally {
       for (const instance of instances) instance.stop();
+      random.mockRestore();
       jest.useRealTimers();
     }
   });
